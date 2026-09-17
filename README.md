@@ -49,9 +49,25 @@ Notes:
 
 ## Multiplayer + chat (how it works)
 
-- **No server.** Multiplayer runs on [Trystero](https://github.com/dmotz/trystero)'s
-  `torrent` strategy: peers find each other through public BitTorrent
-  trackers and then talk directly over WebRTC. Works from static hosting.
+- **No server.** Multiplayer runs on [Trystero](https://github.com/dmotz/trystero):
+  peers find each other through public BitTorrent trackers, then talk
+  directly over WebRTC. Works from static hosting.
+- **NAT traversal (why 2-player works on phones).** Trystero core ships
+  STUN-only ICE, which fails behind symmetric NAT (mobile carriers / CGNAT).
+  `net.js` adds TURN via the OpenRelay **static-auth** scheme (standard
+  coturn TURN REST API — the same one Nextcloud Talk / Jitsi use):
+  credentials are derived client-side with WebCrypto HMAC-SHA1 from the
+  shared secret, valid 24h, refreshed automatically on long sessions.
+  `rtcConfig` *replaces* Trystero's default iceServers, so the config also
+  carries its own STUN entries:
+  `stun:stun.cloudflare.com:3478` + `stun:stun.l.google.com:19302`,
+  then `turn:staticauth.openrelay.metered.ca:80`/`:443` and
+  `turns:staticauth.openrelay.metered.ca:443`. (The old fixed
+  `openrelayproject`/`openrelayproject` password is stale — never used.)
+- **Signaling fallback.** If no peer appears within 15s of joining a room,
+  the client leaves and rejoins the *same* room key via Trystero's `nostr`
+  strategy (`https://esm.sh/@trystero-p2p/nostr`). Both clients run identical
+  logic, so they converge on whichever strategy works. One fallback only.
 - **One room per location:** `limbo-nexus`, `limbo-realm-1` … `limbo-realm-4`
   (all under the app id `limbo_by_holowatts`). Portal hops leave the old
   room and join the new one, so you only ever see/speak to drifters who are
@@ -60,7 +76,9 @@ Notes:
   spheres with floating name tags (capped at 15), eased for smoothness.
 - **Chat:** press **T** (or tap the chat box on mobile) to type, **Enter** to
   send, **Esc** to close. Messages are room-local (140 chars). Peer
-  join/leave shows as quiet system lines ("nova drifted in").
+  join/leave shows as quiet system lines ("nova drifted in"). Alone in a realm
+  room for 20s and you'll get one gentle nudge: "the void is quiet here —
+  drift to the Nexus to find other drifters".
 - **Graceful:** if the CDN or WebRTC is unreachable, the game plays exactly
   like the single-player prototype — no errors, no blocking.
 
