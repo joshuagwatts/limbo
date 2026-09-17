@@ -23,9 +23,16 @@
 const APP_ID = 'limbo_by_holowatts';
 const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
+/* Shared presence room: every client joins it at boot and heartbeats
+   {name, realm} here. Presence ONLY — no wisps, no chat — so the friends
+   list can show who's live and where without joining every realm room. */
+const LOBBY_ROOM = 'limbo-lobby';
+const PRESENCE_INTERVAL_MS = 15000; // heartbeat cadence
+const PRESENCE_EXPIRE_MS = 45000;   // silent this long -> considered gone
+const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '10';
+const BUILD = '11';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -117,6 +124,15 @@ export class LimboNet {
     this.onChatCb = null; // ({n:name, t:text}, peerId)
     this.onPeerLeaveCb = null; // (peerId)
     this.onQuietCb = null; // () — fired once per room visit when alone too long
+    // --- lobby presence (build 11) ---
+    this.lobbyRoom = null;
+    this.sendPresence = null;
+    this.lobbyPeers = new Map(); // peerId -> {name, room, lastSeen}
+    this.onPresenceCb = null; // () — lobby roster changed (heartbeat/expire)
+    this.presenceName = 'drifter';
+    this.presenceRoom = 'nexus';
+    this._presenceTimer = null;
+    this._sweepTimer = null;
     this.fallbackTimer = null;
     this.quietTimer = null;
     this.quietFired = false;
@@ -427,6 +443,12 @@ export class LimboNet {
       this.peers.clear();
       this.sendWisp = this.sendChat = null;
       this._joinWithStrategy();
+      // Keep presence on the working strategy too: the lobby rejoins with
+      // the new selfId; stale entries are dropped by the rejoin.
+      if (this.lobbyRoom) {
+        this._leaveLobby();
+        this.joinLobby();
+      }
       // no re-arm: single fallback, both sides converge identically
     }, FALLBACK_AFTER_MS);
   }
@@ -466,6 +488,110 @@ export class LimboNet {
     this.peers.clear();
     this.sendWisp = null;
     this.sendChat = null;
+  }
+
+  /* ---------------- lobby presence (build 11) ----------------
+     A second room joined once at boot. Heartbeats carry {n, r, t} only.
+     leave()/join() never touch it — it survives realm hops. */
+
+  /* Update what our heartbeat says, and re-broadcast immediately.
+     No-op until the lobby is joined. game.js calls this on boot,
+     realm change, and drifter-name change. */
+  setPresence(name, roomKey) {
+    this.presenceName = this.cleanName(name);
+    this.presenceRoom = String(roomKey || 'nexus').slice(0, 16);
+    this._presenceTick();
+  }
+
+  _presencePayload() {
+    return { n: this.presenceName, r: this.presenceRoom, t: Date.now() };
+  }
+
+  _presenceTick() {
+    if (!this.enabled || !this.sendPresence) return;
+    try {
+      this.sendPresence(this._presencePayload());
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  _notePresence(peerId, data) {
+    try {
+      if (!data || !peerId) return;
+      if (String(peerId) === String(this.selfId)) return; // never list ourselves
+      const name = this.cleanName(data.n);
+      const room = String(data.r || 'nexus').slice(0, 16);
+      this.lobbyPeers.set(String(peerId), { name, room, lastSeen: Date.now() });
+      if (this.onPresenceCb) this.onPresenceCb();
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  /* Drop entries silent longer than PRESENCE_EXPIRE_MS. `now` is
+     injectable so tests can time-travel instead of waiting 45s. */
+  _sweepLobby(now) {
+    const t = typeof now === 'number' ? now : Date.now();
+    let dropped = 0;
+    for (const [id, p] of this.lobbyPeers) {
+      if (t - p.lastSeen > PRESENCE_EXPIRE_MS) {
+        this.lobbyPeers.delete(id);
+        dropped++;
+      }
+    }
+    if (dropped > 0 && this.onPresenceCb) this.onPresenceCb();
+  }
+
+  joinLobby() {
+    if (!this.enabled || this.lobbyRoom) return;
+    try {
+      const isNostr = STRATEGIES[this.stratIdx].name === 'nostr';
+      const room = (this.lobbyRoom = this.mod.joinRoom(
+        {
+          appId: APP_ID,
+          rtcConfig: this.rtcConfig,
+          ...(isNostr ? { relayConfig: { urls: NOSTR_RELAYS } } : {}),
+        },
+        LOBBY_ROOM
+      ));
+      const presenceAction = room.makeAction('presence');
+      this.sendPresence = (data) => presenceAction.send(data);
+      presenceAction.onMessage = (d, info) =>
+        this._notePresence(info && info.peerId, d);
+      // A newcomer joining mid-session gets our heartbeat right away.
+      room.onPeerJoin = () => this._presenceTick();
+      this._presenceTick(); // announce ourselves on entry
+      this._presenceTimer = setInterval(
+        () => this._presenceTick(),
+        PRESENCE_INTERVAL_MS
+      );
+      this._sweepTimer = setInterval(() => this._sweepLobby(), PRESENCE_SWEEP_MS);
+    } catch (e) {
+      this.lobbyRoom = null;
+      this.sendPresence = null;
+    }
+  }
+
+  _leaveLobby() {
+    if (this._presenceTimer) {
+      clearInterval(this._presenceTimer);
+      this._presenceTimer = null;
+    }
+    if (this._sweepTimer) {
+      clearInterval(this._sweepTimer);
+      this._sweepTimer = null;
+    }
+    if (this.lobbyRoom) {
+      try {
+        this.lobbyRoom.leave();
+      } catch (e) {
+        /* ignore */
+      }
+      this.lobbyRoom = null;
+    }
+    this.sendPresence = null;
+    this.lobbyPeers.clear();
   }
 
   /* Broadcast our wisp position + name + equipped look (~12Hz from the

@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=10';
+import { LimboNet } from './net.js?v=11';
 
 /* ---------------- configuration ---------------- */
 
@@ -77,6 +77,10 @@ const wispHatsEl    = document.getElementById('wisp-hats');
 const wispTrailStylesEl = document.getElementById('wisp-trail-styles');
 const wispTrailColorsEl = document.getElementById('wisp-trail-colors');
 const printsListEl  = document.getElementById('prints-list');
+const friendsListEl   = document.getElementById('friends-list');
+const friendsLiveEl   = document.getElementById('friends-live');
+const friendAddInput  = document.getElementById('friend-add-input');
+const friendAddBtn    = document.getElementById('friend-add-btn');
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -632,6 +636,105 @@ function renderPrintsSection() {
   }
 }
 
+/* ---------------- friends + live presence (build 11) ----------------
+   Friends are just names in localStorage ('limbo_friends'). "Live" means
+   we recently heard their heartbeat in the lobby room. The join button
+   portals to their realm through the same goTo() the Nexus portals use. */
+
+let friends = [];
+try {
+  const rawFriends = JSON.parse(localStorage.getItem('limbo_friends') || '[]');
+  if (Array.isArray(rawFriends)) {
+    friends = rawFriends
+      .filter((n) => typeof n === 'string')
+      .map((n) => n.trim().slice(0, 16))
+      .filter(Boolean);
+  }
+} catch (e) { friends = []; }
+function saveFriends() {
+  try { localStorage.setItem('limbo_friends', JSON.stringify(friends)); } catch (e) { /* ignore */ }
+}
+function addFriend(name) {
+  const clean = String(name || '').trim().slice(0, 16);
+  if (!clean) return false;
+  const lc = clean.toLowerCase();
+  if (lc === myName.toLowerCase()) return false; // adding yourself is a no-op
+  if (friends.some((f) => f.toLowerCase() === lc)) return false; // no duplicates
+  friends.push(clean);
+  saveFriends();
+  renderFriendsSection();
+  return true;
+}
+function removeFriend(name) {
+  const lc = String(name || '').toLowerCase();
+  const before = friends.length;
+  friends = friends.filter((f) => f.toLowerCase() !== lc);
+  if (friends.length !== before) { saveFriends(); renderFriendsSection(); }
+}
+
+// Freshest heartbeat wins when two drifters share a name.
+function livePresenceFor(name) {
+  const lc = String(name || '').toLowerCase();
+  let best = null;
+  for (const [pid, p] of net.lobbyPeers) {
+    if (String(p.name).toLowerCase() === lc && (!best || p.lastSeen > best.lastSeen)) {
+      best = { peerId: pid, name: p.name, room: p.room, lastSeen: p.lastSeen };
+    }
+  }
+  return best;
+}
+function realmDisplayName(key) {
+  if (key === 'nexus') return NEXUS_DEF.name;
+  const d = REALM_DEFS.find((r) => r.key === key);
+  return d ? d.name : String(key || '').toUpperCase();
+}
+
+function renderFriendsSection() {
+  if (!friendsListEl) return;
+  friendsListEl.innerHTML = '';
+  const rows = friends.map((name) => ({ name, live: livePresenceFor(name) }));
+  rows.sort((a, b) =>
+    (b.live ? 1 : 0) - (a.live ? 1 : 0) ||
+    a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  let liveCount = 0;
+  for (const { name, live } of rows) {
+    if (live) liveCount++;
+    const row = document.createElement('div');
+    row.className = 'friend-row';
+    const dot = document.createElement('span');
+    dot.className = 'friend-dot' + (live ? ' live' : '');
+    const nm = document.createElement('span');
+    nm.className = 'friend-name';
+    nm.textContent = name;
+    row.appendChild(dot);
+    row.appendChild(nm);
+    if (live) {
+      const where = document.createElement('span');
+      where.className = 'friend-realm';
+      where.textContent = realmDisplayName(live.room);
+      const join = document.createElement('button');
+      join.className = 'friend-join';
+      join.textContent = 'join';
+      join.setAttribute('aria-label', `join ${name} in ${realmDisplayName(live.room)}`);
+      join.addEventListener('click', () => {
+        setSettings(false);
+        goTo(live.room);
+        join.blur();
+      });
+      row.appendChild(where);
+      row.appendChild(join);
+    }
+    const x = document.createElement('button');
+    x.className = 'friend-remove';
+    x.textContent = '×';
+    x.setAttribute('aria-label', `remove ${name} from friends`);
+    x.addEventListener('click', () => { removeFriend(name); x.blur(); });
+    row.appendChild(x);
+    friendsListEl.appendChild(row);
+  }
+  if (friendsLiveEl) friendsLiveEl.textContent = liveCount > 0 ? `— ${liveCount} drifting now` : '';
+}
+
 // Boot: dress the wisp in the saved look; net reads the equipped look
 // for every ~12Hz broadcast so peers see it too.
 applySkin(equipped.skin);
@@ -639,6 +742,7 @@ applyHat(equipped.hat);
 applyTrail();
 renderWispSection(); // populate the settings WISP section for first open
 renderPrintsSection(); // populate the settings PRINTS section
+renderFriendsSection(); // populate the settings FRIENDS section
 net.cosmetics = () => {
   const tc = TRAIL_COLORS[equipped.trailColor] || TRAIL_COLORS.white;
   return {
@@ -1203,6 +1307,7 @@ function goTo(key) {
     active.scene.add(wisp, localTrail.group, peerLayer); // re-parents from the previous scene
     clearPeerVisuals();                       // old room's drifters stay in the old room
     net.join(roomKeyFor(active.key));         // hop to this location's P2P room
+    net.setPresence(myName, active.key);      // lobby heartbeat: we're elsewhere now
     updatePeerCount();
     wisp.position.copy(active.spawn);
     vel.set(0, 0, 0);
@@ -1426,6 +1531,7 @@ net.onChatCb = (d, peerId) => {
 };
 net.onQuietCb = () =>
   addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
+net.onPresenceCb = () => { if (settingsOpen) renderFriendsSection(); };
 
 /* ---------------- settings panel ----------------
    Gear button opens it; D key is a desktop shortcut to the same panel.
@@ -1439,6 +1545,7 @@ function setSettings(open) {
     settingsName.value = myName;
     soundToggle.textContent = audio.muted ? 'OFF' : 'ON';
     renderWispSection();
+    renderFriendsSection();
     updateDebugHud();
   }
 }
@@ -1461,11 +1568,30 @@ settingsName.addEventListener('change', () => {
   const raw = settingsName.value.trim().slice(0, 16) || 'drifter';
   myName = raw;
   net.name = raw; // live: future wisp broadcasts + chat carry the new name
+  net.setPresence(raw, active ? active.key : 'nexus'); // lobby heartbeat carries the new name too
   try { localStorage.setItem('limbo_name', raw); } catch (e) { /* ignore */ }
   if (nameInput) nameInput.value = raw;
   addSystemLine(`you are now known as ${raw}`);
   settingsName.blur();
 });
+// Add a drifter to the friends list by name (Enter works too).
+friendAddBtn.addEventListener('click', () => {
+  if (addFriend(friendAddInput.value)) friendAddInput.value = '';
+  friendAddBtn.blur();
+});
+friendAddInput.addEventListener('keydown', (e) => {
+  e.stopPropagation(); // keep game keys out of the window handler
+  if (e.key === 'Enter') {
+    if (addFriend(friendAddInput.value)) friendAddInput.value = '';
+    friendAddInput.blur();
+  } else if (e.key === 'Escape') friendAddInput.blur();
+});
+// Typing a name isn't flying: reuse the chat field's "don't fly" guard.
+friendAddInput.addEventListener('focus', () => {
+  chatFocused = true;
+  for (const k in keys) keys[k] = false;
+});
+friendAddInput.addEventListener('blur', () => { chatFocused = false; });
 
 /* ---------------- debug readout (lives in the settings panel) ----------------
    Diagnoses multiplayer live on the device: ICE states, candidate types
@@ -1539,6 +1665,8 @@ driftBtn.addEventListener('click', () => {
   // Multiplayer: best-effort — the game plays exactly like v1 without it.
   net.boot(myName).then((ok) => {
     if (ok) {
+      net.setPresence(myName, active.key);
+      net.joinLobby(); // shared presence room: who's live, where
       net.join(roomKeyFor(active.key));
       updatePeerCount();
     } else {
@@ -1725,4 +1853,18 @@ window.__limbo = {
   applyPeerTrail,
   collectEcho,
   renderWispSection,
+  // friends + live presence (build 11)
+  getFriends: () => friends.slice(),
+  addFriend,
+  removeFriend,
+  renderFriendsSection,
+  goTo,
+  activeKey: () => (active ? active.key : null),
+  setPresence: (n, r) => net.setPresence(n, r),
+  presencePayload: () => net._presencePayload(),
+  lobbyPeers: () => [...net.lobbyPeers.entries()].map(([id, p]) => ({ id, ...p })),
+  lobbyMap: () => net.lobbyPeers, // live map: tests time-travel lastSeen for expiry
+  notePresence: (id, d) => net._notePresence(id, d),
+  sweepLobby: (now) => net._sweepLobby(now),
+  joinLobby: () => net.joinLobby(),
 };
