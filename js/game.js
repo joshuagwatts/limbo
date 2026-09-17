@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=5';
+import { LimboNet } from './net.js?v=6';
 
 /* ---------------- configuration ---------------- */
 
@@ -47,7 +47,15 @@ const joyKnob     = document.getElementById('joy-knob');
 const nameInput   = document.getElementById('name-input');
 const chatLog     = document.getElementById('chat-log');
 const chatInput   = document.getElementById('chat-input');
+const chatSend    = document.getElementById('chat-send');
+const chatToggle  = document.getElementById('chat-toggle');
 const peerCountEl = document.getElementById('peer-count');
+const gearBtn       = document.getElementById('gear-btn');
+const settingsPanel = document.getElementById('settings-panel');
+const settingsClose = document.getElementById('settings-close');
+const soundToggle   = document.getElementById('sound-toggle');
+const settingsName  = document.getElementById('settings-name');
+const settingsDebug = document.getElementById('settings-debug');
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -503,28 +511,41 @@ const bootTimeout = setTimeout(finishBoot, 30000);
 const keys = {};
 window.addEventListener('keydown', (e) => {
   const tag = e.target && e.target.tagName;
+  if (e.code === 'Escape' && settingsOpen) { setSettings(false); return; }
   if (tag === 'INPUT' || tag === 'TEXTAREA') return; // typing in chat / name field
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
   keys[e.code] = true;
   if (e.code === 'KeyM') {
-    const muted = audio.toggleMute();
-    muteEl.textContent = muted ? 'SOUND OFF' : 'SOUND ON';
+    setMuted(audio.toggleMute());
   }
   if (e.code === 'KeyT' && started && !chatFocused) {
     e.preventDefault();
     chatInput.focus();
   }
-  if (e.code === 'KeyD' && started && !chatFocused) {
-    debugHudOn = !debugHudOn;
-    debugHud.style.display = debugHudOn ? 'block' : 'none';
-    if (debugHudOn) updateDebugHud();
-  }
+  if (e.code === 'KeyD' && started && !chatFocused) setSettings(!settingsOpen);
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
-/* ---------------- chat ---------------- */
+/* ---------------- chat ----------------
+   Room-local text chat. Messages only *display* for peers within
+   PROXIMITY_R meters (receiver-side filter on the last-known wisp
+   positions, broadcast at 12Hz) — distant chatter arrives as a faint
+   hint instead. Own messages always show. */
 
-function addChatLine(name, text, sys = false) {
+const PROXIMITY_R = 40; // meters — chat only carries this far
+const CHAT_HISTORY_CAP = 100;
+const BUBBLE_SECS = 4; // floating bubble lifetime above the sender's wisp
+
+const peerPositions = new Map(); // peerId -> THREE.Vector3 (last wisp broadcast)
+const chatHistory = []; // {name, text, time, sys, self, distant} — this session, capped
+let lastDistantHint = 0;
+
+function recordChat(name, text, sys = false, self = false, distant = false) {
+  chatHistory.push({ name, text, time: new Date(), sys, self, distant });
+  if (chatHistory.length > CHAT_HISTORY_CAP) chatHistory.shift();
+}
+
+function renderChatLine(name, text, sys = false) {
   const div = document.createElement('div');
   div.className = 'chat-line' + (sys ? ' sys' : '');
   if (sys) {
@@ -534,11 +555,16 @@ function addChatLine(name, text, sys = false) {
     n.className = 'chat-name';
     n.textContent = name;
     div.appendChild(n);
-    div.appendChild(document.createTextNode(' · ' + text));
+    div.appendChild(document.createTextNode(' \u00B7 ' + text));
   }
   chatLog.appendChild(div);
-  while (chatLog.children.length > 50) chatLog.removeChild(chatLog.firstChild);
+  while (chatLog.children.length > CHAT_HISTORY_CAP) chatLog.removeChild(chatLog.firstChild);
   chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function addChatLine(name, text, sys = false, self = false) {
+  recordChat(name, text, sys, self, false);
+  renderChatLine(name, text, sys);
 }
 
 function addSystemLine(text) {
@@ -548,9 +574,76 @@ function addSystemLine(text) {
 function sendChatLine() {
   const text = chatInput.value.trim().slice(0, 140);
   if (!text) { chatInput.blur(); return; }
-  addChatLine(myName, text);
-  net.say(text);
+  addChatLine(myName, text, false, true);
+  if (net.enabled && net.sendChat) {
+    net.say(text);
+  } else {
+    addSystemLine('the void is quiet \u2014 no connection to send with');
+  }
   chatInput.value = '';
+  // On touch devices the keyboard's action key may not fire Enter — the
+  // send button covers that — and after sending we dismiss the keyboard.
+  if (window.matchMedia && matchMedia('(pointer: coarse)').matches) chatInput.blur();
+}
+
+/* Floating speech bubble above a peer's wisp, ~4s. Only when on screen. */
+function makeChatBubble(text) {
+  const shown = String(text).slice(0, 90);
+  const maxChars = 24;
+  const words = shown.split(' ');
+  const lines = [];
+  let line = '';
+  for (const w of words) {
+    if ((line + ' ' + w).trim().length > maxChars && line) { lines.push(line.trim()); line = w; }
+    else line += ' ' + w;
+    if (lines.length === 3) break;
+  }
+  if (line.trim() && lines.length < 3) lines.push(line.trim());
+  const c = document.createElement('canvas');
+  const g = c.getContext('2d');
+  const font = '300 26px system-ui, -apple-system, sans-serif';
+  g.font = font;
+  const wMax = Math.max(...lines.map((l) => g.measureText(l).width), 40);
+  c.width = Math.ceil(wMax + 44);
+  c.height = lines.length * 36 + 40;
+  const g2 = c.getContext('2d');
+  const r = 16;
+  g2.fillStyle = 'rgba(6,10,24,0.88)';
+  g2.strokeStyle = 'rgba(159,216,255,0.5)';
+  g2.lineWidth = 2;
+  g2.beginPath();
+  if (g2.roundRect) g2.roundRect(2, 2, c.width - 4, c.height - 4, r);
+  else g2.rect(2, 2, c.width - 4, c.height - 4);
+  g2.fill();
+  g2.stroke();
+  g2.font = font;
+  g2.fillStyle = 'rgba(235,240,255,0.95)';
+  g2.textBaseline = 'top';
+  lines.forEach((l, i) => g2.fillText(l, 22, 18 + i * 36));
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthWrite: false, fog: false,
+  }));
+  const s = 0.028;
+  sp.scale.set(c.width * s, c.height * s, 1);
+  return sp;
+}
+
+const _projV = new THREE.Vector3();
+function showChatBubble(peerId, text) {
+  const pv = peerVisuals.get(peerId);
+  if (!pv) return;
+  // Only when the sender is actually on screen.
+  _projV.copy(pv.group.position);
+  _projV.y += 2.9;
+  _projV.project(camera);
+  if (_projV.z > 1 || Math.abs(_projV.x) > 1 || Math.abs(_projV.y) > 1) return;
+  if (pv.bubble) pv.group.remove(pv.bubble.sprite);
+  const sprite = makeChatBubble(text);
+  sprite.position.y = 2.9;
+  pv.group.add(sprite);
+  pv.bubble = { sprite, expires: clock.elapsedTime + BUBBLE_SECS };
 }
 
 chatInput.addEventListener('focus', () => {
@@ -562,6 +655,20 @@ chatInput.addEventListener('keydown', (e) => {
   e.stopPropagation(); // keep game keys out of the window handler
   if (e.key === 'Enter') sendChatLine();
   else if (e.key === 'Escape') chatInput.blur();
+});
+
+// Send button — the touch path. Phone keyboards often dismiss instead of
+// firing Enter on a bare input, so without this mobile chat can't send.
+chatSend.addEventListener('click', () => { sendChatLine(); chatSend.blur(); });
+
+// Toggleable history panel (speech-bubble button).
+let chatLogOpen = true;
+chatToggle.addEventListener('click', () => {
+  chatLogOpen = !chatLogOpen;
+  chatLog.classList.toggle('hidden', !chatLogOpen);
+  chatToggle.classList.toggle('off', !chatLogOpen);
+  if (chatLogOpen) chatLog.scrollTop = chatLog.scrollHeight;
+  chatToggle.blur();
 });
 
 // Enter in the name field starts the drift.
@@ -629,9 +736,7 @@ function endTouch(e) {
   lastTapAt = now;
   if (tapCount >= 3 && started) {
     tapCount = 0;
-    debugHudOn = !debugHudOn;
-    debugHud.style.display = debugHudOn ? 'block' : 'none';
-    if (debugHudOn) updateDebugHud();
+    setSettings(!settingsOpen);
   }
 }
 canvas.addEventListener('touchend', endTouch);
@@ -741,15 +846,31 @@ function retagPeer(pv, name) {
 function clearPeerVisuals() {
   for (const pv of peerVisuals.values()) peerLayer.remove(pv.group);
   peerVisuals.clear();
+  peerPositions.clear(); // new room, new neighborhood
 }
 
+/* "DRIFTERS HERE" with a discovery state: while we're online, alone, and
+   still inside the discovery window (~45s from room join) show a soft
+   pulsing "finding others" so the wait reads as working, not broken.
+   After the window, settle into a calm "just you in this realm". */
+const DISCOVERY_WINDOW_MS = 45000;
 function updatePeerCount() {
-  peerCountEl.textContent = `DRIFTERS HERE: ${net.peerCount() + 1}`;
+  const n = net.peerCount() + 1;
+  let cls = '', suffix = '';
+  if (net.enabled && net.peerCount() === 0) {
+    const elapsed = Date.now() - (net.joinedAt || Date.now());
+    if (elapsed < DISCOVERY_WINDOW_MS) { cls = 'searching'; suffix = ' \u00B7 finding others'; }
+    else { cls = 'settled'; suffix = ' \u00B7 just you in this realm'; }
+  }
+  peerCountEl.textContent = `DRIFTERS HERE: ${n}${suffix}`;
+  peerCountEl.className = cls;
 }
+setInterval(updatePeerCount, 1000);
 
 function handleWisp(id, d) {
   if (!d || !Array.isArray(d.p)) return;
   const nm = String(d.n || 'drifter').slice(0, 16) || 'drifter';
+  peerPositions.set(id, new THREE.Vector3(d.p[0], d.p[1], d.p[2])); // proximity table
   let pv = peerVisuals.get(id);
   if (!pv) {
     if (peerVisuals.size >= MAX_REMOTE) return; // render cap; count still tracks
@@ -773,42 +894,87 @@ function handlePeerLeave(id) {
     peerLayer.remove(pv.group);
     peerVisuals.delete(id);
   }
+  peerPositions.delete(id);
   updatePeerCount();
 }
 
 // Wire the net callbacks once; rooms are (re)joined on start + portal hops.
 net.onWispCb = handleWisp;
 net.onPeerLeaveCb = handlePeerLeave;
-net.onChatCb = (d) => {
+net.onChatCb = (d, peerId) => {
   if (!d) return;
   const nm = String(d.n || 'drifter').slice(0, 16) || 'drifter';
   const tx = String(d.t || '').slice(0, 140);
-  if (tx) addChatLine(nm, tx);
+  if (!tx) return;
+  // Proximity chat: only display peers within earshot. Unknown position
+  // (no wisp yet) is treated as near — better than dropping a greeting.
+  const pos = peerId ? peerPositions.get(peerId) : null;
+  const dist = pos ? wisp.position.distanceTo(pos) : 0;
+  if (dist <= PROXIMITY_R) {
+    addChatLine(nm, tx);
+    if (peerId) showChatBubble(peerId, tx);
+  } else {
+    recordChat(nm, tx, false, false, true); // kept in history, marked distant
+    const now = Date.now();
+    if (now - lastDistantHint > 15000) {
+      lastDistantHint = now;
+      addSystemLine('you sense distant chatter\u2026');
+    }
+  }
 };
 net.onQuietCb = () =>
   addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
 
-/* ---------------- debug HUD (press D) ----------------
+/* ---------------- settings panel ----------------
+   Gear button opens it; D key and triple-tap are shortcuts to the same
+   panel. Holds the net debug readout, sound toggle, and drifter name. */
+
+let settingsOpen = false;
+function setSettings(open) {
+  settingsOpen = open;
+  settingsPanel.classList.toggle('open', open);
+  if (open) {
+    settingsName.value = myName;
+    soundToggle.textContent = audio.muted ? 'OFF' : 'ON';
+    updateDebugHud();
+  }
+}
+function setMuted(muted) {
+  muteEl.textContent = muted ? 'SOUND OFF' : 'SOUND ON';
+  soundToggle.textContent = muted ? 'OFF' : 'ON';
+  try { localStorage.setItem('limbo_muted', muted ? '1' : ''); } catch (e) { /* ignore */ }
+}
+gearBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setSettings(!settingsOpen);
+  gearBtn.blur();
+});
+settingsClose.addEventListener('click', () => setSettings(false));
+soundToggle.addEventListener('click', () => {
+  setMuted(audio.toggleMute());
+  soundToggle.blur();
+});
+settingsName.addEventListener('change', () => {
+  const raw = settingsName.value.trim().slice(0, 16) || 'drifter';
+  myName = raw;
+  net.name = raw; // live: future wisp broadcasts + chat carry the new name
+  try { localStorage.setItem('limbo_name', raw); } catch (e) { /* ignore */ }
+  if (nameInput) nameInput.value = raw;
+  addSystemLine(`you are now known as ${raw}`);
+  settingsName.blur();
+});
+
+/* ---------------- debug readout (lives in the settings panel) ----------------
    Diagnoses multiplayer live on the device: ICE states, candidate types
    (host/srflx/relay — 'relay' means TURN allocation worked), selected
    pair, and trystero's own join-error text. Works with zero peers. */
 
 const debugHud = document.createElement('div');
 debugHud.id = 'debug-hud';
-debugHud.style.cssText = [
-  'position:fixed', 'top:8px', 'left:8px', 'z-index:50',
-  'max-width:min(92vw,430px)', 'padding:8px 10px',
-  'background:rgba(4,8,18,0.82)', 'border:1px solid rgba(140,170,255,0.35)',
-  'border-radius:8px', 'color:#bcd2ff',
-  'font:11px/1.55 ui-monospace,Menlo,Consolas,monospace',
-  'white-space:pre-wrap', 'word-break:break-word',
-  'pointer-events:none', 'display:none',
-].join(';');
-document.body.appendChild(debugHud);
-let debugHudOn = false;
+settingsDebug.appendChild(debugHud); // styled by #debug-hud in style.css
 
 async function updateDebugHud() {
-  if (!debugHudOn) return;
+  if (!settingsOpen) return;
   let s;
   try {
     s = await net.getDebugSnapshot();
@@ -863,6 +1029,7 @@ driftBtn.addEventListener('click', () => {
   myName = raw;
   try { localStorage.setItem('limbo_name', raw); } catch (e) { /* ignore */ }
   audio.init(active ? active.root : NEXUS_DEF.root);
+  try { if (localStorage.getItem('limbo_muted')) setMuted(audio.toggleMute()); } catch (e) { /* ignore */ }
   overlayEl.classList.add('gone');
   started = true;
   hintTimer = setTimeout(() => hintEl.classList.add('gone'), 15000);
@@ -986,6 +1153,17 @@ function loop() {
     for (const pv of peerVisuals.values()) {
       pv.group.position.lerp(pv.target, k);
       pv.bob.position.y = Math.sin(t * 2.2 + pv.phase) * 0.3;
+      // Floating chat bubbles: rise, fade, vanish after BUBBLE_SECS.
+      if (pv.bubble) {
+        const remain = pv.bubble.expires - t;
+        if (remain <= 0) {
+          pv.group.remove(pv.bubble.sprite);
+          pv.bubble = null;
+        } else {
+          pv.bubble.sprite.position.y = 2.9 + (1 - remain / BUBBLE_SECS) * 1.2;
+          pv.bubble.sprite.material.opacity = Math.min(1, remain / 1.2);
+        }
+      }
     }
   }
 
@@ -999,3 +1177,21 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+/* Test + diagnostics hook: exposes multiplayer internals so automated
+   tests (and future debugging) can drive the chat/proximity paths
+   without needing a real second peer. */
+window.__limbo = {
+  net,
+  wisp,
+  camera,
+  peerVisuals,
+  chatHistory: () => chatHistory.slice(),
+  myName: () => myName,
+  setPeerPos: (id, x, y, z) => peerPositions.set(id, new THREE.Vector3(x, y, z)),
+  getPeerPos: (id) => peerPositions.get(id),
+  handleWisp,
+  showChatBubble,
+  PROXIMITY_R,
+  build: net.build,
+};

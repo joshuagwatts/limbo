@@ -25,7 +25,7 @@ const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '5';
+const BUILD = '6';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -107,6 +107,7 @@ export class LimboNet {
     this.selfId = null;
     this.room = null;
     this.roomKey = null;
+    this.joinedAt = 0; // discovery window start (drives the "finding others" UI)
     this.peers = new Map(); // peerId -> true (presence in current room)
     this.name = 'drifter';
     this.sendWisp = null;
@@ -316,6 +317,7 @@ export class LimboNet {
     if (!this.enabled) return;
     this.leave();
     this.roomKey = roomKey;
+    this.joinedAt = Date.now(); // discovery window start (drives the "finding others" UI)
     this.quietFired = false;
     this.hsPeers.clear(); // fresh diagnostics per room visit
     this.nostrFrames.length = 0;
