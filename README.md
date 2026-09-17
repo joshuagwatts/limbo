@@ -21,6 +21,10 @@ too. All cosmetics are earned by playing; nothing is paid.
 The settings panel also has a **PRINTS** section: each realm's artwork is a
 real giclée print in the shop, one tap away.
 
+The **FRIENDS** section keeps a local friends list and shows who's live:
+every client heartbeats into a shared lobby room, so you can see which
+realm a friend is drifting in and hop straight to them.
+
 Everything is static files — no build step, no backend, no audio files
 (all sound is synthesized live with WebAudio).
 

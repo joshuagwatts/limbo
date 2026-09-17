@@ -56,6 +56,13 @@
   <div class="set-debug-head">PRINTS</div>
   <div class="set-tiny">the realm artworks, as giclée prints</div>
   <div id="prints-list"></div>
+  <div class="set-debug-head">FRIENDS <span id="friends-live"></span></div>
+  <div class="set-tiny">add drifters by name — see who's live, hop to their realm</div>
+  <div class="friend-add-row">
+    <input id="friend-add-input" maxlength="16" placeholder="drifter name…" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="friend-add-btn">add</button>
+  </div>
+  <div id="friends-list"></div>
   <div class="set-debug-head">NET DEBUG</div>
   <div id="settings-debug"></div>
 </div>
@@ -85,6 +92,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=10"></script>
+<script type="module" src="js/game.js?v=11"></script>
 </body>
 </html>
