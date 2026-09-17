@@ -715,6 +715,8 @@ net.onChatCb = (d) => {
   const tx = String(d.t || '').slice(0, 140);
   if (tx) addChatLine(nm, tx);
 };
+net.onQuietCb = () =>
+  addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
 
 /* ---------------- start ---------------- */
 
