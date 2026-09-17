@@ -35,9 +35,6 @@
   <div id="mute-label">SOUND ON</div>
 </div>
 
-<!-- loading indicator while art textures download -->
-<div id="loading"><span>summoning limbo</span></div>
-
 <!-- room-local text chat with whoever is drifting here -->
 <div id="chat">
   <div id="chat-log"></div>
@@ -50,12 +47,15 @@
   <p class="sub">a portal universe</p>
   <input id="name-input" maxlength="16" placeholder="what do other drifters call you?" autocomplete="off" autocapitalize="off" spellcheck="false">
   <button id="drift-btn" disabled>loading…</button>
+  <!-- loading indicator while art textures download: in the overlay's column
+       (under the button) so it can never overlap the title/subtitle -->
+  <div id="loading"><span>summoning limbo</span></div>
   <p class="tiny">headphones recommended · 4 realms · 20 echoes</p>
 </div>
 
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=3"></script>
+<script type="module" src="js/game.js?v=4"></script>
 </body>
 </html>
