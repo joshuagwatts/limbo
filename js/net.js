@@ -25,7 +25,7 @@ const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '3';
+const BUILD = '4';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -176,24 +176,27 @@ export class LimboNet {
         },
         this.roomKey
       ));
-      const [sendWisp, onWisp] = room.makeAction('wisp');
-      const [sendChat, onChat] = room.makeAction('chat');
-      this.sendWisp = sendWisp;
-      this.sendChat = sendChat;
-      onWisp((d, id) => {
-        if (this.onWispCb) this.onWispCb(id, d);
-      });
-      onChat((d, id) => {
-        if (this.onChatCb) this.onChatCb(d, id);
-      });
-      room.onPeerJoin((id) => {
+      // Trystero 0.25.x API: makeAction returns an action OBJECT (not a
+      // [send, receive] tuple), and room event handlers are property
+      // assignments (not method calls). The old call style throws.
+      const wispAction = room.makeAction('wisp');
+      const chatAction = room.makeAction('chat');
+      this.sendWisp = (data) => wispAction.send(data);
+      this.sendChat = (data) => chatAction.send(data);
+      wispAction.onMessage = (d, info) => {
+        if (this.onWispCb) this.onWispCb(info && info.peerId, d);
+      };
+      chatAction.onMessage = (d, info) => {
+        if (this.onChatCb) this.onChatCb(d, info && info.peerId);
+      };
+      room.onPeerJoin = (id) => {
         this.peers.set(id, true);
         this._clearFallbackTimer(); // someone made it — signaling works
-      });
-      room.onPeerLeave((id) => {
+      };
+      room.onPeerLeave = (id) => {
         this.peers.delete(id);
         if (this.onPeerLeaveCb) this.onPeerLeaveCb(id);
-      });
+      };
     } catch (err) {
       this.enabled = false;
       this.room = null;
