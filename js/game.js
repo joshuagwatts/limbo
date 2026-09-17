@@ -10,7 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=11';
+import { LimboNet } from './net.js?v=13';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=13';
 
 /* ---------------- configuration ---------------- */
 
@@ -39,6 +40,11 @@ function printUrl(realmKey) {
 
 const ECHOES_PER_REALM = 5;
 const TOTAL_ECHOES = REALM_DEFS.length * ECHOES_PER_REALM;
+/* The sound room (build 12): a 5th portal and a social space, NOT a
+   progression realm — no echoes, no attunement, so none of the
+   REALM_DEFS-based math (echo totals, unlock thresholds, prints) moves. */
+const SOUND_DEF = { key: 'soundroom', name: 'SOUND ROOM', accent: 0xffc24d, root: 98.0 };
+const SOUND_ROOM_KEY = SOUND_DEF.key; // world key used by goTo()
 const NEXUS_BOUND = 40;       // horizontal leash in the hub
 const PORTAL_TRIGGER = 3.0;   // wisp-to-portal distance that teleports
 const ECHO_TRIGGER = 2.6;     // wisp-to-echo distance that collects
@@ -95,7 +101,9 @@ try { myName = localStorage.getItem('limbo_name') || 'drifter'; } catch (e) { /*
 if (nameInput && myName !== 'drifter') nameInput.value = myName;
 
 function roomKeyFor(worldKey) {
-  return worldKey === 'nexus' ? 'limbo-nexus' : 'limbo-realm-' + worldKey.replace('realm', '');
+  if (worldKey === 'nexus') return 'limbo-nexus';
+  if (worldKey === SOUND_ROOM_KEY) return 'limbo-realm-5';
+  return 'limbo-realm-' + worldKey.replace('realm', '');
 }
 
 /* ---------------- tiny utils ---------------- */
@@ -678,13 +686,14 @@ function livePresenceFor(name) {
   let best = null;
   for (const [pid, p] of net.lobbyPeers) {
     if (String(p.name).toLowerCase() === lc && (!best || p.lastSeen > best.lastSeen)) {
-      best = { peerId: pid, name: p.name, room: p.room, lastSeen: p.lastSeen };
+      best = { peerId: pid, name: p.name, room: p.room, dj: p.dj || null, lastSeen: p.lastSeen };
     }
   }
   return best;
 }
 function realmDisplayName(key) {
   if (key === 'nexus') return NEXUS_DEF.name;
+  if (key === SOUND_ROOM_KEY) return SOUND_DEF.name;
   const d = REALM_DEFS.find((r) => r.key === key);
   return d ? d.name : String(key || '').toUpperCase();
 }
@@ -711,7 +720,8 @@ function renderFriendsSection() {
     if (live) {
       const where = document.createElement('span');
       where.className = 'friend-realm';
-      where.textContent = realmDisplayName(live.room);
+      // A DJing friend shows "on the decks" instead of the room name.
+      where.textContent = live.dj ? '\u{1F534} on the decks' : realmDisplayName(live.room);
       const join = document.createElement('button');
       join.className = 'friend-join';
       join.textContent = 'join';
@@ -735,6 +745,737 @@ function renderFriendsSection() {
   if (friendsLiveEl) friendsLiveEl.textContent = liveCount > 0 ? `— ${liveCount} drifting now` : '';
 }
 
+/* ---------------- sound room: DJ slot + listeners (build 12) ----------------
+   One DJ at a time. The DJ shares desktop audio (Chrome tab share); the
+   room claims resolve through net's djClaim channel (earliest fresh claim
+   wins) and the audio rides Trystero's media API (addTrack/onPeerTrack).
+   Listeners hear the same room-wide mix. An analyser on either side feeds
+   the room's bass-reactive lights. */
+
+const djLineEl = document.getElementById('dj-line');
+const decksBtn = document.getElementById('decks-btn');
+
+const dj = {
+  active: false,      // WE hold the decks
+  stream: null,       // our captured desktop audio (DJ side)
+  track: null,
+  node: null,         // DJ-side analyser source node
+  analyser: null,
+  analyserData: null,
+  listenPeerId: null, // whose track we're hearing (listener side)
+  listenNode: null,
+  listenAnalyser: null,
+  listenAnalyserData: null,
+  listenAudioEl: null,
+};
+let djBassSmooth = 0; // 0..1, eased — drives the room pulse
+let djAudioRetryArmed = false;
+
+/* Small FFT on a stream; the room only cares about bass. Reuses the game's
+   AudioContext when the generative engine is running. */
+function makeAnalyserFor(stream) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx = null;
+    try { ctx = audio.ctx || null; } catch (e) {}
+    if (!ctx) {
+      if (!AC) return null;
+      ctx = new AC();
+    }
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const node = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 64; // 32 bins; bass lives in the first few
+    node.connect(analyser);
+    return { node, analyser, data: new Uint8Array(analyser.frequencyBinCount) };
+  } catch (e) {
+    return null;
+  }
+}
+
+function detachDjAnalyser() {
+  if (dj.node) { try { dj.node.disconnect(); } catch (e) {} dj.node = null; }
+  dj.analyser = null;
+  dj.analyserData = null;
+}
+
+/* Listener side: play the DJ's stream room-wide (not spatialized). */
+function attachDjListener(stream) {
+  detachDjListener();
+  const el = document.createElement('audio');
+  el.srcObject = stream;
+  el.autoplay = true;
+  el.playsInline = true;
+  try { el.muted = audio.muted; } catch (e) {}
+  dj.listenAudioEl = el;
+  const a = makeAnalyserFor(stream);
+  if (a) {
+    dj.listenNode = a.node;
+    dj.listenAnalyser = a.analyser;
+    dj.listenAnalyserData = a.data;
+  }
+  const tryPlay = () => el.play().catch(() => {
+    // Autoplay policy: wait for the next gesture, then try again.
+    if (djAudioRetryArmed) return;
+    djAudioRetryArmed = true;
+    const retry = () => {
+      djAudioRetryArmed = false;
+      window.removeEventListener('pointerdown', retry);
+      if (dj.listenAudioEl === el) tryPlay();
+    };
+    window.addEventListener('pointerdown', retry);
+  });
+  tryPlay();
+}
+
+function detachDjListener() {
+  if (dj.listenAudioEl) {
+    try { dj.listenAudioEl.pause(); } catch (e) {}
+    dj.listenAudioEl.srcObject = null;
+    dj.listenAudioEl = null;
+  }
+  if (dj.listenNode) { try { dj.listenNode.disconnect(); } catch (e) {} dj.listenNode = null; }
+  dj.listenAnalyser = null;
+  dj.listenAnalyserData = null;
+  dj.listenPeerId = null;
+}
+
+/* Earliest fresh claim wins — ours included when we hold the decks. */
+function djWinner() {
+  let best = null;
+  if (net.myDjClaim) best = { name: myName, isSelf: true, t: net.myDjClaim.t };
+  for (const [pid, c] of net.djClaims) {
+    if (!best || c.t < best.t) best = { name: c.name, isSelf: false, peerId: pid, t: c.t };
+  }
+  return best;
+}
+
+function renderDjHud() {
+  const inRoom = !!(active && active.key === SOUND_ROOM_KEY);
+  if (jamBtn) jamBtn.style.display = inRoom ? '' : 'none';
+  if (decksBtn) {
+    decksBtn.style.display = inRoom ? '' : 'none';
+    if (inRoom) decksBtn.textContent = dj.active ? 'leave the decks' : 'take the decks';
+  }
+  if (!djLineEl) return;
+  if (!inRoom) {
+    djLineEl.textContent = '';
+    djLineEl.style.display = 'none';
+    return;
+  }
+  const w = djWinner();
+  if (w) {
+    const n = net.peers.size + 1;
+    djLineEl.textContent = `\u{1F3A7} ${w.name} is on the decks \u00B7 ${n} listening`;
+  } else {
+    djLineEl.textContent = 'the decks are open';
+  }
+  djLineEl.style.display = '';
+}
+
+async function takeDecks() {
+  if (dj.active) return true;
+  if (!active || active.key !== SOUND_ROOM_KEY) return false;
+  const coarse = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+  const gdm = navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia;
+  if (!gdm) {
+    const note = coarse
+      ? 'the decks need desktop Chrome \u2014 phones are for listening \u{1F3A7}'
+      : 'this browser can\u2019t share tab audio \u2014 the decks stay open';
+    showUnlockToast([note]);
+    addSystemLine(note);
+    return false;
+  }
+  let disp;
+  try {
+    // Video is requested for the picker UI on some browsers; stopped at once.
+    disp = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  } catch (e) {
+    addSystemLine('the decks stay open \u2014 screen share was dismissed');
+    return false;
+  }
+  try {
+    const vids = disp.getVideoTracks ? disp.getVideoTracks() : [];
+    vids.forEach((v) => { try { v.stop(); } catch (e) {} });
+  } catch (e) {}
+  const auds = disp.getAudioTracks ? disp.getAudioTracks() : [];
+  const track = auds[0];
+  if (!track) {
+    addSystemLine('no audio came through \u2014 share a tab with sound playing');
+    return false;
+  }
+  dj.stream = disp;
+  dj.track = track;
+  dj.active = true;
+  const a = makeAnalyserFor(disp);
+  if (a) { dj.node = a.node; dj.analyser = a.analyser; dj.analyserData = a.data; }
+  track.onended = () => stopDecks(); // user stopped sharing from the browser UI
+  if (net.enabled) {
+    net.djStart(track, disp);
+    net.setDj(SOUND_ROOM_KEY); // friends see "on the decks" in the lobby heartbeat
+  }
+  jamOnBecomeDj(); // start the shared beat clock (broadcasts only when net is up)
+  addSystemLine('you\u2019re on the decks \u2014 share a tab with music playing');
+  renderDjHud();
+  renderFriendsSection();
+  return true;
+}
+
+function stopDecks(yielded = false, byName = '') {
+  if (!dj.active) return;
+  dj.active = false;
+  jamStopClock(); // the grid dies with the DJ — a new DJ starts a fresh one
+  jamStopRecorder(); // the sampler's ring buffer dies with the stream
+  detachDjAnalyser();
+  try { if (dj.track) dj.track.stop(); } catch (e) {}
+  dj.track = null;
+  dj.stream = null;
+  net.djStop(); // release the claim + pull the track
+  net.setDj(null);
+  if (yielded && byName) {
+    showUnlockToast([`${byName} took the decks`]);
+    addSystemLine(`${byName} took the decks`);
+  } else if (!yielded) {
+    addSystemLine('you stepped away from the decks');
+  }
+  renderDjHud();
+  renderFriendsSection();
+}
+
+/* ---------------- jam room (build 13) ----------------
+   The sound room becomes a jam space. THE CORE TRICK: instrument audio
+   is never streamed — the internet can't do real-time jam latency
+   (~500ms round trips). Instead, tiny note/pad events ride Trystero's
+   data channel and EVERY client synthesizes the sound locally with
+   WebAudio, scheduled against a shared beat clock. Your own notes play
+   instantly (zero latency for you); everyone else's land quantized on
+   the grid. It feels tight because the timing happens on-device.
+
+   Protocol (sound-room room only, fire-and-forget):
+     jamClock {bpm, startWall, by}  — DJ -> room. startWall is a
+       Date.now() epoch for beat 0; beat = (now - startWall) * bpm/60000.
+       Re-broadcast on BPM change, DJ takeover, and every 15s while
+       DJing (keeps late joiners on the grid).
+     jamNote {n, midi, vel, beat, w, c, r} — any jammer -> room. beat is
+       the target beat on the shared clock (null = free-time, play now).
+       w/c/r carry the sender's patch (wave, cutoff, resonance) so every
+       client renders the same timbre. v1 choice: patch rides each note
+       (3 tiny fields) instead of a separate jamPatch message.
+     jamPad {n, pad, beat, lenBars} — pad trigger. The loop audio itself
+       is NEVER sent: every client grabs its own local copy of the same
+       DJ stream (see the ring buffer below), so triggers quantized to
+       the bar stay musical within network jitter. Honest v1.
+
+   The DJ is the clock master. No DJ -> clock stopped; the synth still
+   plays free-time locally (heard by all, unsynced). */
+
+const jamBtn = document.getElementById('jam-btn');
+const jamPanel = document.getElementById('jam-panel');
+const jamCloseBtn = document.getElementById('jam-close');
+const jamBpmEl = document.getElementById('jam-bpm');
+const jamClockDotEl = document.getElementById('jam-clock-dot');
+const jamClockStatusEl = document.getElementById('jam-clock-status');
+const jamTapEl = document.getElementById('jam-tap');
+const jamBpmDownEl = document.getElementById('jam-bpm-down');
+const jamBpmUpEl = document.getElementById('jam-bpm-up');
+const jamKeysEl = document.getElementById('jam-keys');
+const jamGrabEl = document.getElementById('jam-grab');
+const jamPadsEl = document.getElementById('jam-pads');
+const jamHintEl = document.getElementById('jam-hint');
+const jamJammersEl = document.getElementById('jam-jammers');
+
+const jam = {
+  open: false,
+  bpm: 120,
+  startWall: null, // Date.now() epoch of beat 0; null = clock stopped
+  clockBy: null, // whose clock we're following
+  manual: false, // DJ overrode BPM this session (auto-detect paused)
+  wave: 'sawtooth',
+  cutoff: 1800,
+  reso: 5,
+  pads: [null, null, null, null], // AudioBuffers, local to this client
+  padRound: 0, // next pad to fill on grab (round-robin)
+  rec: null, // ring-buffer recorder on the DJ stream
+  jammers: new Map(), // name -> last note/pad timestamp (30s window)
+  detector: null, // OnsetDetector, while we're the DJ
+  detStable: 0,
+  detLast: null,
+};
+const jamQueue = []; // pending {beat, play(audioTime)} — the lookahead scheduler's list
+let jamVoicesSpawned = 0; // diagnostic counter for the test hook
+let jamTaps = []; // tap-tempo timestamps
+
+/* Current beat on the shared clock, or null when the clock is stopped. */
+function jamBeatNow() {
+  if (jam.startWall == null) return null;
+  return (Date.now() - jam.startWall) * jam.bpm / 60000;
+}
+
+/* AudioContext timestamp for a beat. Clamped to "now" — a beat in the
+   past (late-arriving event) plays immediately rather than throwing. */
+function jamAudioTimeForBeat(beat) {
+  const ctx = audio.ctx;
+  if (!ctx || jam.startWall == null) return null;
+  const wallMs = jam.startWall + (beat * 60000) / jam.bpm;
+  return ctx.currentTime + Math.max(0, (wallMs - Date.now()) / 1000);
+}
+
+function jamEnqueue(ev) {
+  jamQueue.push(ev);
+}
+
+/* Lookahead scheduler: every 25ms, schedule any queued event whose time
+   falls within the next 120ms. The standard WebAudio pattern — absorbs
+   network jitter so remote notes land on the grid. */
+function jamSchedulerTick() {
+  if (!jamQueue.length) return;
+  const ctx = audio.ctx;
+  if (!ctx || jamBeatNow() == null) {
+    // Clock vanished mid-queue: flush immediately, never strand notes.
+    while (jamQueue.length) {
+      const ev = jamQueue.shift();
+      try { ev.play(ctx ? ctx.currentTime + 0.01 : 0); } catch (e) {}
+    }
+    return;
+  }
+  jamQueue.sort((a, b) => a.beat - b.beat);
+  const horizon = ctx.currentTime + 0.12;
+  while (jamQueue.length) {
+    const at = jamAudioTimeForBeat(jamQueue[0].beat);
+    if (at == null || at > horizon) break;
+    const ev = jamQueue.shift();
+    try { ev.play(Math.max(at, ctx.currentTime + 0.005)); } catch (e) {}
+  }
+}
+setInterval(jamSchedulerTick, 25);
+
+/* Render one synth note through the shared-voice builder. Every note
+   spawns fresh nodes — no voice stealing, so overlapping notes from
+   several jammers just layer. */
+function jamRenderNote(midi, vel, audioTime, patch) {
+  const ctx = audio.ctx;
+  if (!ctx || !audio.master) return;
+  jamVoicesSpawned++;
+  playSynthNote(ctx, audio.master, {
+    midi,
+    vel,
+    time: audioTime,
+    wave: (patch && patch.w) || jam.wave,
+    cutoff: (patch && patch.c) || jam.cutoff,
+    resonance: (patch && patch.r) || jam.reso,
+  });
+}
+
+/* YOUR note: plays locally immediately (zero latency for you) and
+   broadcasts quantized to the next 16th so the room hears it on-grid. */
+function jamPlayLocal(midi, vel = 0.9) {
+  const ctx = audio.ctx;
+  jamRenderNote(midi, vel, ctx ? ctx.currentTime + 0.01 : 0, null);
+  const beatNow = jamBeatNow();
+  const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
+  if (net.enabled && net.sendJamNote && active && active.key === SOUND_ROOM_KEY) {
+    try {
+      net.sendJamNote({
+        n: myName, midi, vel, beat,
+        w: jam.wave, c: Math.round(jam.cutoff), r: jam.reso,
+      });
+    } catch (e) { /* ignore */ }
+  }
+  jamMarkJammer(myName);
+  renderJamJammers();
+}
+
+/* Someone else's note: schedule it on the grid (or play now, free-time). */
+function handleJamNote(d, peerId) {
+  if (!d || !Number.isFinite(Number(d.midi))) return;
+  const midi = Math.max(0, Math.min(127, Math.round(Number(d.midi))));
+  const vel = Math.max(0.05, Math.min(1.2, Number(d.vel) || 0.9));
+  const name = String(d.n || 'drifter').slice(0, 16);
+  const beat = d.beat == null ? null : Number(d.beat);
+  const patch = {
+    w: ['sawtooth', 'square', 'mix'].includes(d.w) ? d.w : 'sawtooth',
+    c: Number.isFinite(Number(d.c)) ? Number(d.c) : 1800,
+    r: Number.isFinite(Number(d.r)) ? Number(d.r) : 5,
+  };
+  jamMarkJammer(name);
+  renderJamJammers();
+  if (beat != null && Number.isFinite(beat) && jamBeatNow() != null) {
+    jamEnqueue({ beat, play: (at) => jamRenderNote(midi, vel, at, patch) });
+  } else {
+    jamRenderNote(midi, vel, audio.ctx ? audio.ctx.currentTime + 0.01 : 0, patch);
+  }
+}
+
+/* Pad trigger from a peer: play OUR local copy of that loop. Clients
+   that never grabbed the loop have nothing in the slot — skipped
+   silently. */
+function handleJamPad(d, peerId) {
+  if (!d || !Number.isInteger(d.pad) || d.pad < 0 || d.pad > 3) return;
+  const name = String(d.n || 'drifter').slice(0, 16);
+  const buf = jam.pads[d.pad];
+  jamMarkJammer(name);
+  renderJamJammers();
+  if (!buf) return;
+  const beat = d.beat == null ? null : Number(d.beat);
+  if (beat != null && Number.isFinite(beat) && jamBeatNow() != null) {
+    jamEnqueue({ beat, play: (at) => jamPlayPad(d.pad, at) });
+  } else if (audio.ctx) {
+    jamPlayPad(d.pad, audio.ctx.currentTime + 0.01);
+  }
+}
+
+/* Clock from the room: only the current DJ's clock counts. Stale clocks
+   from a deposed DJ are ignored — the new DJ's grid takes over. */
+function handleJamClock(d, peerId) {
+  if (!d || !Number.isFinite(Number(d.bpm)) || !Number.isFinite(Number(d.startWall))) return;
+  const w = djWinner();
+  if (!w || w.isSelf) return; // we never follow our own echo
+  if (w.peerId !== peerId) return; // not the DJ's clock
+  jam.bpm = Math.max(60, Math.min(200, Number(d.bpm)));
+  jam.startWall = Number(d.startWall);
+  jam.clockBy = String(d.by || w.name).slice(0, 16);
+  renderJamTransport();
+}
+
+function jamBroadcastClock() {
+  if (!dj.active || !net.enabled || !net.sendJamClock) return;
+  if (jam.startWall == null) return;
+  try {
+    net.sendJamClock({ bpm: jam.bpm, startWall: jam.startWall, by: myName });
+  } catch (e) { /* ignore */ }
+}
+
+/* Set the tempo. Phase-preserving: the grid doesn't jump — the current
+   beat stays continuous under the new BPM. */
+function jamSetBpm(bpm, opts = {}) {
+  const { manual = false, broadcast = true } = opts;
+  bpm = Math.max(60, Math.min(200, Math.round(Number(bpm) * 10) / 10));
+  if (!Number.isFinite(bpm)) return;
+  const nowBeat = jamBeatNow();
+  jam.bpm = bpm;
+  jam.startWall = Date.now() - (nowBeat != null ? nowBeat : 0) * (60000 / bpm);
+  if (manual) jam.manual = true; // DJ override pauses auto-detect for the session
+  if (broadcast) jamBroadcastClock();
+  renderJamTransport();
+}
+
+function jamStopClock() {
+  jam.startWall = null;
+  jam.clockBy = null;
+  renderJamTransport();
+}
+
+/* We just took the decks: fresh grid, auto-detect armed for this session. */
+function jamOnBecomeDj() {
+  jam.manual = false;
+  jam.detector = new OnsetDetector();
+  jam.detStable = 0;
+  jam.detLast = null;
+  jamTaps = [];
+  jam.startWall = Date.now();
+  jam.clockBy = myName;
+  jamBroadcastClock();
+  renderJamTransport();
+}
+
+/* Tap tempo: 3+ taps set the BPM from the median interval. Any manual
+   tempo move pauses auto-detect for the rest of the DJ session. */
+function jamTapTempo() {
+  if (!dj.active) return;
+  const now = Date.now();
+  if (jamTaps.length && now - jamTaps[jamTaps.length - 1] > 2000) jamTaps = [];
+  jamTaps.push(now);
+  if (jamTaps.length > 6) jamTaps.shift();
+  if (jamTaps.length >= 3) {
+    const iv = [];
+    for (let i = 1; i < jamTaps.length; i++) iv.push(jamTaps[i] - jamTaps[i - 1]);
+    iv.sort((a, b) => a - b);
+    const med = iv[Math.floor(iv.length / 2)];
+    if (med > 240 && med < 1200) jamSetBpm(60000 / med, { manual: true });
+  }
+  if (jamTapEl) {
+    jamTapEl.classList.add('tapped');
+    setTimeout(() => jamTapEl.classList.remove('tapped'), 120);
+  }
+}
+
+/* Auto-BPM: once a second, feed the DJ stream's analyser to the onset
+   detector and adopt a stable new estimate. Runs only while WE are the
+   DJ and only until a manual override. */
+function jamDetectTick() {
+  if (!dj.active || jam.manual) return;
+  const an = dj.analyser;
+  if (!an) return;
+  if (!jam.detector) jam.detector = new OnsetDetector();
+  const est = estimateBpm(jam.detector.process(an));
+  if (est == null) return;
+  const r = Math.round(est);
+  if (Math.abs(r - Math.round(jam.bpm)) <= 2) {
+    jam.detStable = 0;
+    jam.detLast = null;
+    return;
+  }
+  if (jam.detLast === r) jam.detStable++;
+  else { jam.detLast = r; jam.detStable = 1; }
+  // Adopt only if the estimate persists ~4s — no jumpy tempos.
+  if (jam.detStable >= 4) {
+    jamSetBpm(r);
+    jam.detStable = 0;
+    jam.detLast = null;
+  }
+}
+setInterval(jamDetectTick, 1000);
+
+/* ---------------- sampler: ring buffer on the DJ stream ----------------
+   A ScriptProcessorNode taps the DJ stream (ours when we're on the
+   decks, the remote one when we're listening) into a 12s mono ring
+   buffer. "Grab loop" copies the last 2 bars (or 4s with no clock) into
+   the next pad. ScriptProcessor is deprecated but universally supported;
+   an AudioWorklet ring would be the upgrade path — capture latency is
+   irrelevant here since we only ever read the buffer on demand. */
+
+function jamStopRecorder() {
+  const rec = jam.rec;
+  jam.rec = null;
+  if (!rec) return;
+  try { rec.proc.onaudioprocess = null; } catch (e) {}
+  try { rec.src.disconnect(); } catch (e) {}
+  try { rec.proc.disconnect(); } catch (e) {}
+  try { rec.sink.disconnect(); } catch (e) {}
+}
+
+function jamEnsureRecorder() {
+  const stream =
+    dj.stream || (dj.listenAudioEl && dj.listenAudioEl.srcObject) || null;
+  if (!stream) return null;
+  if (jam.rec && jam.rec.stream === stream) return jam.rec;
+  jamStopRecorder();
+  try {
+    const ctx = audio.ctx;
+    if (!ctx || typeof ctx.createScriptProcessor !== 'function') return null;
+    const src = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 2, 1);
+    const ringLen = Math.floor(ctx.sampleRate * 12);
+    const rec = { stream, ctx, src, proc, ring: new Float32Array(ringLen), w: 0, sink: null };
+    const sink = ctx.createGain();
+    sink.gain.value = 0; // ScriptProcessor needs a connected output to run
+    rec.sink = sink;
+    proc.onaudioprocess = (e) => {
+      const ib = e.inputBuffer;
+      const c0 = ib.getChannelData(0);
+      const c1 = ib.numberOfChannels > 1 ? ib.getChannelData(1) : null;
+      for (let i = 0; i < c0.length; i++) {
+        rec.ring[rec.w] = c1 ? (c0[i] + c1[i]) * 0.5 : c0[i];
+        rec.w = (rec.w + 1) % ringLen;
+      }
+    };
+    src.connect(proc);
+    proc.connect(sink);
+    sink.connect(ctx.destination);
+    jam.rec = rec;
+    return rec;
+  } catch (e) {
+    return null;
+  }
+}
+
+function jamGrabLoop() {
+  const rec = jamEnsureRecorder();
+  if (!rec) {
+    showUnlockToast(['need the decks live to sample \u{1F3A7}']);
+    renderJamSamplerHint();
+    return false;
+  }
+  const clockOn = jamBeatNow() != null;
+  const lenSec = clockOn ? (8 * 60) / jam.bpm : 4; // 2 bars, or 4s free-time
+  const ctx = rec.ctx;
+  const n = Math.max(1, Math.min(Math.floor(lenSec * ctx.sampleRate), rec.ring.length));
+  const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+  const out = buf.getChannelData(0);
+  let r = (((rec.w - n) % rec.ring.length) + rec.ring.length) % rec.ring.length;
+  for (let i = 0; i < n; i++) {
+    out[i] = rec.ring[r];
+    r = (r + 1) % rec.ring.length;
+  }
+  const slot = jam.padRound;
+  jam.pads[slot] = buf;
+  jam.padRound = (jam.padRound + 1) % jam.pads.length;
+  addSystemLine(`loop grabbed — pad ${slot + 1} is loaded`);
+  renderJamPads();
+  renderJamSamplerHint();
+  return true;
+}
+
+function jamPlayPad(i, audioTime) {
+  const ctx = audio.ctx;
+  const buf = jam.pads[i];
+  if (!ctx || !buf || !audio.master) return;
+  try {
+    const t = Math.max(audioTime || 0, ctx.currentTime);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const g = ctx.createGain();
+    g.gain.value = 0.85;
+    src.connect(g);
+    g.connect(audio.master);
+    src.start(t);
+  } catch (e) { /* ignore */ }
+}
+
+/* Tap a pad: quantized to the next bar (or immediately, no clock).
+   The trigger is broadcast; every client plays its OWN local copy. */
+function jamTriggerPad(i) {
+  if (!jam.pads[i]) {
+    showUnlockToast(['pad empty — grab a loop first']);
+    return false;
+  }
+  const beatNow = jamBeatNow();
+  const beat = beatNow != null ? quantizeUp(beatNow, 4) : null;
+  if (net.enabled && net.sendJamPad && active && active.key === SOUND_ROOM_KEY) {
+    try {
+      net.sendJamPad({ n: myName, pad: i, beat, lenBars: beatNow != null ? 2 : 0 });
+    } catch (e) { /* ignore */ }
+  }
+  if (beat != null) jamEnqueue({ beat, play: (at) => jamPlayPad(i, at) });
+  else if (audio.ctx) jamPlayPad(i, audio.ctx.currentTime + 0.01);
+  jamMarkJammer(myName);
+  renderJamJammers();
+  return true;
+}
+
+/* ---------------- who's jamming ---------------- */
+
+function jamMarkJammer(name) {
+  jam.jammers.set(String(name || 'drifter').slice(0, 16), Date.now());
+}
+
+function renderJamJammers() {
+  if (!jamJammersEl) return;
+  const now = Date.now();
+  const names = [];
+  for (const [n, t] of jam.jammers) {
+    if (now - t < 30000) names.push(n);
+    else jam.jammers.delete(n);
+  }
+  jamJammersEl.textContent = names.length
+    ? 'jamming now: ' + names.join(', ')
+    : 'the room is quiet — play something \u{1F3B9}';
+}
+setInterval(() => { if (jam.open) renderJamJammers(); }, 5000);
+
+/* ---------------- jam panel UI ---------------- */
+
+function setJamPanel(open) {
+  jam.open = !!open;
+  if (jamPanel) jamPanel.classList.toggle('open', jam.open);
+  chatFocused = jam.open; // reuse the chat guard: keys never fly the wisp mid-jam
+  if (jam.open) {
+    renderJamTransport();
+    renderJamPads();
+    renderJamSamplerHint();
+    renderJamJammers();
+  }
+}
+
+function renderJamTransport() {
+  if (!jamPanel) return;
+  if (jamBpmEl) jamBpmEl.textContent = Math.round(jam.bpm);
+  const on = jam.startWall != null;
+  if (jamClockStatusEl) {
+    jamClockStatusEl.textContent = !on
+      ? 'clock stopped'
+      : dj.active
+        ? `you're the clock · ${jam.manual ? 'manual' : 'auto-detect'}`
+        : `synced · ${jam.clockBy || 'dj'}`;
+  }
+  if (jamClockDotEl) jamClockDotEl.classList.toggle('live', on);
+  // Only the DJ sets the tempo.
+  const canSet = dj.active;
+  for (const b of [jamTapEl, jamBpmDownEl, jamBpmUpEl]) {
+    if (b) {
+      b.disabled = !canSet;
+      b.title = canSet ? '' : 'the DJ sets the tempo';
+    }
+  }
+}
+
+function renderJamPads() {
+  if (!jamPadsEl) return;
+  jamPadsEl.innerHTML = '';
+  for (let i = 0; i < 4; i++) {
+    const b = document.createElement('button');
+    b.className = 'jam-pad' + (jam.pads[i] ? ' loaded' : '');
+    b.textContent = jam.pads[i] ? `${i + 1}` : '·';
+    b.setAttribute('aria-label', jam.pads[i] ? `play loop ${i + 1}` : `pad ${i + 1} (empty)`);
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamTriggerPad(i); });
+    jamPadsEl.appendChild(b);
+  }
+}
+
+function renderJamSamplerHint() {
+  if (!jamHintEl) return;
+  const live = !!(dj.stream || (dj.listenAudioEl && dj.listenAudioEl.srcObject));
+  jamHintEl.textContent = !live
+    ? 'need the decks live to sample \u{1F3A7}'
+    : jam.pads.every((p) => !p)
+      ? 'grab a loop from the decks, then tap a pad on the bar'
+      : '';
+}
+
+function buildJamKeys() {
+  if (!jamKeysEl) return;
+  jamKeysEl.innerHTML = '';
+  const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  for (let i = 0; i <= 12; i++) {
+    const midi = 60 + i; // one chromatic octave, C4–C5
+    const black = [1, 3, 6, 8, 10].includes(i % 12);
+    const b = document.createElement('button');
+    b.className = 'jam-key' + (black ? ' black' : '');
+    b.textContent = black ? '' : names[i % 12];
+    b.setAttribute('aria-label', names[i % 12] + (4 + Math.floor(i / 12)));
+    // pointerdown (not click): notes fire the instant the finger lands.
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamPlayLocal(midi, 0.9); });
+    jamKeysEl.appendChild(b);
+  }
+}
+
+if (jamBtn) {
+  jamBtn.addEventListener('click', () => {
+    setJamPanel(!jam.open);
+    jamBtn.blur();
+  });
+}
+if (jamCloseBtn) jamCloseBtn.addEventListener('click', () => setJamPanel(false));
+if (jamTapEl) jamTapEl.addEventListener('click', () => { jamTapTempo(); jamTapEl.blur(); });
+if (jamBpmDownEl) jamBpmDownEl.addEventListener('click', () => { jamSetBpm(jam.bpm - 1, { manual: true }); jamBpmDownEl.blur(); });
+if (jamBpmUpEl) jamBpmUpEl.addEventListener('click', () => { jamSetBpm(jam.bpm + 1, { manual: true }); jamBpmUpEl.blur(); });
+if (jamGrabEl) jamGrabEl.addEventListener('click', () => { jamGrabLoop(); jamGrabEl.blur(); });
+document.querySelectorAll('.jam-wave').forEach((b) => {
+  b.addEventListener('click', () => {
+    jam.wave = b.dataset.wave || 'sawtooth';
+    document.querySelectorAll('.jam-wave').forEach((x) =>
+      x.classList.toggle('sel', x === b));
+    b.blur();
+  });
+});
+{
+  const first = document.querySelector('.jam-wave');
+  if (first) first.classList.add('sel');
+}
+const jamCutoffEl = document.getElementById('jam-cutoff');
+const jamResoEl = document.getElementById('jam-reso');
+if (jamCutoffEl) jamCutoffEl.addEventListener('input', () => { jam.cutoff = Number(jamCutoffEl.value) || 1800; });
+if (jamResoEl) jamResoEl.addEventListener('input', () => { jam.reso = Number(jamResoEl.value) || 0; });
+
+
+if (decksBtn) {
+  decksBtn.addEventListener('click', () => {
+    if (dj.active) stopDecks();
+    else takeDecks();
+    decksBtn.blur();
+  });
+}
+
 // Boot: dress the wisp in the saved look; net reads the equipped look
 // for every ~12Hz broadcast so peers see it too.
 applySkin(equipped.skin);
@@ -743,6 +1484,7 @@ applyTrail();
 renderWispSection(); // populate the settings WISP section for first open
 renderPrintsSection(); // populate the settings PRINTS section
 renderFriendsSection(); // populate the settings FRIENDS section
+buildJamKeys(); // one-octave synth keyboard for the jam panel
 net.cosmetics = () => {
   const tc = TRAIL_COLORS[equipped.trailColor] || TRAIL_COLORS.white;
   return {
@@ -827,6 +1569,175 @@ function makePortal(artTexture, accent, labelText, ringR = 2.2, tube = 0.16) {
   return { group, ring };
 }
 
+/* Procedural portal art for the sound room: amber EQ bars on dark. */
+function makeSoundTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#0a0703';
+  g.fillRect(0, 0, 256, 256);
+  const rnd = mulberry32(4242);
+  const n = 18;
+  for (let i = 0; i < n; i++) {
+    const h = 40 + rnd() * 150;
+    const x = 14 + i * ((256 - 28) / n);
+    const w = (256 - 28) / n - 6;
+    const grad = g.createLinearGradient(0, 256 - h, 0, 256);
+    grad.addColorStop(0, '#ffc24d');
+    grad.addColorStop(1, '#ff7a3d');
+    g.fillStyle = grad;
+    g.globalAlpha = 0.92;
+    g.fillRect(x, 256 - 14 - h, w, h);
+  }
+  g.globalAlpha = 1;
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/* ---------------- the sound room (build 12) ----------------
+   A 5th portal off the Nexus: a social listening space with a DJ booth
+   and the four realm artworks hanging as a gallery. No echoes, no
+   attunement — the room is for hanging out, not progression. */
+function buildSoundRoom(textures) {
+  const accent = SOUND_DEF.accent;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x020204);
+  scene.fog = new THREE.FogExp2(0x0a0610, 0.012);
+  scene.add(new THREE.AmbientLight(0x99aacc, 0.5));
+
+  // Floor.
+  const floor = new THREE.Mesh(
+    new THREE.CircleGeometry(34, 48),
+    new THREE.MeshStandardMaterial({ color: 0x0b0b12, roughness: 0.9, metalness: 0.1 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  scene.add(floor);
+
+  // Four walls.
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0x080810, roughness: 1 });
+  const wallGeo = new THREE.PlaneGeometry(68, 18);
+  const walls = [
+    { p: [0, 9, -34], r: 0 },
+    { p: [34, 9, 0], r: Math.PI / 2 },
+    { p: [0, 9, 34], r: Math.PI },
+    { p: [-34, 9, 0], r: -Math.PI / 2 },
+  ];
+  for (const w of walls) {
+    const m = new THREE.Mesh(wallGeo, wallMat);
+    m.position.set(...w.p);
+    m.rotation.y = w.r;
+    scene.add(m);
+  }
+
+  // Gallery: the four realm artworks, framed, one per wall.
+  const galleryFiles = [];
+  const frameDefs = [
+    { def: REALM_DEFS[0], p: [0, 8, -33.7], r: 0 },
+    { def: REALM_DEFS[1], p: [33.7, 8, 0], r: -Math.PI / 2 },
+    { def: REALM_DEFS[2], p: [0, 8, 33.7], r: Math.PI },
+    { def: REALM_DEFS[3], p: [-33.7, 8, 0], r: Math.PI / 2 },
+  ];
+  for (const f of frameDefs) {
+    const tex = textures[f.def.key];
+    const img = tex && tex.image ? tex.image : null;
+    const aspect = img ? img.width / img.height : 1;
+    const AW = 15, AH = Math.min(AW / aspect, 11);
+    const frame = new THREE.Group();
+    const back = new THREE.Mesh(
+      new THREE.PlaneGeometry(AW + 1.2, AH + 1.2),
+      new THREE.MeshStandardMaterial({ color: f.def.accent, emissive: f.def.accent, emissiveIntensity: 0.25, roughness: 0.4, metalness: 0.6 })
+    );
+    const art = new THREE.Mesh(
+      new THREE.PlaneGeometry(AW, AH),
+      new THREE.MeshBasicMaterial({ map: tex })
+    );
+    art.position.z = 0.08;
+    frame.add(back, art);
+    frame.position.set(...f.p);
+    frame.rotation.y = f.r;
+    scene.add(frame);
+    galleryFiles.push(f.def.file);
+  }
+
+  // DJ booth: platform, two decks, mixer, amber glow.
+  const booth = new THREE.Group();
+  const boothMat = new THREE.MeshStandardMaterial({ color: 0x14141c, roughness: 0.6, metalness: 0.4 });
+  const platform = new THREE.Mesh(new THREE.BoxGeometry(11, 1, 5), boothMat);
+  platform.position.y = 0.5;
+  booth.add(platform);
+  const deckGeo = new THREE.CylinderGeometry(1.6, 1.6, 0.5, 32);
+  const deckMat = new THREE.MeshStandardMaterial({ color: 0x1c1c26, roughness: 0.4, metalness: 0.7 });
+  for (const dx of [-2.6, 2.6]) {
+    const deck = new THREE.Mesh(deckGeo, deckMat);
+    deck.position.set(dx, 1.3, 0);
+    booth.add(deck);
+    const platter = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.1, 1.1, 0.56, 32),
+      new THREE.MeshStandardMaterial({ color: 0x0a0a10, roughness: 0.3, metalness: 0.8 })
+    );
+    platter.position.set(dx, 1.3, 0);
+    booth.add(platter);
+  }
+  const mixer = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.6, 1.6), boothMat);
+  mixer.position.set(0, 1.3, 0.4);
+  booth.add(mixer);
+  const boothGlow = new THREE.Sprite(
+    new THREE.SpriteMaterial({ map: glowTex, color: accent, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false })
+  );
+  boothGlow.scale.set(16, 10, 1);
+  boothGlow.position.y = 3.4;
+  booth.add(boothGlow);
+  booth.position.set(0, 0, -24);
+  scene.add(booth);
+
+  // Accent lights that pulse with the music (see update + setBass).
+  const lightA = new THREE.PointLight(accent, 1.2, 60);
+  lightA.position.set(-12, 9, -8);
+  const lightB = new THREE.PointLight(accent, 1.2, 60);
+  lightB.position.set(12, 9, -8);
+  scene.add(lightA, lightB);
+
+  const dust = makeDust(200, 40, accent, 0.6);
+  scene.add(dust.pts);
+
+  // Return portal to the Nexus.
+  const { group, ring } = makePortal(makeSoundTexture(), accent, 'RETURN', 1.7, 0.14);
+  group.position.set(0, 3, 26);
+  group.lookAt(0, 5, 10);
+  scene.add(group);
+  const portals = [{ group, ring, pos: group.position.clone(), target: 'nexus', phase: 0.6, baseY: 3 }];
+
+  return {
+    key: SOUND_DEF.key, name: SOUND_DEF.name, root: SOUND_DEF.root,
+    scene, portals, echoes: [],
+    gallery: galleryFiles, // realm artwork files on the walls — tests check these are real
+    spawn: new THREE.Vector3(0, 2, 20), spawnYaw: 0, // face the booth (-Z)
+    bound: 'realm',
+    anim: { dust, lightA, lightB, boothGlow, bass: 0 },
+    attunedShown: true, // n/a: no echoes here, nothing to attune
+    setBass(v) { this.anim.bass = Math.max(0, Math.min(1, v)); },
+    update(dt, t) {
+      const { dust, lightA, lightB, boothGlow } = this.anim;
+      const bass = this.anim.bass;
+      dust.pts.rotation.y += dt * 0.02;
+      for (const pt of this.portals) {
+        pt.group.position.y = pt.baseY + Math.sin(t * 0.8 + pt.phase) * 0.3;
+        pt.ring.rotation.z -= dt * 0.15;
+        pt.pos.copy(pt.group.position);
+      }
+      // The room breathes with the music; idle when nobody's on the decks.
+      const pulse = 1 + bass * 2.2 + Math.sin(t * 1.4) * 0.08;
+      lightA.intensity = 1.2 * pulse;
+      lightB.intensity = 1.2 * (2 - pulse) + 1.2 + bass; // counter-phase shimmer
+      boothGlow.material.opacity = 0.4 + bass * 0.5;
+      const gs = 16 + bass * 6;
+      boothGlow.scale.set(gs, gs * 0.62, 1);
+      scene.fog.density = 0.012 + bass * 0.008;
+    },
+  };
+}
+
 function buildNexus(textures) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x020204);
@@ -839,9 +1750,16 @@ function buildNexus(textures) {
   scene.add(starsFar, starsNear, dust.pts);
 
   const portals = [];
-  REALM_DEFS.forEach((def, i) => {
-    const a = (i / REALM_DEFS.length) * Math.PI * 2;
-    const { group, ring } = makePortal(textures[def.key], def.accent, def.name);
+  // The 4 realm portals + the sound room portal (build 12).
+  const portalDefs = REALM_DEFS.map((def) => ({
+    key: def.key, name: def.name, accent: def.accent, tex: textures[def.key],
+  })).concat([{
+    key: SOUND_DEF.key, name: SOUND_DEF.name, accent: SOUND_DEF.accent,
+    tex: makeSoundTexture(),
+  }]);
+  portalDefs.forEach((def, i) => {
+    const a = (i / portalDefs.length) * Math.PI * 2;
+    const { group, ring } = makePortal(def.tex, def.accent, def.name);
     group.position.set(Math.cos(a) * 16, 2.5, Math.sin(a) * 16);
     group.lookAt(0, 2.5, 0);
     scene.add(group);
@@ -1034,6 +1952,7 @@ function finishBoot() {
   try {
     worlds.nexus = buildNexus(textures);
     for (const def of REALM_DEFS) worlds[def.key] = buildRealm(def, textures[def.key]);
+    worlds[SOUND_DEF.key] = buildSoundRoom(textures);
   } catch (err) {
     // Last resort: say so on screen instead of a dead "loading…" hang.
     loadingEl.firstElementChild.textContent = 'limbo failed to wake — reload to try again';
@@ -1046,6 +1965,7 @@ function finishBoot() {
   wisp.position.copy(active.spawn);
   yaw = active.spawnYaw;
   clearTrail();
+  renderDjHud(); // decks button starts hidden (we boot in the Nexus)
 
   loadingEl.classList.add('done');
   driftBtn.disabled = false;
@@ -1300,6 +2220,8 @@ function showTitleCard(name) {
 
 function goTo(key) {
   if (transitioning || !worlds[key]) return;
+  // Leaving the sound room: step away from the decks automatically.
+  if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) stopDecks();
   transitioning = true;
   fadeEl.classList.add('on');
   setTimeout(() => {
@@ -1317,6 +2239,7 @@ function goTo(key) {
     realmNameEl.textContent = active.name;
     audio.setRoot(active.root);
     showTitleCard(active.name);
+    renderDjHud(); // show/hide the decks button + DJ line for this room
     fadeEl.classList.remove('on');
     lastTransition = clock.elapsedTime;
     setTimeout(() => { transitioning = false; }, 700);
@@ -1502,6 +2425,11 @@ function handlePeerLeave(id) {
     peerVisuals.delete(id);
   }
   peerPositions.delete(id);
+  // DJ slot: if we were listening to them, the music stops.
+  if (dj.listenPeerId === id) {
+    detachDjListener();
+    renderDjHud();
+  }
   updatePeerCount();
 }
 
@@ -1532,6 +2460,37 @@ net.onChatCb = (d, peerId) => {
 net.onQuietCb = () =>
   addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
 net.onPresenceCb = () => { if (settingsOpen) renderFriendsSection(); };
+// DJ slot (build 12): claims changed — re-resolve the slot, yield if beaten.
+net.onDjCb = () => {
+  const w = djWinner();
+  if (dj.active && w && !w.isSelf) {
+    stopDecks(true, w.name); // their claim is earlier: yield gracefully
+    return;
+  }
+  if (!dj.active && !w) {
+    detachDjListener(); // decks empty: stop any audio
+    jamStopRecorder();
+    jamStopClock(); // no DJ, no clock
+  }
+  renderDjHud();
+  if (settingsOpen) renderFriendsSection();
+};
+// Someone's audio track arrived — listen only if they're the current DJ.
+net.onRemoteTrackCb = (track, stream, peerId) => {
+  if (!active || active.key !== SOUND_ROOM_KEY) return;
+  const w = djWinner();
+  if (w && !w.isSelf && w.peerId !== peerId) return; // not the DJ's track
+  attachDjListener(stream); // starts with detachDjListener, so set the peer after
+  dj.listenPeerId = peerId;
+  addSystemLine(`${w ? w.name : 'a drifter'} is on the decks \u{1F3A7}`);
+  renderDjHud();
+};
+
+// Jam room (build 13): clock/note/pad events -> local synthesis.
+net.onJamClockCb = handleJamClock;
+net.onJamNoteCb = handleJamNote;
+net.onJamPadCb = handleJamPad;
+net.onJamTickCb = () => jamBroadcastClock(); // 15s clock re-broadcast while we hold the decks
 
 /* ---------------- settings panel ----------------
    Gear button opens it; D key is a desktop shortcut to the same panel.
@@ -1552,6 +2511,7 @@ function setSettings(open) {
 function setMuted(muted) {
   muteEl.textContent = muted ? 'SOUND OFF' : 'SOUND ON';
   soundToggle.textContent = muted ? 'OFF' : 'ON';
+  if (dj.listenAudioEl) { try { dj.listenAudioEl.muted = muted; } catch (e) {} }
   try { localStorage.setItem('limbo_muted', muted ? '1' : ''); } catch (e) { /* ignore */ }
 }
 gearBtn.addEventListener('click', (e) => {
@@ -1769,6 +2729,25 @@ function loop() {
   const t = clock.elapsedTime;
 
   active.update(dt, t);
+
+  // Sound room reactivity (build 12): bass energy from the DJ stream —
+  // ours when we're on the decks, the remote one when we're listening.
+  {
+    let target = 0;
+    const an = dj.analyser || dj.listenAnalyser;
+    const data = dj.analyserData || dj.listenAnalyserData;
+    if (an && data) {
+      try {
+        an.getByteFrequencyData(data);
+        let s = 0, n = 0;
+        for (let i = 1; i < 8 && i < data.length; i++) { s += data[i]; n++; }
+        target = n ? (s / n / 255) * 1.6 : 0;
+      } catch (e) {}
+    }
+    djBassSmooth += (Math.min(1, target) - djBassSmooth) * Math.min(1, dt * 6);
+    if (active.key === SOUND_ROOM_KEY && active.setBass) active.setBass(djBassSmooth);
+  }
+
   updatePlayer(dt);
   checkPortals();
   checkEchoes();
@@ -1867,4 +2846,70 @@ window.__limbo = {
   notePresence: (id, d) => net._notePresence(id, d),
   sweepLobby: (now) => net._sweepLobby(now),
   joinLobby: () => net.joinLobby(),
+  // sound room + DJ slot (build 12)
+  SOUND_DEF,
+  worldKeys: () => Object.keys(worlds),
+  nexusPortals: () => (worlds.nexus ? worlds.nexus.portals.map((p) => p.target) : []),
+  galleryFiles: () => (worlds.soundroom && worlds.soundroom.gallery ? worlds.soundroom.gallery.slice() : []),
+  takeDecks,
+  stopDecks,
+  djState: () => ({
+    active: dj.active,
+    winner: djWinner(),
+    claims: [...net.djClaims.entries()].map(([id, c]) => ({ id, ...c })),
+    listening: !!dj.listenAudioEl,
+    listenPeerId: dj.listenPeerId,
+    bass: djBassSmooth,
+  }),
+  noteDjClaim: (id, d) => net._noteDjClaim(id, d),
+  sweepDj: (now) => net._sweepDjClaims(now),
+  djClaimPayload: () => net._djClaimPayload(),
+  setDj: (r) => net.setDj(r),
+  livePresenceFor,
+  renderDjHud,
+  remoteTrack: (track, stream, peerId) => net._onRemoteTrack(track, stream, peerId),
+  // jam room (build 13)
+  jamState: () => ({
+    open: jam.open,
+    bpm: jam.bpm,
+    clockOn: jam.startWall != null,
+    by: jam.clockBy,
+    manual: jam.manual,
+    wave: jam.wave,
+    cutoff: jam.cutoff,
+    reso: jam.reso,
+    padsLoaded: jam.pads.map((b) => !!b),
+    voices: jamVoicesSpawned,
+    queue: jamQueue.length,
+    jammers: [...jam.jammers.keys()],
+  }),
+  jamBeatNow,
+  jamQuantize: (q) => {
+    const n = jamBeatNow();
+    return n == null ? null : quantizeUp(n, q);
+  },
+  jamSetBpm: (b, o) => jamSetBpm(b, o || {}),
+  jamBroadcastClock: () => jamBroadcastClock(),
+  jamClockMsg: () => ({ bpm: jam.bpm, startWall: jam.startWall, by: myName }),
+  jamTestClock: (bpm, startWallAgoMs) => {
+    jam.bpm = bpm;
+    jam.startWall = Date.now() - startWallAgoMs;
+    renderJamTransport();
+  },
+  jamNote: (d, pid) => handleJamNote(d, pid),
+  jamPad: (d, pid) => handleJamPad(d, pid),
+  jamClockIn: (d, pid) => handleJamClock(d, pid),
+  jamPlayLocal: (m, v) => jamPlayLocal(m, v),
+  jamGrabLoop: () => jamGrabLoop(),
+  jamTriggerPad: (i) => jamTriggerPad(i),
+  jamOnBecomeDj: () => jamOnBecomeDj(),
+  jamStopClock: () => jamStopClock(),
+  jamDetectTick: () => jamDetectTick(),
+  jamEstimateBpm: (o) => estimateBpm(o),
+  newOnsetDetector: () => new OnsetDetector(),
+  setJamPanel: (o) => setJamPanel(o),
+  jamOpen: () => jam.open,
+  jamAudioTimeForBeat: (b) => jamAudioTimeForBeat(b),
+  // test helper: simulate holding the decks without real media capture
+  jamSimulateDj: (on) => { dj.active = !!on; renderDjHud(); renderJamTransport(); },
 };
