@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=4';
+import { LimboNet } from './net.js?v=5';
 
 /* ---------------- configuration ---------------- */
 
@@ -820,6 +820,24 @@ async function updateDebugHud() {
   L.push(`LIMBO net debug · build ${s.build} · ${s.enabled ? 'online' : 'OFFLINE (single-player)'}`);
   L.push(`strategy: ${s.strategy} · room: ${s.roomKey}`);
   L.push(`peers: ${s.peerCount} · turn user: ${s.turnUser}`);
+  // (a) relay websocket connectivity — open vs shut per pinned relay
+  if (s.relays) {
+    L.push('relays: ' + s.relays.map((r) => `${r.host}${r.open ? '✓' : '✗'}`).join(' '));
+  } else {
+    L.push('relays: n/a (torrent strategy)');
+  }
+  // (b)+(c) discovery & handshake stages per observed peer id
+  if (s.hsPeers && s.hsPeers.length) {
+    L.push('discovery: ' + s.hsPeers.map((h) =>
+      `${h.id}:${h.stage}${h.initiator === true ? '(init)' : ''} sig↓${h.sigIn}↑${h.sigOut}`
+    ).join(' · '));
+  } else {
+    L.push('discovery: no peer announces seen yet');
+  }
+  // recent nostr wire frames (dir/topic[/peer])
+  if (s.frames && s.frames.length) {
+    L.push('wire: ' + s.frames.slice(-8).join(' '));
+  }
   if (s.peers.length === 0) {
     L.push('no peer connections — signaling found nobody (or room not joined yet)');
   }

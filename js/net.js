@@ -25,7 +25,7 @@ const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '4';
+const BUILD = '5';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -37,6 +37,18 @@ const STRATEGIES = [
   // silently change the module's export shape and break the import.
   { name: 'torrent', url: 'https://esm.sh/@trystero-p2p/torrent@0.25.4' },
   { name: 'nostr', url: 'https://esm.sh/@trystero-p2p/nostr@0.25.4' },
+];
+
+/* Nostr relay pinning — the 0.25.4 nostr strategy picks 5 relays
+   deterministically from its 28 defaults, seeded by appId. For our appId
+   that set included two flaky relays (nostr.sathoarder.com, schnorr.me —
+   both timed out in testing), so we pin the 3 reliable ones. Verified in
+   the module source: getRelays(config, defaults, 5) returns
+   config.relayConfig.urls when set. */
+const NOSTR_RELAYS = [
+  'wss://yabu.me/v2',
+  'wss://relay02.lnfi.network',
+  'wss://relay.sigit.io',
 ];
 
 /* OpenRelay static-auth (no signup): time-limited HMAC-SHA1 credentials. */
@@ -107,6 +119,17 @@ export class LimboNet {
     this.quietTimer = null;
     this.quietFired = false;
     this.lastJoinError = null; // {error, peerId, at} from trystero onJoinError
+    // --- handshake-stage diagnostics (debug HUD) ---
+    this.hsPeers = new Map(); // shortId -> {stage, firstSeen, lastSeen, sigIn, sigOut, initiator}
+    this.nostrFrames = []; // ring buffer of recent nostr EVENT frames (compact strings)
+    this.relayHosts = NOSTR_RELAYS.map((u) => {
+      try {
+        return new URL(u).host;
+      } catch (e) {
+        return u;
+      }
+    });
+    this._installWsTap();
   }
 
   cleanName(n) {
@@ -115,6 +138,153 @@ export class LimboNet {
 
   get mod() {
     return this.mods[this.stratIdx];
+  }
+
+  /* One-time WebSocket wrapper that taps nostr signaling frames for the
+     debug HUD. Trystero 0.25.4 exposes no event for "saw a peer announce"
+     or per-relay socket state, so we observe the wire directly: the nostr
+     module creates its sockets via `new WebSocket(url)`, and our subclass
+     logs EVENT frames to/from our pinned relay hosts. Everything else
+     passes through to the native WebSocket untouched. Installed before the
+     strategy module is dynamically imported, so its sockets get wrapped. */
+  _installWsTap() {
+    try {
+      if (typeof window === 'undefined' || !window.WebSocket) return;
+      if (window.__limboNostrTap) return; // installed already
+      const hosts = this.relayHosts;
+      const note = (dir, url, data) => {
+        try {
+          this._noteNostrFrame(dir, url, data);
+        } catch (e) {
+          /* diagnostics must never break networking */
+        }
+      };
+      const NativeWS = window.WebSocket;
+      class TapWS extends NativeWS {
+        constructor(url, protocols) {
+          super(url, protocols);
+          try {
+            if (hosts.some((h) => String(url).indexOf(h) !== -1)) {
+              this.addEventListener('message', (ev) =>
+                note('in', String(url), String(ev.data))
+              );
+              const rawSend = this.send.bind(this);
+              this.send = (data) => {
+                note('out', String(url), String(data));
+                return rawSend(data);
+              };
+            }
+          } catch (e) {
+            /* never break the socket */
+          }
+        }
+      }
+      window.WebSocket = TapWS;
+      window.__limboNostrTap = true;
+    } catch (e) {
+      /* tap is optional */
+    }
+  }
+
+  /* Parse one nostr frame (relay<->client). Incoming frames look like
+     ["EVENT", subId, {kind, tags, content, pubkey}]; outgoing look like
+     ["EVENT", {kind, tags, content}]. The "x" tag is an opaque topic hash,
+     so we label frames by content shape instead: announce content is just
+     {"peerId"}, signal content carries offer/answer payloads. */
+  _noteNostrFrame(dir, url, data) {
+    if (!data || data.charCodeAt(0) !== 91) return; // must start with '['
+    if (data.indexOf('"EVENT"') === -1) return;
+    let arr;
+    try {
+      arr = JSON.parse(data);
+    } catch (e) {
+      return;
+    }
+    if (!Array.isArray(arr) || arr[0] !== 'EVENT') return;
+    const ev =
+      arr[1] && typeof arr[1] === 'object' && typeof arr[1].kind === 'number'
+        ? arr[1]
+        : arr[2] && typeof arr[2] === 'object'
+          ? arr[2]
+          : null;
+    if (!ev || typeof ev.kind !== 'number') return;
+    let topicKind = '?';
+    let peerId = null;
+    if (typeof ev.content === 'string') {
+      try {
+        const c = JSON.parse(ev.content);
+        if (c && c.peerId) {
+          peerId = String(c.peerId).slice(0, 8);
+          topicKind = c.offer || c.answer || c.offerId ? 'signal' : 'announce';
+        }
+      } catch (e) {}
+    }
+    const now = new Date().toLocaleTimeString();
+    this.nostrFrames.push(
+      `${dir}/${topicKind}${peerId ? '/' + peerId : ''}`
+    );
+    if (this.nostrFrames.length > 14) this.nostrFrames.shift();
+    if (peerId && (topicKind === 'announce' || topicKind === 'signal')) {
+      const selfShort = this.selfId ? String(this.selfId).slice(0, 8) : null;
+      const isSelf = selfShort && peerId === selfShort;
+      const rec = this.hsPeers.get(peerId) || {
+        stage: 'seen',
+        firstSeen: now,
+        lastSeen: now,
+        sigIn: 0,
+        sigOut: 0,
+        initiator: null,
+      };
+      if (isSelf) {
+        // Our own announce echoed back by the relay — proves the relay
+        // round-trips; not another player.
+        rec.stage = 'self';
+      } else if (topicKind === 'announce' && rec.stage === 'seen') rec.stage = 'discovered';
+      if (topicKind === 'signal') {
+        if (dir === 'in') rec.sigIn++;
+        else rec.sigOut++;
+        if (rec.stage === 'seen' || rec.stage === 'discovered') rec.stage = 'signaling';
+      }
+      rec.lastSeen = now;
+      this.hsPeers.set(peerId, rec);
+    }
+  }
+
+  /* Which pinned nostr relays actually have an open socket. Uses the
+     module's own exported getRelaySockets() (0.25.4 exports it) — no
+     guessing at internals. NOTE: despite the name it returns a plain
+     {url: WebSocket} object, not a Map (verified live). Returns null when
+     the nostr strategy isn't the active one. */
+  _getRelayStatus() {
+    try {
+      const mod = this.mod;
+      if (!mod || typeof mod.getRelaySockets !== 'function') return null;
+      const m = mod.getRelaySockets();
+      const entries =
+        m && typeof m.forEach === 'function' ? [...m.entries()] : Object.entries(m || {});
+      return entries.map(([url, ws]) => ({
+        host: String(url).replace(/^wss:\/\//, ''),
+        open: !!ws && ws.readyState === 1,
+      }));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  _hsTouch(id, stage) {
+    const now = new Date().toLocaleTimeString();
+    const rec = this.hsPeers.get(id) || {
+      stage,
+      firstSeen: now,
+      lastSeen: now,
+      sigIn: 0,
+      sigOut: 0,
+      initiator: null,
+    };
+    rec.stage = stage;
+    rec.lastSeen = now;
+    this.hsPeers.set(id, rec);
+    return rec;
   }
 
   /* Loads the first strategy + TURN credentials. Resolves true/false. */
@@ -147,6 +317,8 @@ export class LimboNet {
     this.leave();
     this.roomKey = roomKey;
     this.quietFired = false;
+    this.hsPeers.clear(); // fresh diagnostics per room visit
+    this.nostrFrames.length = 0;
     try {
       await this._refreshTurnCreds();
     } catch (e) {
@@ -160,10 +332,14 @@ export class LimboNet {
 
   _joinWithStrategy() {
     try {
+      const isNostr = STRATEGIES[this.stratIdx].name === 'nostr';
       const room = (this.room = this.mod.joinRoom(
         {
           appId: APP_ID,
           rtcConfig: this.rtcConfig,
+          // Pin the 3 reliable nostr relays (verified config key in the
+          // 0.25.4 module source: getRelays uses config.relayConfig.urls).
+          ...(isNostr ? { relayConfig: { urls: NOSTR_RELAYS } } : {}),
           // Trystero calls this when SDP was exchanged but the peer
           // connection failed — carries the real reason (ICE/TURN/etc).
           onJoinError: (details) => {
@@ -172,6 +348,16 @@ export class LimboNet {
               peerId: details && details.peerId ? String(details.peerId).slice(0, 8) : '?',
               at: new Date().toLocaleTimeString(),
             };
+          },
+          // Fires per peer during the WebRTC handshake, BEFORE onPeerJoin
+          // (which only fires after the data channel fully connects). The
+          // core composes this with its internal handshake handler, so
+          // observing here is safe. Lets the HUD tell "discovered but
+          // handshake stalled" apart from "never discovered".
+          onPeerHandshake: (peerId, _send, _receive, isInitiator) => {
+            const id = String(peerId).slice(0, 8);
+            const rec = this._hsTouch(id, 'handshaking');
+            rec.initiator = !!isInitiator;
           },
         },
         this.roomKey
@@ -191,6 +377,7 @@ export class LimboNet {
       };
       room.onPeerJoin = (id) => {
         this.peers.set(id, true);
+        this._hsTouch(String(id).slice(0, 8), 'joined');
         this._clearFallbackTimer(); // someone made it — signaling works
       };
       room.onPeerLeave = (id) => {
@@ -364,6 +551,18 @@ export class LimboNet {
       peers,
       lastJoinError: this.lastJoinError,
       turnUser: this.turnCreds ? this.turnCreds.username : '(none)',
+      // Handshake-stage diagnostics: relay socket state, per-peer
+      // discovery/handshake stage, recent nostr wire frames.
+      relays: this._getRelayStatus(),
+      hsPeers: [...this.hsPeers.entries()].map(([id, r]) => ({
+        id,
+        stage: r.stage,
+        sigIn: r.sigIn,
+        sigOut: r.sigOut,
+        initiator: r.initiator,
+        lastSeen: r.lastSeen,
+      })),
+      frames: this.nostrFrames.slice(),
     };
   }
 }
