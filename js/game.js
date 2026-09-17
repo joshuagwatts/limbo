@@ -1,13 +1,16 @@
 /* ============================================================
    LIMBO — a portal universe (prototype)
    Fly a wisp through the Nexus into 4 art-realms, gather echoes.
+   Drift with others: serverless P2P multiplayer (Trystero) + chat.
 
    Controls: WASD / arrows fly · mouse-drag look · SPACE/SHIFT or
-   E/Q rise/sink · M mute · touch: left-half joystick, right-half drag
+   E/Q rise/sink · T chat · M mute · touch: left-half joystick,
+   right-half drag
    ============================================================ */
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js';
+import { LimboNet } from './net.js';
 
 /* ---------------- configuration ---------------- */
 
@@ -21,10 +24,10 @@ const NEXUS_DEF = { key: 'nexus', name: 'THE NEXUS', root: 110.0 };
 
 const ECHOES_PER_REALM = 5;
 const TOTAL_ECHOES = REALM_DEFS.length * ECHOES_PER_REALM;
-const REALM_RADIUS = 46;      // inverted skysphere radius
 const NEXUS_BOUND = 40;       // horizontal leash in the hub
 const PORTAL_TRIGGER = 3.0;   // wisp-to-portal distance that teleports
 const ECHO_TRIGGER = 2.6;     // wisp-to-echo distance that collects
+const MAX_REMOTE = 15;        // cap on rendered remote wisps
 
 /* ---------------- dom ---------------- */
 
@@ -41,6 +44,26 @@ const overlayEl   = document.getElementById('start-overlay');
 const driftBtn    = document.getElementById('drift-btn');
 const joyBase     = document.getElementById('joy-base');
 const joyKnob     = document.getElementById('joy-knob');
+const nameInput   = document.getElementById('name-input');
+const chatLog     = document.getElementById('chat-log');
+const chatInput   = document.getElementById('chat-input');
+const peerCountEl = document.getElementById('peer-count');
+
+/* ---------------- multiplayer state ---------------- */
+
+const net = new LimboNet();
+const peerLayer = new THREE.Group(); // remote wisps, re-parented per scene
+const peerVisuals = new Map();       // peerId -> {group, bob, tag, target, name, phase}
+let myName = 'drifter';
+let started = false;                 // true once past the start overlay
+let chatFocused = false;
+let netTimer = 0;
+try { myName = localStorage.getItem('limbo_name') || 'drifter'; } catch (e) { /* ignore */ }
+if (nameInput && myName !== 'drifter') nameInput.value = myName;
+
+function roomKeyFor(worldKey) {
+  return worldKey === 'nexus' ? 'limbo-nexus' : 'limbo-realm-' + worldKey.replace('realm', '');
+}
 
 /* ---------------- tiny utils ---------------- */
 
@@ -284,30 +307,47 @@ function buildNexus(textures) {
 function buildRealm(def, texture) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x020204);
-  scene.fog = new THREE.FogExp2(def.fog, 0.016);
+  scene.fog = new THREE.FogExp2(def.fog, 0.012);
   scene.add(new THREE.AmbientLight(0x99aacc, 0.5));
 
-  // The realm itself: the artwork wrapped around an inverted sphere.
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(REALM_RADIUS, 48, 32),
-    new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide, fog: true })
-  );
-  scene.add(sky);
+  // The realm: ONE big flat artwork floating in the dark void.
+  // Gently bowed (edges recede a touch) for a hint of immersion —
+  // never wrapped; the full frame always faces you.
+  const aspect = texture.image.width / texture.image.height;
+  const ART_W = 76;
+  const ART_H = Math.min(ART_W / aspect, 54);
+  const artGeo = new THREE.PlaneGeometry(ART_W, ART_H, 64, 1);
+  {
+    const p = artGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i);
+      p.setZ(i, -0.0022 * x * x);
+    }
+    artGeo.computeVertexNormals();
+  }
+  const art = new THREE.Mesh(artGeo, new THREE.MeshBasicMaterial({ map: texture, fog: true }));
+  art.position.set(0, 7, -46);
+  scene.add(art);
 
-  const dust = makeDust(170, REALM_RADIUS - 6, def.accent, 0.65);
+  // Soft backlit halo so the piece glows against the void.
+  const halo = new THREE.Mesh(
+    new THREE.PlaneGeometry(ART_W + 12, ART_H + 12),
+    new THREE.MeshBasicMaterial({ map: glowTex, color: def.accent, transparent: true, opacity: 0.16, blending: THREE.AdditiveBlending, depthWrite: false })
+  );
+  halo.position.set(0, 7, -46.9);
+  scene.add(halo);
+
+  const dust = makeDust(200, 60, def.accent, 0.6);
   scene.add(dust.pts);
 
-  // 5 echo orbs at deterministic, reachable positions.
+  // 5 echo orbs at deterministic, reachable positions in front of the art.
   const rnd = mulberry32(def.key.length * 31337 + 11);
   const echoes = [];
-  const spawn = new THREE.Vector3(0, 2, 20);
+  const spawn = new THREE.Vector3(0, 2, 22);
   for (let i = 0; i < ECHOES_PER_REALM; i++) {
     let pos;
     for (let tries = 0; tries < 40; tries++) {
-      const r = 12 + rnd() * (REALM_RADIUS - 20);
-      const th = rnd() * Math.PI * 2;
-      const y = -12 + rnd() * 24;
-      pos = new THREE.Vector3(r * Math.cos(th), y, r * Math.sin(th));
+      pos = new THREE.Vector3((rnd() - 0.5) * 56, -2 + rnd() * 22, -34 + rnd() * 44);
       if (pos.distanceTo(spawn) > 9) break;
     }
     const mesh = new THREE.Mesh(
@@ -324,18 +364,18 @@ function buildRealm(def, texture) {
     echoes.push({ mesh, glow, basePos: pos.clone(), phase: rnd() * Math.PI * 2, collected: false, burstT: null });
   }
 
-  // Return portal back to the Nexus, placed behind the spawn point.
+  // Return portal back to the Nexus, off to one side of the artwork.
   const { group, ring } = makePortal(texture, def.accent, 'RETURN', 1.7, 0.14);
-  group.position.set(0, 2, 32);
-  group.lookAt(spawn);
+  group.position.set(30, 3, -10);
+  group.lookAt(0, 5, -30);
   scene.add(group);
-  const portals = [{ group, ring, pos: group.position.clone(), target: 'nexus', phase: 0.6, baseY: 2 }];
+  const portals = [{ group, ring, pos: group.position.clone(), target: 'nexus', phase: 0.6, baseY: 3 }];
 
   return {
     key: def.key, name: def.name, root: def.root,
     scene, portals, echoes,
-    spawn, spawnYaw: 0, // face the realm's heart (-Z)
-    bound: 'sphere',
+    spawn, spawnYaw: 0, // face the artwork (-Z)
+    bound: 'realm',
     anim: { dust },
     attunedShown: false,
     update(dt, t) {
@@ -394,7 +434,7 @@ manager.onLoad = () => {
   for (const def of REALM_DEFS) worlds[def.key] = buildRealm(def, textures[def.key]);
 
   active = worlds.nexus;
-  active.scene.add(wisp, trail);
+  active.scene.add(wisp, trail, peerLayer);
   wisp.position.copy(active.spawn);
   yaw = active.spawnYaw;
   clearTrail();
@@ -409,14 +449,68 @@ manager.onLoad = () => {
 
 const keys = {};
 window.addEventListener('keydown', (e) => {
+  const tag = e.target && e.target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return; // typing in chat / name field
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
   keys[e.code] = true;
   if (e.code === 'KeyM') {
     const muted = audio.toggleMute();
     muteEl.textContent = muted ? 'SOUND OFF' : 'SOUND ON';
   }
+  if (e.code === 'KeyT' && started && !chatFocused) {
+    e.preventDefault();
+    chatInput.focus();
+  }
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+/* ---------------- chat ---------------- */
+
+function addChatLine(name, text, sys = false) {
+  const div = document.createElement('div');
+  div.className = 'chat-line' + (sys ? ' sys' : '');
+  if (sys) {
+    div.textContent = text;
+  } else {
+    const n = document.createElement('span');
+    n.className = 'chat-name';
+    n.textContent = name;
+    div.appendChild(n);
+    div.appendChild(document.createTextNode(' · ' + text));
+  }
+  chatLog.appendChild(div);
+  while (chatLog.children.length > 50) chatLog.removeChild(chatLog.firstChild);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function addSystemLine(text) {
+  addChatLine('', text, true);
+}
+
+function sendChatLine() {
+  const text = chatInput.value.trim().slice(0, 140);
+  if (!text) { chatInput.blur(); return; }
+  addChatLine(myName, text);
+  net.say(text);
+  chatInput.value = '';
+}
+
+chatInput.addEventListener('focus', () => {
+  chatFocused = true;
+  for (const k in keys) keys[k] = false; // never fly while typing
+});
+chatInput.addEventListener('blur', () => { chatFocused = false; });
+chatInput.addEventListener('keydown', (e) => {
+  e.stopPropagation(); // keep game keys out of the window handler
+  if (e.key === 'Enter') sendChatLine();
+  else if (e.key === 'Escape') chatInput.blur();
+});
+
+// Enter in the name field starts the drift.
+nameInput.addEventListener('keydown', (e) => {
+  e.stopPropagation();
+  if (e.key === 'Enter' && !driftBtn.disabled) driftBtn.click();
+});
 
 /* ---------------- input: mouse drag-look (no pointer lock) ---------------- */
 
@@ -490,7 +584,10 @@ function goTo(key) {
   fadeEl.classList.add('on');
   setTimeout(() => {
     active = worlds[key];
-    active.scene.add(wisp, trail); // re-parents from the previous scene
+    active.scene.add(wisp, trail, peerLayer); // re-parents from the previous scene
+    clearPeerVisuals();                       // old room's drifters stay in the old room
+    net.join(roomKeyFor(active.key));         // hop to this location's P2P room
+    updatePeerCount();
     wisp.position.copy(active.spawn);
     vel.set(0, 0, 0);
     yaw = active.spawnYaw;
@@ -516,13 +613,129 @@ function collectEcho(echo) {
   audio.chime(collectedTotal);
 }
 
+/* ---------------- remote drifters (multiplayer visuals) ---------------- */
+
+const peerCoreGeo = new THREE.SphereGeometry(0.32, 16, 12);
+
+// Floating name tag above a remote wisp.
+function makeNameTag(name) {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 128;
+  const g = c.getContext('2d');
+  g.font = '300 40px system-ui, -apple-system, sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  try { g.letterSpacing = '10px'; } catch (e) { /* older browsers */ }
+  g.fillStyle = 'rgba(235,240,255,0.9)';
+  g.shadowColor = 'rgba(150,190,255,0.8)';
+  g.shadowBlur = 14;
+  g.fillText(name, 256, 64);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, fog: false }));
+  sp.scale.set(6.4, 1.6, 1);
+  return sp;
+}
+
+// Stable per-peer tint so you can tell drifters apart.
+function peerColor(id) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = ((h * 31) + id.charCodeAt(i)) >>> 0;
+  return new THREE.Color().setHSL((h % 360) / 360, 0.65, 0.72);
+}
+
+function createPeerVisual(id, name) {
+  const color = peerColor(id);
+  const group = new THREE.Group();
+  const bob = new THREE.Group();
+  const core = new THREE.Mesh(peerCoreGeo, new THREE.MeshBasicMaterial({ color }));
+  const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTex, color, transparent: true, opacity: 0.75,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  glow.scale.set(3.4, 3.4, 1);
+  const tag = makeNameTag(name);
+  tag.position.y = 1.8;
+  bob.add(core, glow);
+  group.add(bob, tag);
+  return { group, bob, tag, target: new THREE.Vector3(), name, phase: Math.random() * Math.PI * 2 };
+}
+
+function retagPeer(pv, name) {
+  pv.group.remove(pv.tag);
+  pv.tag = makeNameTag(name);
+  pv.tag.position.y = 1.8;
+  pv.group.add(pv.tag);
+}
+
+function clearPeerVisuals() {
+  for (const pv of peerVisuals.values()) peerLayer.remove(pv.group);
+  peerVisuals.clear();
+}
+
+function updatePeerCount() {
+  peerCountEl.textContent = `DRIFTERS HERE: ${net.peerCount() + 1}`;
+}
+
+function handleWisp(id, d) {
+  if (!d || !Array.isArray(d.p)) return;
+  const nm = String(d.n || 'drifter').slice(0, 16) || 'drifter';
+  let pv = peerVisuals.get(id);
+  if (!pv) {
+    if (peerVisuals.size >= MAX_REMOTE) return; // render cap; count still tracks
+    pv = createPeerVisual(id, nm);
+    pv.target.set(d.p[0], d.p[1], d.p[2]);
+    pv.group.position.copy(pv.target); // snap on first sight
+    peerVisuals.set(id, pv);
+    peerLayer.add(pv.group);
+    addSystemLine(`${nm} drifted in`);
+    updatePeerCount();
+  } else {
+    pv.target.set(d.p[0], d.p[1], d.p[2]);
+    if (pv.name !== nm) { pv.name = nm; retagPeer(pv, nm); }
+  }
+}
+
+function handlePeerLeave(id) {
+  const pv = peerVisuals.get(id);
+  if (pv) {
+    addSystemLine(`${pv.name} drifted away`);
+    peerLayer.remove(pv.group);
+    peerVisuals.delete(id);
+  }
+  updatePeerCount();
+}
+
+// Wire the net callbacks once; rooms are (re)joined on start + portal hops.
+net.onWispCb = handleWisp;
+net.onPeerLeaveCb = handlePeerLeave;
+net.onChatCb = (d) => {
+  if (!d) return;
+  const nm = String(d.n || 'drifter').slice(0, 16) || 'drifter';
+  const tx = String(d.t || '').slice(0, 140);
+  if (tx) addChatLine(nm, tx);
+};
+
 /* ---------------- start ---------------- */
 
 let hintTimer = null;
 driftBtn.addEventListener('click', () => {
+  const raw = (nameInput.value || '').trim().slice(0, 16) || 'drifter';
+  myName = raw;
+  try { localStorage.setItem('limbo_name', raw); } catch (e) { /* ignore */ }
   audio.init(active ? active.root : NEXUS_DEF.root);
   overlayEl.classList.add('gone');
+  started = true;
   hintTimer = setTimeout(() => hintEl.classList.add('gone'), 15000);
+  // Multiplayer: best-effort — the game plays exactly like v1 without it.
+  net.boot(myName).then((ok) => {
+    if (ok) {
+      net.join(roomKeyFor(active.key));
+      updatePeerCount();
+    } else {
+      addSystemLine('the void is quiet tonight — drifting solo');
+    }
+  });
 });
 
 /* ---------------- per-frame ---------------- */
@@ -541,12 +754,14 @@ function updatePlayer(dt) {
 
   _move.set(0, 0, 0);
   let ix = 0, iz = 0, iy = 0;
-  if (keys.KeyW || keys.ArrowUp) iz += 1;
-  if (keys.KeyS || keys.ArrowDown) iz -= 1;
-  if (keys.KeyD || keys.ArrowRight) ix += 1;
-  if (keys.KeyA || keys.ArrowLeft) ix -= 1;
-  if (keys.Space || keys.KeyE) iy += 1;
-  if (keys.ShiftLeft || keys.ShiftRight || keys.KeyQ) iy -= 1;
+  if (!chatFocused) { // never fly while typing in chat
+    if (keys.KeyW || keys.ArrowUp) iz += 1;
+    if (keys.KeyS || keys.ArrowDown) iz -= 1;
+    if (keys.KeyD || keys.ArrowRight) ix += 1;
+    if (keys.KeyA || keys.ArrowLeft) ix -= 1;
+    if (keys.Space || keys.KeyE) iy += 1;
+    if (keys.ShiftLeft || keys.ShiftRight || keys.KeyQ) iy -= 1;
+  }
   ix += joy.x; iz -= joy.y; // touch joystick (up = forward)
 
   _move.addScaledVector(_fwd, iz).addScaledVector(_right, ix);
@@ -564,9 +779,10 @@ function updatePlayer(dt) {
   wisp.position.addScaledVector(vel, dt);
 
   // Keep the wisp inside its world.
-  if (active.bound === 'sphere') {
-    const d = wisp.position.length();
-    if (d > REALM_RADIUS - 3) wisp.position.setLength(REALM_RADIUS - 3);
+  if (active.bound === 'realm') {
+    wisp.position.x = Math.max(-52, Math.min(52, wisp.position.x));
+    wisp.position.y = Math.max(-8, Math.min(36, wisp.position.y));
+    wisp.position.z = Math.max(-54, Math.min(32, wisp.position.z));
   } else {
     const hx = wisp.position.x, hz = wisp.position.z;
     const hd = Math.hypot(hx, hz);
@@ -602,7 +818,7 @@ function checkPortals() {
 }
 
 function checkEchoes() {
-  if (transitioning || active.bound !== 'sphere') return;
+  if (transitioning || active.bound === 'nexus') return;
   for (const e of active.echoes) {
     if (!e.collected && wisp.position.distanceTo(e.mesh.position) < ECHO_TRIGGER) {
       collectEcho(e);
@@ -619,6 +835,20 @@ function loop() {
   updatePlayer(dt);
   checkPortals();
   checkEchoes();
+
+  // Multiplayer: broadcast our wisp, ease remote wisps toward their targets.
+  if (started) {
+    netTimer += dt;
+    if (netTimer >= 1 / 12) {
+      netTimer = 0;
+      net.broadcast(wisp.position);
+    }
+    const k = 1 - Math.exp(-9 * dt);
+    for (const pv of peerVisuals.values()) {
+      pv.group.position.lerp(pv.target, k);
+      pv.bob.position.y = Math.sin(t * 2.2 + pv.phase) * 0.3;
+    }
+  }
 
   renderer.render(active.scene, camera);
 }
