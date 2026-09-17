@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=6';
+import { LimboNet } from './net.js?v=7';
 
 /* ---------------- configuration ---------------- */
 
@@ -723,20 +723,10 @@ canvas.addEventListener('touchmove', (e) => {
   }
   e.preventDefault();
 }, { passive: false });
-let lastTapAt = 0, tapCount = 0; // triple-tap -> debug HUD (no D key on phones)
 function endTouch(e) {
   for (const t of e.changedTouches) {
     if (t.identifier === joy.id) { joy.id = null; joy.x = 0; joy.y = 0; joyBase.style.display = 'none'; }
     if (t.identifier === look.id) look.id = null;
-  }
-  // Triple-tap (no drag) toggles the debug HUD — phones have no D key.
-  const now = performance.now();
-  if (now - lastTapAt < 600) tapCount++;
-  else tapCount = 1;
-  lastTapAt = now;
-  if (tapCount >= 3 && started) {
-    tapCount = 0;
-    setSettings(!settingsOpen);
   }
 }
 canvas.addEventListener('touchend', endTouch);
@@ -926,7 +916,7 @@ net.onQuietCb = () =>
   addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
 
 /* ---------------- settings panel ----------------
-   Gear button opens it; D key and triple-tap are shortcuts to the same
+   Gear button opens it; D key is a desktop shortcut to the same panel.
    panel. Holds the net debug readout, sound toggle, and drifter name. */
 
 let settingsOpen = false;

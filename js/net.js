@@ -25,7 +25,7 @@ const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '6';
+const BUILD = '7';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
