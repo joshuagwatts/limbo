@@ -66,8 +66,10 @@ Notes:
   `openrelayproject`/`openrelayproject` password is stale — never used.)
 - **Signaling fallback.** If no peer appears within 15s of joining a room,
   the client leaves and rejoins the *same* room key via Trystero's `nostr`
-  strategy (`https://esm.sh/@trystero-p2p/nostr`). Both clients run identical
-  logic, so they converge on whichever strategy works. One fallback only.
+  strategy (`https://esm.sh/@trystero-p2p/nostr@0.25.4` — version-pinned, like
+  the torrent strategy, so a silent esm.sh "latest" drift can't break the
+  import shape). Both clients run identical logic, so they converge on
+  whichever strategy works. One fallback only.
 - **One room per location:** `limbo-nexus`, `limbo-realm-1` … `limbo-realm-4`
   (all under the app id `limbo_by_holowatts`). Portal hops leave the old
   room and join the new one, so you only ever see/speak to drifters who are
@@ -81,6 +83,17 @@ Notes:
   drift to the Nexus to find other drifters".
 - **Graceful:** if the CDN or WebRTC is unreachable, the game plays exactly
   like the single-player prototype — no errors, no blocking.
+- **Debug HUD (press D, or triple-tap on mobile).** Live overlay showing the
+  build stamp (so you can confirm a phone is running the latest deploy and
+  not a cached copy), signaling strategy, room key, peer count, and — for
+  each peer connection — ICE state, gathering state, local candidate types
+  (`host`/`srflx`/`relay`), the selected pair type, and trystero's own
+  join-error text. `relay` in local candidates = TURN allocation worked;
+  host+srflx only = TURN is dead. Updates every second while open.
+- **Cache-busting.** `index.html` loads `js/game.js?v=N` and game.js imports
+  `./net.js?v=N` / `./audio.js?v=N` — bump `N` (and `BUILD` in `net.js`) on
+  every deploy, because mobile browsers aggressively cache the old bundle
+  and a stale STUN-only copy looks exactly like "multiplayer still broken".
 
 ## Controls
 
