@@ -9,8 +9,8 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=3';
-import { LimboNet } from './net.js?v=3';
+import { AudioEngine } from './audio.js?v=4';
+import { LimboNet } from './net.js?v=4';
 
 /* ---------------- configuration ---------------- */
 
@@ -114,7 +114,15 @@ function makeLabel(text, size = 44) {
 
 /* ---------------- renderer / camera ---------------- */
 
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+// If WebGL is unavailable (old browser, headless test rig) the constructor
+// throws — show a message instead of leaving a dead "loading…" screen.
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+} catch (err) {
+  loadingEl.firstElementChild.textContent = 'limbo needs WebGL — try another browser';
+  throw err;
+}
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 
@@ -421,17 +429,54 @@ function buildRealm(def, texture) {
 const manager = new THREE.LoadingManager();
 const loader = new THREE.TextureLoader(manager);
 const textures = {};
+const failedTextures = new Set();
 for (const def of REALM_DEFS) {
-  const tex = loader.load(def.file);
+  // onError only marks the failure — the manager still settles the item,
+  // so one bad download can never wedge the loading screen forever.
+  const tex = loader.load(
+    def.file,
+    undefined,
+    undefined,
+    () => failedTextures.add(def.key)
+  );
   tex.colorSpace = THREE.SRGBColorSpace;
   textures[def.key] = tex;
 }
-manager.onProgress = (url, loaded, total) => {
-  loadingEl.firstElementChild.textContent = `summoning limbo · ${loaded}/${total}`;
-};
-manager.onLoad = () => {
-  worlds.nexus = buildNexus(textures);
-  for (const def of REALM_DEFS) worlds[def.key] = buildRealm(def, textures[def.key]);
+
+// Generative stand-in: buildRealm reads texture.image, which is undefined
+// when a download fails — substitute so boot can never throw on it.
+function makePlaceholderTexture() {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 512;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(256, 256, 40, 256, 256, 380);
+  grad.addColorStop(0, '#241b4d');
+  grad.addColorStop(1, '#04040c');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 512, 512);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+let booted = false;
+function finishBoot() {
+  if (booted) return;
+  booted = true;
+  clearTimeout(bootTimeout);
+  // Anything that failed (or never settled) becomes a placeholder.
+  for (const def of REALM_DEFS) {
+    if (!textures[def.key].image) textures[def.key] = makePlaceholderTexture();
+  }
+  try {
+    worlds.nexus = buildNexus(textures);
+    for (const def of REALM_DEFS) worlds[def.key] = buildRealm(def, textures[def.key]);
+  } catch (err) {
+    // Last resort: say so on screen instead of a dead "loading…" hang.
+    loadingEl.firstElementChild.textContent = 'limbo failed to wake — reload to try again';
+    console.error('[limbo] world build failed:', err);
+    return;
+  }
 
   active = worlds.nexus;
   active.scene.add(wisp, trail, peerLayer);
@@ -443,7 +488,15 @@ manager.onLoad = () => {
   driftBtn.disabled = false;
   driftBtn.textContent = 'click to drift';
   requestAnimationFrame(loop);
+}
+manager.onProgress = (url, loaded, total) => {
+  loadingEl.firstElementChild.textContent = `summoning limbo · ${loaded}/${total}`;
 };
+manager.onError = (url) => console.warn('[limbo] texture failed:', url);
+manager.onLoad = finishBoot;
+// Safety net: image loads have no timeout, so a stalled connection could
+// leave the manager waiting forever — boot anyway after 30s.
+const bootTimeout = setTimeout(finishBoot, 30000);
 
 /* ---------------- input: keys ---------------- */
 
