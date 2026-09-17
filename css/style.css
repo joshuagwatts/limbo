@@ -78,6 +78,79 @@ html, body {
   100% { opacity: 0; letter-spacing: 0.9em; }
 }
 
+/* ---------- unlock celebration toast ---------- */
+#unlock-toast {
+  position: fixed;
+  top: 44%; left: 0; right: 0;
+  text-align: center;
+  font-weight: 300;
+  font-size: clamp(13px, 2.2vw, 18px);
+  letter-spacing: 0.35em;
+  text-indent: 0.35em;
+  color: #ffe9a8;
+  text-shadow: 0 0 20px rgba(255, 210, 120, 0.9);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 42;
+}
+#unlock-toast.show { animation: unlocktoast 4.5s ease forwards; }
+#unlock-toast div { margin: 8px 0; }
+#unlock-toast div:first-child { color: #fff3d0; }
+@keyframes unlocktoast {
+  0%   { opacity: 0; transform: translateY(10px); }
+  12%  { opacity: 1; transform: none; }
+  78%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* ---------- wisp customization (settings panel) ---------- */
+.set-sub {
+  margin: 10px 0 6px;
+  letter-spacing: 0.3em; font-size: 10px;
+  color: var(--ink-faint);
+}
+.wisp-row {
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.wisp-swatch {
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+  background: none; border: none; cursor: pointer;
+  padding: 6px 4px; min-width: 56px; min-height: 44px;
+  font-family: inherit; touch-action: manipulation;
+}
+.wisp-swatch .dot {
+  width: 34px; height: 34px; border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, rgba(255,255,255,0.85), var(--sw) 62%);
+  box-shadow: 0 0 14px var(--sw);
+  border: 2px solid transparent;
+}
+.wisp-swatch.equipped .dot { border-color: #ffe9a8; }
+.wisp-swatch.locked { cursor: default; }
+.wisp-swatch.locked .dot {
+  background: rgba(120, 130, 150, 0.22);
+  box-shadow: none;
+}
+.wisp-swatch .lbl {
+  font-size: 9px; letter-spacing: 0.1em;
+  color: var(--ink-dim); text-align: center;
+  max-width: 72px; line-height: 1.5;
+}
+.wisp-swatch.locked .lbl { color: var(--ink-faint); font-size: 8.5px; }
+.wisp-hat {
+  background: rgba(235, 240, 255, 0.06);
+  border: 1px solid rgba(140, 170, 255, 0.35);
+  border-radius: 999px;
+  color: var(--ink); font-family: inherit;
+  letter-spacing: 0.14em; font-size: 10.5px;
+  padding: 9px 14px; cursor: pointer; touch-action: manipulation;
+  min-height: 44px;
+}
+.wisp-hat.equipped { border-color: #ffe9a8; color: #ffe9a8; }
+.wisp-hat.locked {
+  cursor: default; opacity: 0.6;
+  font-size: 9px; color: var(--ink-faint);
+}
+
 /* ---------- HUD ---------- */
 #hud { position: fixed; inset: 0; pointer-events: none; z-index: 30; }
 
