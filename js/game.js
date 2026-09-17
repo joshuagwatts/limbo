@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=7';
+import { LimboNet } from './net.js?v=8';
 
 /* ---------------- configuration ---------------- */
 
@@ -56,6 +56,9 @@ const settingsClose = document.getElementById('settings-close');
 const soundToggle   = document.getElementById('sound-toggle');
 const settingsName  = document.getElementById('settings-name');
 const settingsDebug = document.getElementById('settings-debug');
+const unlockToastEl = document.getElementById('unlock-toast');
+const wispSkinsEl   = document.getElementById('wisp-skins');
+const wispHatsEl    = document.getElementById('wisp-hats');
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -179,6 +182,18 @@ const trail = new THREE.Points(
 trail.frustumCulled = false;
 let trailTimer = 0;
 
+// Re-tint the trail ribbon (used when equipping a skin).
+function retintTrail(hex) {
+  const head = new THREE.Color(hex);
+  for (let i = 0; i < TRAIL_N; i++) {
+    const f = Math.pow(i / (TRAIL_N - 1), 1.6); // i=0 tail .. i=N-1 head
+    trailCol[i * 3] = head.r * f;
+    trailCol[i * 3 + 1] = head.g * f;
+    trailCol[i * 3 + 2] = head.b * f;
+  }
+  trailGeo.attributes.color.needsUpdate = true;
+}
+
 function clearTrail() {
   for (let i = 0; i < TRAIL_N; i++) {
     trailPos[i * 3] = wisp.position.x;
@@ -198,6 +213,220 @@ function pushTrail(dt) {
   trailPos[o + 2] = wisp.position.z;
   trailGeo.attributes.position.needsUpdate = true;
 }
+
+/* ---------------- wisp customization: skins & hats ----------------
+   Attuning a realm (all 5 echoes) unlocks cosmetics. Unlocks + equipped
+   look persist in localStorage; the equipped look broadcasts to other
+   drifters ~12Hz so remote wisps render with the right skin + hat. */
+
+const SKINS = {
+  drifter:    { name: 'Drifter',    core: 0xeaf6ff, glow: 0x9fd8ff, light: 0xaad4ff, trail: 0xbfe2ff, req: null },
+  prism:      { name: 'Prism',      core: 0xffd9f2, glow: 0xff4fd8, light: 0xff4fd8, trail: 0xff8fdc, req: 'attune PRISM DEEP' },
+  tide:       { name: 'Tide',       core: 0xded4ff, glow: 0x7a5cff, light: 0x7a5cff, trail: 0x9d86ff, req: 'attune MIRROR TIDE' },
+  volt:       { name: 'Volt',       core: 0xd4f7ff, glow: 0x37e6ff, light: 0x37e6ff, trail: 0x6fe8ff, req: 'attune CHROME VEIL' },
+  sage:       { name: 'Sage',       core: 0xd6ffea, glow: 0x2dffb3, light: 0x2dffb3, trail: 0x66ffbe, req: 'attune STILL POINT' },
+  voidwalker: { name: 'Voidwalker', core: 0xfff9e8, glow: 0xffe9a8, light: 0xffdf8a, trail: 0xffe9a8, req: 'attune all 4 realms' },
+};
+const HATS = {
+  none:  { name: 'Bare',      req: null },
+  party: { name: 'Party Hat', req: 'attune 1 realm' },
+  top:   { name: 'Top Hat',   req: 'attune 2 realms' },
+  crown: { name: 'Crown',     req: 'attune all 4 realms' },
+};
+const REALM_SKIN = { realm1: 'prism', realm2: 'tide', realm3: 'volt', realm4: 'sage' };
+const SKIN_ORDER = ['drifter', 'prism', 'tide', 'volt', 'sage', 'voidwalker'];
+const HAT_ORDER = ['none', 'party', 'top', 'crown'];
+
+// limbo_unlocks: { attuned:[realmKeys], skins:[ids], hats:[ids] }
+// limbo_wisp:   { skin, hat } — equipped look
+function loadUnlocks() {
+  const d = { attuned: [], skins: ['drifter'], hats: [] };
+  try {
+    const raw = JSON.parse(localStorage.getItem('limbo_unlocks') || 'null');
+    if (raw && typeof raw === 'object') {
+      if (Array.isArray(raw.attuned)) d.attuned = raw.attuned.filter((k) => REALM_DEFS.some((r) => r.key === k));
+      if (Array.isArray(raw.skins)) d.skins = ['drifter', ...raw.skins.filter((s) => SKINS[s] && s !== 'drifter')];
+      if (Array.isArray(raw.hats)) d.hats = raw.hats.filter((h) => HATS[h] && h !== 'none');
+    }
+  } catch (e) { /* ignore — defaults */ }
+  return d;
+}
+function saveUnlocks() {
+  try { localStorage.setItem('limbo_unlocks', JSON.stringify(unlocks)); } catch (e) { /* ignore */ }
+}
+function loadWisp() {
+  const d = { skin: 'drifter', hat: 'none' };
+  try {
+    const raw = JSON.parse(localStorage.getItem('limbo_wisp') || 'null');
+    if (raw && SKINS[raw.skin]) d.skin = raw.skin;
+    if (raw && HATS[raw.hat]) d.hat = raw.hat;
+  } catch (e) { /* ignore — defaults */ }
+  return d;
+}
+function saveWisp() {
+  try { localStorage.setItem('limbo_wisp', JSON.stringify(equipped)); } catch (e) { /* ignore */ }
+}
+let unlocks = loadUnlocks();
+let equipped = loadWisp();
+
+function applySkin(skinId) {
+  const s = SKINS[skinId] || SKINS.drifter;
+  wispCore.material.color.setHex(s.core);
+  wispGlow.material.color.setHex(s.glow);
+  wispLight.color.setHex(s.light);
+  retintTrail(s.trail);
+}
+
+function buildHat(hatId) {
+  const g = new THREE.Group();
+  if (hatId === 'party') {
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(0.22, 0.5, 20),
+      new THREE.MeshBasicMaterial({ color: 0xff4fd8 })
+    );
+    cone.position.y = 0.25;
+    const pompom = new THREE.Mesh(
+      new THREE.SphereGeometry(0.07, 12, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffe9a8 })
+    );
+    pompom.position.y = 0.53;
+    g.add(cone, pompom);
+  } else if (hatId === 'top') {
+    const brim = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.34, 0.34, 0.05, 24),
+      new THREE.MeshBasicMaterial({ color: 0x1a1d26 })
+    );
+    const crownM = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.2, 0.2, 0.42, 24),
+      new THREE.MeshBasicMaterial({ color: 0x23262f })
+    );
+    crownM.position.y = 0.23;
+    const band = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.205, 0.205, 0.08, 24),
+      new THREE.MeshBasicMaterial({ color: 0x7a5cff })
+    );
+    band.position.y = 0.07;
+    g.add(brim, crownM, band);
+  } else if (hatId === 'crown') {
+    const band = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.24, 0.26, 0.18, 24),
+      new THREE.MeshBasicMaterial({ color: 0xd9a441 })
+    );
+    band.position.y = 0.09;
+    g.add(band);
+    for (let i = 0; i < 6; i++) {
+      const spike = new THREE.Mesh(
+        new THREE.ConeGeometry(0.055, 0.22, 8),
+        new THREE.MeshBasicMaterial({ color: 0xffe9a8 })
+      );
+      const a = (i / 6) * Math.PI * 2;
+      spike.position.set(Math.cos(a) * 0.22, 0.28, Math.sin(a) * 0.22);
+      g.add(spike);
+    }
+  }
+  return g;
+}
+
+let wispHat = null;
+function applyHat(hatId) {
+  if (wispHat) { wisp.remove(wispHat); wispHat = null; }
+  if (hatId && hatId !== 'none' && HATS[hatId]) {
+    wispHat = buildHat(hatId);
+    wispHat.position.y = 0.42; // sits atop the 0.32-radius core
+    wisp.add(wispHat);
+  }
+}
+
+function showUnlockToast(lines) {
+  if (!unlockToastEl || !lines.length) return;
+  unlockToastEl.innerHTML = '';
+  for (const line of lines) {
+    const div = document.createElement('div');
+    div.textContent = line;
+    unlockToastEl.appendChild(div);
+  }
+  unlockToastEl.classList.remove('show');
+  void unlockToastEl.offsetWidth; // restart CSS animation
+  unlockToastEl.classList.add('show');
+}
+
+// Called the moment a realm attunes (all 5 echoes). Grants are idempotent —
+// re-attuning across sessions replays the shimmer but not the unlock toast.
+function onRealmAttuned(realmKey, realmName) {
+  const isNew = !unlocks.attuned.includes(realmKey);
+  if (isNew) unlocks.attuned.push(realmKey);
+  const fresh = [];
+  const skinId = REALM_SKIN[realmKey];
+  if (skinId && !unlocks.skins.includes(skinId)) {
+    unlocks.skins.push(skinId);
+    fresh.push(`${SKINS[skinId].name} skin unlocked`);
+  }
+  const n = unlocks.attuned.length;
+  for (const [hatId, need] of [['party', 1], ['top', 2], ['crown', 4]]) {
+    if (n >= need && !unlocks.hats.includes(hatId)) {
+      unlocks.hats.push(hatId);
+      fresh.push(`${HATS[hatId].name} unlocked`);
+    }
+  }
+  if (n >= 4 && !unlocks.skins.includes('voidwalker')) {
+    unlocks.skins.push('voidwalker');
+    fresh.push('Voidwalker skin unlocked');
+  }
+  saveUnlocks();
+  if (fresh.length) {
+    showUnlockToast([`${realmName} attuned`, ...fresh]);
+    addSystemLine(`${realmName} attuned — ${fresh.join(' · ').toLowerCase()}`);
+  }
+  renderWispSection();
+}
+
+// Settings panel "WISP" section: skin swatches + hat buttons. Locked items
+// show their requirement; tapping an owned item equips it immediately.
+function renderWispSection() {
+  if (!wispSkinsEl || !wispHatsEl) return;
+  wispSkinsEl.innerHTML = '';
+  for (const id of SKIN_ORDER) {
+    const s = SKINS[id];
+    const owned = unlocks.skins.includes(id);
+    const b = document.createElement('button');
+    b.className = 'wisp-swatch' + (equipped.skin === id ? ' equipped' : '') + (owned ? '' : ' locked');
+    const hex = '#' + s.glow.toString(16).padStart(6, '0');
+    b.style.setProperty('--sw', owned ? hex : '#3a4152');
+    b.title = owned ? s.name : `${s.name} — ${s.req}`;
+    b.setAttribute('aria-label', b.title);
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = owned ? s.name : s.req;
+    b.append(dot, lbl);
+    if (owned) b.addEventListener('click', () => {
+      equipped.skin = id; saveWisp(); applySkin(id); renderWispSection(); b.blur();
+    });
+    wispSkinsEl.appendChild(b);
+  }
+  wispHatsEl.innerHTML = '';
+  for (const id of HAT_ORDER) {
+    const h = HATS[id];
+    const owned = id === 'none' || unlocks.hats.includes(id);
+    const b = document.createElement('button');
+    b.className = 'wisp-hat' + (equipped.hat === id ? ' equipped' : '') + (owned ? '' : ' locked');
+    b.title = owned ? h.name : `${h.name} — ${h.req}`;
+    b.setAttribute('aria-label', b.title);
+    b.textContent = owned ? h.name : h.req;
+    if (owned) b.addEventListener('click', () => {
+      equipped.hat = id; saveWisp(); applyHat(id); renderWispSection(); b.blur();
+    });
+    wispHatsEl.appendChild(b);
+  }
+}
+
+// Boot: dress the wisp in the saved look; net reads the equipped look
+// for every ~12Hz broadcast so peers see it too.
+applySkin(equipped.skin);
+applyHat(equipped.hat);
+renderWispSection(); // populate the settings WISP section for first open
+net.cosmetics = () => ({ s: equipped.skin, h: equipped.hat });
 
 /* ---------------- world builders ---------------- */
 
@@ -427,6 +656,7 @@ function buildRealm(def, texture) {
         attunedEl.classList.remove('show');
         void attunedEl.offsetWidth; // restart CSS animation
         attunedEl.classList.add('show');
+        onRealmAttuned(this.key, this.name); // unlocks: skin + hat thresholds
       }
     },
   };
@@ -810,7 +1040,7 @@ function peerColor(id) {
 }
 
 function createPeerVisual(id, name) {
-  const color = peerColor(id);
+  const color = peerColor(id); // fallback tint for old clients without skins
   const group = new THREE.Group();
   const bob = new THREE.Group();
   const core = new THREE.Mesh(peerCoreGeo, new THREE.MeshBasicMaterial({ color }));
@@ -823,7 +1053,29 @@ function createPeerVisual(id, name) {
   tag.position.y = 1.8;
   bob.add(core, glow);
   group.add(bob, tag);
-  return { group, bob, tag, target: new THREE.Vector3(), name, phase: Math.random() * Math.PI * 2 };
+  return { id, group, bob, core, glow, hat: null, tag, target: new THREE.Vector3(), name, skin: null, hatId: null, phase: Math.random() * Math.PI * 2 };
+}
+
+// Dress a remote wisp in the peer's equipped skin (unknown id = old client,
+// keep the stable per-peer hash tint). Hats ride the existing bob group.
+function applyPeerSkin(pv, skinId) {
+  const s = SKINS[skinId];
+  if (s) {
+    pv.core.material.color.setHex(s.core);
+    pv.glow.material.color.setHex(s.glow);
+  } else {
+    const c = peerColor(pv.id);
+    pv.core.material.color.copy(c);
+    pv.glow.material.color.copy(c);
+  }
+}
+function applyPeerHat(pv, hatId) {
+  if (pv.hat) { pv.bob.remove(pv.hat); pv.hat = null; }
+  if (hatId && hatId !== 'none' && HATS[hatId]) {
+    pv.hat = buildHat(hatId);
+    pv.hat.position.y = 0.55;
+    pv.bob.add(pv.hat);
+  }
 }
 
 function retagPeer(pv, name) {
@@ -865,6 +1117,8 @@ function handleWisp(id, d) {
   if (!pv) {
     if (peerVisuals.size >= MAX_REMOTE) return; // render cap; count still tracks
     pv = createPeerVisual(id, nm);
+    pv.skin = d.s || null; applyPeerSkin(pv, pv.skin);
+    pv.hatId = d.h || null; applyPeerHat(pv, pv.hatId);
     pv.target.set(d.p[0], d.p[1], d.p[2]);
     pv.group.position.copy(pv.target); // snap on first sight
     peerVisuals.set(id, pv);
@@ -874,6 +1128,9 @@ function handleWisp(id, d) {
   } else {
     pv.target.set(d.p[0], d.p[1], d.p[2]);
     if (pv.name !== nm) { pv.name = nm; retagPeer(pv, nm); }
+    const s = d.s || null, h = d.h || null;
+    if (pv.skin !== s) { pv.skin = s; applyPeerSkin(pv, s); }
+    if (pv.hatId !== h) { pv.hatId = h; applyPeerHat(pv, h); }
   }
 }
 
@@ -926,6 +1183,7 @@ function setSettings(open) {
   if (open) {
     settingsName.value = myName;
     soundToggle.textContent = audio.muted ? 'OFF' : 'ON';
+    renderWispSection();
     updateDebugHud();
   }
 }
@@ -1142,8 +1400,7 @@ function loop() {
     const k = 1 - Math.exp(-9 * dt);
     for (const pv of peerVisuals.values()) {
       pv.group.position.lerp(pv.target, k);
-      pv.bob.position.y = Math.sin(t * 2.2 + pv.phase) * 0.3;
-      // Floating chat bubbles: rise, fade, vanish after BUBBLE_SECS.
+      pv.bob.position.y = Math.sin(t * 2.2 + pv.phase) * 0.3;      // Floating chat bubbles: rise, fade, vanish after BUBBLE_SECS.
       if (pv.bubble) {
         const remain = pv.bubble.expires - t;
         if (remain <= 0) {
@@ -1154,6 +1411,11 @@ function loop() {
           pv.bubble.sprite.material.opacity = Math.min(1, remain / 1.2);
         }
       }
+    }
+    // Local hat: gentle bob + sway so it feels worn, not glued on.
+    if (wispHat) {
+      wispHat.position.y = 0.42 + Math.sin(t * 2.2) * 0.05;
+      wispHat.rotation.y = Math.sin(t * 0.7) * 0.12;
     }
   }
 
@@ -1184,4 +1446,15 @@ window.__limbo = {
   showChatBubble,
   PROXIMITY_R,
   build: net.build,
+  // customization (build 8)
+  SKINS,
+  HATS,
+  SKIN_ORDER,
+  HAT_ORDER,
+  unlocks: () => JSON.parse(JSON.stringify(unlocks)),
+  equipped: () => ({ ...equipped }),
+  grantAttunement: onRealmAttuned,
+  applySkin,
+  applyHat,
+  renderWispSection,
 };

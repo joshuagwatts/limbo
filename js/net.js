@@ -25,7 +25,7 @@ const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '7';
+const BUILD = '8';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -112,7 +112,8 @@ export class LimboNet {
     this.name = 'drifter';
     this.sendWisp = null;
     this.sendChat = null;
-    this.onWispCb = null; // (peerId, {p:[x,y,z], n:name})
+    this.cosmetics = null; // () => ({s: skinId, h: hatId}) — set by game.js
+    this.onWispCb = null; // (peerId, {p:[x,y,z], n:name, s:skin, h:hat})
     this.onChatCb = null; // ({n:name, t:text}, peerId)
     this.onPeerLeaveCb = null; // (peerId)
     this.onQuietCb = null; // () — fired once per room visit when alone too long
@@ -467,13 +468,22 @@ export class LimboNet {
     this.sendChat = null;
   }
 
-  /* Broadcast our wisp position + name (~12Hz from the game loop). */
+  /* Broadcast our wisp position + name + equipped look (~12Hz from the
+     game loop). game.js sets this.cosmetics so peers can render our skin
+     and hat; short string ids keep the payload tiny. */
   broadcast(pos) {
     if (!this.enabled || !this.sendWisp) return;
+    let s = 'drifter', h = 'none';
+    try {
+      const c = (typeof this.cosmetics === 'function') ? this.cosmetics() : null;
+      if (c) { if (c.s) s = String(c.s).slice(0, 16); if (c.h) h = String(c.h).slice(0, 16); }
+    } catch (e) { /* ignore */ }
     try {
       this.sendWisp({
         p: [r1(pos.x), r1(pos.y), r1(pos.z)],
         n: this.name,
+        s,
+        h,
       });
     } catch (e) {
       /* ignore */
