@@ -14,8 +14,12 @@ with whoever is drifting in the same place as you.
 
 Attuning a realm (all 5 echoes) unlocks **wisp customization**: each realm
 grants its own wisp skin, and attunement milestones grant hats (party hat,
-top hat, crown). Pick your look in the settings panel — other drifters see
-your skin and hat too.
+top hat, crown) and trail styles/colors (ribbon, comet, ghost). Pick your
+look in the settings panel — other drifters see your skin, hat, and trail
+too. All cosmetics are earned by playing; nothing is paid.
+
+The settings panel also has a **PRINTS** section: each realm's artwork is a
+real giclée print in the shop, one tap away.
 
 Everything is static files — no build step, no backend, no audio files
 (all sound is synthesized live with WebAudio).
@@ -29,7 +33,7 @@ build step: edit the files, refresh the browser, done.
 deploys automatically (takes ~1 minute; watch the Actions tab go green).
 **Every deploy must bump the version** or phones will keep running the cached
 old copy: `BUILD` in `js/net.js`, `js/game.js?v=N` in `index.html`, and
-`./net.js?v=N` in `js/game.js` (keep all three `N`s in sync — currently 7).
+`./net.js?v=N` in `js/game.js` (keep all three `N`s in sync — currently 10).
 `audio.js` only needs a bump when it actually changes.
 
 One rule: talk before pushing to `main` — there's an automated builder on
