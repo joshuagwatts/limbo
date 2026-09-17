@@ -35,10 +35,24 @@
   <div id="mute-label">SOUND ON</div>
 </div>
 
+<!-- settings (gear) — debug readout, sound, drifter name -->
+<button id="gear-btn" aria-label="settings">&#9881;</button>
+<div id="settings-panel">
+  <div class="set-head"><span>SETTINGS</span><button id="settings-close" aria-label="close">&#10005;</button></div>
+  <div class="set-row"><span class="set-label">SOUND</span><button id="sound-toggle">ON</button></div>
+  <div class="set-row"><span class="set-label">DRIFTER NAME</span><input id="settings-name" maxlength="16" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+  <div class="set-debug-head">NET DEBUG</div>
+  <div id="settings-debug"></div>
+</div>
+
 <!-- room-local text chat with whoever is drifting here -->
 <div id="chat">
+  <button id="chat-toggle" aria-label="toggle chat history">&#128172;</button>
   <div id="chat-log"></div>
-  <input id="chat-input" maxlength="140" placeholder="say something to the drifters here…" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <div id="chat-row">
+    <input id="chat-input" maxlength="140" enterkeyhint="send" placeholder="say something to the drifters here…" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="chat-send" aria-label="send">&#10148;</button>
+  </div>
 </div>
 
 <!-- start overlay: the click also unlocks WebAudio -->
@@ -56,6 +70,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=5"></script>
+<script type="module" src="js/game.js?v=6"></script>
 </body>
 </html>
