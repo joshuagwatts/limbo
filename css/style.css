@@ -1,0 +1,191 @@
+/* LIMBO — dark, minimal, wide-tracked UI */
+
+:root {
+  --ink: rgba(235, 240, 255, 0.92);
+  --ink-dim: rgba(235, 240, 255, 0.55);
+  --ink-faint: rgba(235, 240, 255, 0.30);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #020204;
+  font-family: system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  color: var(--ink);
+  -webkit-user-select: none; user-select: none;
+}
+
+#scene {
+  position: fixed; inset: 0;
+  width: 100%; height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+}
+#scene:active { cursor: grabbing; }
+
+/* ---------- portal transition fade ---------- */
+#fade {
+  position: fixed; inset: 0;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.6s ease;
+  z-index: 40;
+}
+#fade.on { opacity: 1; }
+
+/* ---------- realm title card ---------- */
+#title-card {
+  position: fixed;
+  top: 38%; left: 0; right: 0;
+  text-align: center;
+  font-weight: 200;
+  font-size: clamp(28px, 5vw, 54px);
+  letter-spacing: 0.55em;
+  text-indent: 0.55em; /* recenter tracked text */
+  color: var(--ink);
+  text-shadow: 0 0 30px rgba(160, 200, 255, 0.5);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 1.1s ease;
+  z-index: 41;
+}
+#title-card.show { opacity: 1; }
+
+/* ---------- realm attuned shimmer ---------- */
+#attuned {
+  position: fixed;
+  top: 30%; left: 0; right: 0;
+  text-align: center;
+  font-weight: 200;
+  font-size: clamp(16px, 2.6vw, 26px);
+  letter-spacing: 0.7em;
+  text-indent: 0.7em;
+  color: #ffe9a8;
+  text-shadow: 0 0 24px rgba(255, 220, 130, 0.8);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 41;
+}
+#attuned.show { animation: attuned 3s ease forwards; }
+@keyframes attuned {
+  0%   { opacity: 0; letter-spacing: 0.4em; }
+  20%  { opacity: 1; }
+  75%  { opacity: 1; }
+  100% { opacity: 0; letter-spacing: 0.9em; }
+}
+
+/* ---------- HUD ---------- */
+#hud { position: fixed; inset: 0; pointer-events: none; z-index: 30; }
+
+#realm-name {
+  position: absolute; top: 22px; left: 26px;
+  font-weight: 300; font-size: 13px;
+  letter-spacing: 0.45em;
+  color: var(--ink-dim);
+}
+
+#echo-counter {
+  position: absolute; top: 22px; right: 26px;
+  font-weight: 300; font-size: 13px;
+  letter-spacing: 0.45em;
+  color: var(--ink-dim);
+}
+
+#controls-hint {
+  position: absolute; bottom: 26px; left: 0; right: 0;
+  text-align: center;
+  font-weight: 300; font-size: 11px;
+  letter-spacing: 0.3em;
+  color: var(--ink-faint);
+  transition: opacity 2s ease;
+}
+#controls-hint.gone { opacity: 0; }
+
+#mute-label {
+  position: absolute; bottom: 24px; right: 26px;
+  font-weight: 300; font-size: 10px;
+  letter-spacing: 0.35em;
+  color: var(--ink-faint);
+}
+
+/* ---------- loading ---------- */
+#loading {
+  position: fixed; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  z-index: 60; pointer-events: none;
+  font-weight: 200; font-size: 14px;
+  letter-spacing: 0.5em; text-indent: 0.5em;
+  color: var(--ink-dim);
+}
+#loading span::after { content: "…"; animation: dots 1.4s steps(4) infinite; }
+@keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+#loading.done { display: none; }
+
+/* ---------- start overlay ---------- */
+#start-overlay {
+  position: fixed; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 18px;
+  background: radial-gradient(ellipse at center, rgba(2,2,6,0.25) 0%, rgba(2,2,6,0.78) 100%);
+  z-index: 50;
+  transition: opacity 1.2s ease;
+}
+#start-overlay.gone { opacity: 0; pointer-events: none; }
+
+#start-overlay h1 {
+  font-weight: 100;
+  font-size: clamp(54px, 11vw, 120px);
+  letter-spacing: 0.5em; text-indent: 0.5em;
+  text-shadow: 0 0 60px rgba(140, 180, 255, 0.45);
+}
+#start-overlay .sub {
+  font-weight: 200; font-size: 15px;
+  letter-spacing: 0.6em; text-indent: 0.6em;
+  color: var(--ink-dim);
+}
+#drift-btn {
+  margin-top: 14px;
+  background: transparent;
+  border: 1px solid rgba(235, 240, 255, 0.35);
+  color: var(--ink);
+  font-family: inherit; font-weight: 300; font-size: 13px;
+  letter-spacing: 0.45em; text-indent: 0.45em;
+  padding: 15px 38px 15px 44px;
+  cursor: pointer;
+  transition: border-color 0.3s, background 0.3s, box-shadow 0.3s;
+}
+#drift-btn:not(:disabled):hover {
+  border-color: rgba(235, 240, 255, 0.9);
+  background: rgba(235, 240, 255, 0.06);
+  box-shadow: 0 0 30px rgba(140, 180, 255, 0.25);
+}
+#drift-btn:disabled { opacity: 0.45; cursor: wait; }
+#start-overlay .tiny {
+  font-weight: 300; font-size: 10px;
+  letter-spacing: 0.35em;
+  color: var(--ink-faint);
+}
+
+/* ---------- touch joystick ---------- */
+#joy-base {
+  position: fixed;
+  width: 112px; height: 112px;
+  border: 1px solid rgba(235, 240, 255, 0.25);
+  border-radius: 50%;
+  display: none;
+  pointer-events: none;
+  z-index: 35;
+  transform: translate(-50%, -50%);
+}
+#joy-knob {
+  position: absolute; left: 50%; top: 50%;
+  width: 46px; height: 46px;
+  border-radius: 50%;
+  background: rgba(235, 240, 255, 0.22);
+  transform: translate(-50%, -50%);
+}
