@@ -15,6 +15,22 @@ is drifting in the same place as you.
 Everything is static files — no build step, no backend, no audio files
 (all sound is synthesized live with WebAudio).
 
+## Building together
+
+The repo is public — clone it and run it locally, same as above. There is no
+build step: edit the files, refresh the browser, done.
+
+**Deploying:** GitHub Pages serves the `main` branch, so pushing to `main`
+deploys automatically (takes ~1 minute; watch the Actions tab go green).
+**Every deploy must bump the version** or phones will keep running the cached
+old copy: `BUILD` in `js/net.js`, `js/game.js?v=N` in `index.html`, and
+`./net.js?v=N` in `js/game.js` (keep all three `N`s in sync — currently 7).
+`audio.js` only needs a bump when it actually changes.
+
+One rule: talk before pushing to `main` — there's an automated builder on
+Joshua's side that works from its own copy and uploads through the GitHub web
+UI, so coordinate to avoid stepping on each other's deploys.
+
 ## Run it locally
 
 ```bash
@@ -28,19 +44,9 @@ require http.)
 
 ## Deploy to GitHub Pages
 
-1. Create a new GitHub repo (e.g. `holowatts/limbo`).
-2. Push the contents of this folder to the `main` branch, at the repo root:
-   ```bash
-   cd ~/workspace/limbo
-   git init -b main
-   git add .
-   git commit -m "LIMBO prototype"
-   git remote add origin git@github.com:holowatts/limbo.git
-   git push -u origin main
-   ```
-3. In the repo: **Settings → Pages → Build and deployment → Deploy from a branch**,
-   select `main` and `/ (root)`, Save.
-4. It'll be live at `https://holowatts.github.io/limbo/` in a minute or two.
+Already live at `https://joshuagwatts.github.io/limbo/` — Pages is set to
+**Deploy from a branch**, `main` / `/ (root)`. Push to `main` and it
+redeploys in about a minute. Remember the version bump (see above).
 
 Notes:
 - All paths are relative, so it works identically locally and on Pages.
@@ -76,24 +82,28 @@ Notes:
   *where you are*.
 - Your wisp position + name broadcasts ~12Hz; remote wisps render as glowing
   spheres with floating name tags (capped at 15), eased for smoothness.
-- **Chat:** press **T** (or tap the chat box on mobile) to type, **Enter** to
-  send, **Esc** to close. Messages are room-local (140 chars). Peer
-  join/leave shows as quiet system lines ("nova drifted in"). Alone in a realm
+- **Chat:** tap the chat box (or press **T**) to type, **Enter** to send,
+  **Esc** to close. Messages are room-local, 140 chars, and **proximity-based**:
+  you only hear drifters within ~40m of you — a message from farther away
+  shows as a faint "you sense distant chatter…" hint. The speech-bubble
+  button opens the session's chat history; incoming messages also float as
+  bubbles above the sender's wisp for a few seconds. Peer join/leave shows
+  as quiet system lines ("nova drifted in"). Alone in a realm
   room for 20s and you'll get one gentle nudge: "the void is quiet here —
   drift to the Nexus to find other drifters".
 - **Graceful:** if the CDN or WebRTC is unreachable, the game plays exactly
   like the single-player prototype — no errors, no blocking.
-- **Debug HUD (press D, or triple-tap on mobile).** Live overlay showing the
-  build stamp (so you can confirm a phone is running the latest deploy and
-  not a cached copy), signaling strategy, room key, peer count, and — for
+- **Debug readout** lives in the settings panel (gear button, or **D** on
+  desktop). Live overlay showing the build stamp (so you can confirm a phone
+  is running the latest deploy and not a cached copy), signaling strategy, room key, peer count, and — for
   each peer connection — ICE state, gathering state, local candidate types
   (`host`/`srflx`/`relay`), the selected pair type, and trystero's own
   join-error text. `relay` in local candidates = TURN allocation worked;
   host+srflx only = TURN is dead. Updates every second while open.
 - **Cache-busting.** `index.html` loads `js/game.js?v=N` and game.js imports
-  `./net.js?v=N` / `./audio.js?v=N` — bump `N` (and `BUILD` in `net.js`) on
-  every deploy, because mobile browsers aggressively cache the old bundle
-  and a stale STUN-only copy looks exactly like "multiplayer still broken".
+  `./net.js?v=N` — bump `N` (and `BUILD` in `net.js`) on every deploy,
+  because mobile browsers aggressively cache the old bundle and a stale
+  copy looks exactly like "multiplayer still broken".
 
 ## Controls
 
