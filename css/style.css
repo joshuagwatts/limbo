@@ -283,6 +283,26 @@ html, body {
 @keyframes pulse-dot { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 #peer-count.settled { color: var(--ink-faint); }
 
+/* ---------- sound room: DJ line + decks button (build 12) ---------- */
+#dj-line {
+  position: absolute; top: 66px; right: 26px;
+  font-weight: 300; font-size: 11px;
+  letter-spacing: 0.28em;
+  color: #ffc24d;
+  text-shadow: 0 0 12px rgba(255, 194, 77, 0.55);
+}
+#decks-btn {
+  position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%);
+  z-index: 40;
+  background: rgba(255, 194, 77, 0.12);
+  border: 1px solid rgba(255, 194, 77, 0.6); border-radius: 999px;
+  color: #ffd88a; font-family: inherit; letter-spacing: 0.2em;
+  font-size: 11px; text-transform: uppercase;
+  padding: 14px 26px; min-height: 48px;
+  cursor: pointer; touch-action: manipulation;
+}
+#decks-btn:active { background: rgba(255, 194, 77, 0.25); }
+
 /* ---------- settings ---------- */
 #gear-btn {
   position: fixed; top: 14px; left: 14px; z-index: 46;
@@ -512,3 +532,134 @@ html, body {
   background: rgba(235, 240, 255, 0.22);
   transform: translate(-50%, -50%);
 }
+
+/* ---------- jam room: button + bottom sheet (build 13) ---------- */
+#jam-btn {
+  position: fixed; bottom: 160px; left: 50%; transform: translateX(-50%);
+  z-index: 48;
+  background: rgba(122, 224, 255, 0.10);
+  border: 1px solid rgba(122, 224, 255, 0.55); border-radius: 999px;
+  color: #bfeaff; font-family: inherit; letter-spacing: 0.2em;
+  font-size: 11px; text-transform: uppercase;
+  padding: 14px 26px; min-height: 48px;
+  cursor: pointer; touch-action: manipulation;
+}
+#jam-btn:active { background: rgba(122, 224, 255, 0.25); }
+#jam-panel {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  max-height: 72vh; overflow-y: auto;
+  background: rgba(4, 8, 18, 0.96);
+  border-top: 1px solid rgba(122, 224, 255, 0.35);
+  border-radius: 16px 16px 0 0;
+  padding: 12px 16px 28px;
+  transform: translateY(105%);
+  transition: transform 0.25s ease;
+  font-weight: 300;
+  touch-action: manipulation;
+  user-select: none; -webkit-user-select: none;
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.6);
+}
+#jam-panel.open { transform: none; }
+.jam-head {
+  display: flex; justify-content: space-between; align-items: center;
+  letter-spacing: 0.35em; font-size: 12px; color: #bfeaff;
+  margin-bottom: 8px;
+}
+#jam-close {
+  background: none; border: none; color: #9fd8ff;
+  font-size: 15px; cursor: pointer; padding: 8px 10px;
+  touch-action: manipulation; min-height: 44px; min-width: 44px;
+}
+.jam-sub {
+  letter-spacing: 0.35em; font-size: 10px; color: var(--ink-dim);
+  margin: 12px 0 6px;
+}
+.jam-transport {
+  display: flex; align-items: center; gap: 10px;
+}
+.jam-bpm-wrap { text-align: center; min-width: 64px; }
+#jam-bpm { font-size: 30px; color: #fff; line-height: 1; }
+.jam-bpm-label { font-size: 9px; letter-spacing: 0.3em; color: var(--ink-dim); }
+.jam-clock {
+  display: flex; align-items: center; gap: 6px; flex: 1;
+  font-size: 11px; letter-spacing: 0.12em; color: var(--ink-dim);
+}
+#jam-clock-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: #556; display: inline-block;
+}
+#jam-clock-dot.live { background: #37e6ff; box-shadow: 0 0 10px #37e6ff; }
+.jam-transport button {
+  background: rgba(122, 224, 255, 0.08);
+  border: 1px solid rgba(122, 224, 255, 0.4); border-radius: 10px;
+  color: #bfeaff; font-family: inherit; font-size: 12px;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  min-height: 44px; min-width: 52px; padding: 10px 14px;
+  cursor: pointer; touch-action: manipulation;
+}
+.jam-transport button:disabled { opacity: 0.3; }
+.jam-transport button:active:not(:disabled) { background: rgba(122, 224, 255, 0.22); }
+#jam-tap.tapped { background: rgba(122, 224, 255, 0.35); }
+.jam-synth-row { display: flex; gap: 8px; }
+.jam-wave {
+  flex: 1; background: rgba(122, 224, 255, 0.06);
+  border: 1px solid rgba(122, 224, 255, 0.3); border-radius: 10px;
+  color: #bfeaff; font-family: inherit; font-size: 11px;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  min-height: 44px; cursor: pointer; touch-action: manipulation;
+}
+.jam-wave.sel { background: rgba(122, 224, 255, 0.22); border-color: #7ae0ff; }
+.jam-knobs {
+  display: flex; gap: 18px; margin-top: 10px;
+  font-size: 11px; letter-spacing: 0.15em; color: var(--ink-dim);
+}
+.jam-knobs label { display: flex; align-items: center; gap: 8px; flex: 1; }
+.jam-knobs input[type="range"] { flex: 1; accent-color: #7ae0ff; }
+#jam-keys {
+  display: flex; height: 118px; margin-top: 10px;
+  border: 1px solid rgba(122, 224, 255, 0.25); border-radius: 10px;
+  overflow: hidden; background: #0a0f1e;
+}
+.jam-key {
+  flex: 1; border: none; border-right: 1px solid rgba(122, 224, 255, 0.18);
+  background: linear-gradient(#f4f8ff, #cfd9ee);
+  color: #445; font-family: inherit; font-size: 10px;
+  display: flex; align-items: flex-end; justify-content: center;
+  padding-bottom: 8px; cursor: pointer; touch-action: manipulation;
+}
+.jam-key:last-child { border-right: none; }
+.jam-key.black {
+  flex: 0 0 7.5%; margin: 0 -3.75%; height: 62%; align-self: flex-start;
+  background: linear-gradient(#2a3350, #10142a);
+  border: 1px solid #000; border-radius: 0 0 5px 5px;
+  z-index: 2; color: transparent;
+}
+.jam-key:active { filter: brightness(1.25); }
+.jam-sampler-row { display: flex; gap: 10px; align-items: stretch; }
+#jam-grab {
+  background: rgba(255, 194, 77, 0.10);
+  border: 1px solid rgba(255, 194, 77, 0.5); border-radius: 10px;
+  color: #ffd88a; font-family: inherit; font-size: 11px;
+  letter-spacing: 0.15em; text-transform: uppercase;
+  min-height: 56px; padding: 10px 18px;
+  cursor: pointer; touch-action: manipulation;
+}
+#jam-grab:active { background: rgba(255, 194, 77, 0.25); }
+#jam-pads { display: flex; gap: 8px; flex: 1; }
+.jam-pad {
+  flex: 1; min-height: 56px; border-radius: 10px;
+  background: rgba(140, 170, 255, 0.06);
+  border: 1px dashed rgba(140, 170, 255, 0.35);
+  color: var(--ink-dim); font-family: inherit; font-size: 16px;
+  cursor: pointer; touch-action: manipulation;
+}
+.jam-pad.loaded {
+  border-style: solid; border-color: rgba(55, 230, 255, 0.6);
+  background: rgba(55, 230, 255, 0.12); color: #bfeaff;
+}
+.jam-pad:active { filter: brightness(1.3); }
+.jam-hint {
+  font-size: 11px; letter-spacing: 0.08em; color: var(--ink-dim);
+  margin-top: 8px; min-height: 14px;
+}
+.jam-jammers { font-size: 12px; letter-spacing: 0.08em; color: #9fd8ff; }
