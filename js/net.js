@@ -25,7 +25,7 @@ const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '8';
+const BUILD = '10';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -112,7 +112,7 @@ export class LimboNet {
     this.name = 'drifter';
     this.sendWisp = null;
     this.sendChat = null;
-    this.cosmetics = null; // () => ({s: skinId, h: hatId}) — set by game.js
+    this.cosmetics = null; // () => ({s: skinId, h: hatId, t: trailStyle, c: trailHex6}) — set by game.js
     this.onWispCb = null; // (peerId, {p:[x,y,z], n:name, s:skin, h:hat})
     this.onChatCb = null; // ({n:name, t:text}, peerId)
     this.onPeerLeaveCb = null; // (peerId)
@@ -469,14 +469,19 @@ export class LimboNet {
   }
 
   /* Broadcast our wisp position + name + equipped look (~12Hz from the
-     game loop). game.js sets this.cosmetics so peers can render our skin
-     and hat; short string ids keep the payload tiny. */
+     game loop). game.js sets this.cosmetics so peers can render our skin,
+     hat, and trail; short string ids keep the payload tiny. */
   broadcast(pos) {
     if (!this.enabled || !this.sendWisp) return;
-    let s = 'drifter', h = 'none';
+    let s = 'drifter', h = 'none', t = 'ribbon', c = 'bfe2ff';
     try {
-      const c = (typeof this.cosmetics === 'function') ? this.cosmetics() : null;
-      if (c) { if (c.s) s = String(c.s).slice(0, 16); if (c.h) h = String(c.h).slice(0, 16); }
+      const csm = (typeof this.cosmetics === 'function') ? this.cosmetics() : null;
+      if (csm) {
+        if (csm.s) s = String(csm.s).slice(0, 16);
+        if (csm.h) h = String(csm.h).slice(0, 16);
+        if (csm.t) t = String(csm.t).slice(0, 16);
+        if (csm.c) c = String(csm.c).slice(0, 6);
+      }
     } catch (e) { /* ignore */ }
     try {
       this.sendWisp({
@@ -484,6 +489,8 @@ export class LimboNet {
         n: this.name,
         s,
         h,
+        t,
+        c,
       });
     } catch (e) {
       /* ignore */

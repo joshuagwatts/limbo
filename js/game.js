@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=8';
+import { LimboNet } from './net.js?v=10';
 
 /* ---------------- configuration ---------------- */
 
@@ -21,6 +21,21 @@ const REALM_DEFS = [
   { key: 'realm4', name: 'STILL POINT', file: 'assets/realm4.jpg', fog: 0x06231c, accent: 0x2dffb3, root: 196.0  },
 ];
 const NEXUS_DEF = { key: 'nexus', name: 'THE NEXUS', root: 110.0 };
+
+// Print shop: every realm's artwork is a real giclée print. One base URL so
+// the store can move from the temp domain to shop.holowatts.com later
+// without touching the rows below.
+const SHOP_BASE = 'https://newvjk-az.myshopify.com';
+const REALM_PRINT = {
+  realm1: { title: 'Colorful Worlds' },
+  realm2: { title: 'Rainbow Deathstar' },
+  realm3: { title: 'BubbleFairy' },
+  realm4: { title: 'Mind Body n Soul' },
+};
+function printUrl(realmKey) {
+  const t = (REALM_PRINT[realmKey] && REALM_PRINT[realmKey].title) || '';
+  return SHOP_BASE + '/search?q=' + encodeURIComponent(t);
+}
 
 const ECHOES_PER_REALM = 5;
 const TOTAL_ECHOES = REALM_DEFS.length * ECHOES_PER_REALM;
@@ -59,6 +74,9 @@ const settingsDebug = document.getElementById('settings-debug');
 const unlockToastEl = document.getElementById('unlock-toast');
 const wispSkinsEl   = document.getElementById('wisp-skins');
 const wispHatsEl    = document.getElementById('wisp-hats');
+const wispTrailStylesEl = document.getElementById('wisp-trail-styles');
+const wispTrailColorsEl = document.getElementById('wisp-trail-colors');
+const printsListEl  = document.getElementById('prints-list');
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -159,60 +177,158 @@ wisp.add(wispCore, wispGlow, wispLight);
 const vel = new THREE.Vector3();   // wisp velocity (dreamy inertia)
 let yaw = 0, pitch = -0.05;        // look direction
 
-// Fading trail: a ribbon of points, head bright -> tail black (additive = invisible).
-const TRAIL_N = 60;
-const trailPos = new Float32Array(TRAIL_N * 3);
-const trailCol = new Float32Array(TRAIL_N * 3);
-{
-  const head = new THREE.Color(0xbfe2ff);
-  for (let i = 0; i < TRAIL_N; i++) {
-    const f = Math.pow(i / (TRAIL_N - 1), 1.6); // i=0 tail .. i=N-1 head
-    trailCol[i * 3] = head.r * f;
-    trailCol[i * 3 + 1] = head.g * f;
-    trailCol[i * 3 + 2] = head.b * f;
-  }
-}
-const trailGeo = new THREE.BufferGeometry();
-trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3));
-trailGeo.setAttribute('color', new THREE.BufferAttribute(trailCol, 3));
-const trail = new THREE.Points(
-  trailGeo,
-  new THREE.PointsMaterial({ size: 0.45, vertexColors: true, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false })
-);
-trail.frustumCulled = false;
-let trailTimer = 0;
+/* ---------------- trails ----------------
+   Three earnable styles, all cheap CPU point buffers with additive
+   blending (head bright -> tail black = invisible):
+   - ribbon: the classic fading point trail (default)
+   - comet: sparkles emitted along the path that drift and fade out
+   - ghost: two wide soft ribbons weaving side to side (dreamy)
+   makeTrail(n, sizeScale) -> { group, setStyle, setColor, update, clear }.
+   The local wisp gets a full 60-segment trail; remote drifters get a
+   shorter 24-segment one (hidden beyond 150m for perf). */
 
-// Re-tint the trail ribbon (used when equipping a skin).
-function retintTrail(hex) {
-  const head = new THREE.Color(hex);
-  for (let i = 0; i < TRAIL_N; i++) {
-    const f = Math.pow(i / (TRAIL_N - 1), 1.6); // i=0 tail .. i=N-1 head
-    trailCol[i * 3] = head.r * f;
-    trailCol[i * 3 + 1] = head.g * f;
-    trailCol[i * 3 + 2] = head.b * f;
+const TRAIL_STYLES = {
+  ribbon: { name: 'Ribbon', req: null },
+  comet:  { name: 'Comet',  req: 'collect 10 echoes' },
+  ghost:  { name: 'Ghost',  req: 'attune 2 realms' },
+};
+const TRAIL_COLORS = {
+  white: { name: 'Moonlight', hex: 0xbfe2ff, req: null },
+  prism: { name: 'Prism',     hex: 0xff4fd8, req: 'attune PRISM DEEP' },
+  tide:  { name: 'Tide',      hex: 0x7a5cff, req: 'attune MIRROR TIDE' },
+  volt:  { name: 'Volt',      hex: 0x37e6ff, req: 'attune CHROME VEIL' },
+  sage:  { name: 'Sage',      hex: 0x2dffb3, req: 'attune STILL POINT' },
+  gold:  { name: 'Gold',      hex: 0xffe9a8, req: 'attune all 4 realms' },
+};
+const TRAIL_STYLE_ORDER = ['ribbon', 'comet', 'ghost'];
+const TRAIL_COLOR_ORDER = ['white', 'prism', 'tide', 'volt', 'sage', 'gold'];
+const REALM_TRAIL_COLOR = { realm1: 'prism', realm2: 'tide', realm3: 'volt', realm4: 'sage' };
+
+function makeTrail(n, sizeScale) {
+  const group = new THREE.Group();
+  const color = new THREE.Color(0xbfe2ff);
+  let style = 'ribbon';
+
+  function fadeInto(arr) {
+    for (let i = 0; i < n; i++) {
+      const f = Math.pow(i / (n - 1), 1.6); // i=0 tail .. i=n-1 head
+      arr[i * 3] = color.r * f;
+      arr[i * 3 + 1] = color.g * f;
+      arr[i * 3 + 2] = color.b * f;
+    }
   }
-  trailGeo.attributes.color.needsUpdate = true;
+  function ribbonPoints(size, opacity) {
+    const pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+    fadeInto(col);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    const pts = new THREE.Points(geo, new THREE.PointsMaterial({
+      size: size * sizeScale, vertexColors: true, transparent: true, opacity,
+      blending: THREE.AdditiveBlending, depthWrite: false }));
+    pts.frustumCulled = false;
+    return { pts, pos, col, geo };
+  }
+
+  const R = ribbonPoints(0.45, 0.85);          // ribbon style
+  const G1 = ribbonPoints(0.9, 0.35);          // ghost: left weave
+  const G2 = ribbonPoints(0.9, 0.35);          // ghost: right weave
+
+  // comet: n sparkles, each with velocity + remaining life
+  const cPos = new Float32Array(n * 3), cCol = new Float32Array(n * 3);
+  const cVel = new Float32Array(n * 3), cLife = new Float32Array(n);
+  const COMET_LIFE = 0.9;
+  let cCursor = 0, cEmitT = 0;
+  const cGeo = new THREE.BufferGeometry();
+  cGeo.setAttribute('position', new THREE.BufferAttribute(cPos, 3));
+  cGeo.setAttribute('color', new THREE.BufferAttribute(cCol, 3));
+  const comet = new THREE.Points(cGeo, new THREE.PointsMaterial({
+    size: 0.3 * sizeScale, vertexColors: true, transparent: true, opacity: 0.9,
+    blending: THREE.AdditiveBlending, depthWrite: false }));
+  comet.frustumCulled = false;
+
+  group.add(R.pts, G1.pts, G2.pts, comet);
+
+  let pushT = 0, tG = 0;
+
+  function pushRibbon(P, x, y, z) {
+    P.pos.copyWithin(0, 3); // drop oldest
+    const o = (n - 1) * 3;
+    P.pos[o] = x; P.pos[o + 1] = y; P.pos[o + 2] = z;
+    P.geo.attributes.position.needsUpdate = true;
+  }
+
+  function setStyle(s) {
+    style = TRAIL_STYLES[s] ? s : 'ribbon';
+    R.pts.visible = style === 'ribbon';
+    comet.visible = style === 'comet';
+    G1.pts.visible = G2.pts.visible = style === 'ghost';
+  }
+  function setColor(hex) {
+    color.setHex(hex);
+    for (const P of [R, G1, G2]) { fadeInto(P.col); P.geo.attributes.color.needsUpdate = true; }
+    // comet particles re-tint live from `color` as they fade
+  }
+  function clear(pos) {
+    for (const P of [R, G1, G2]) {
+      for (let i = 0; i < n; i++) { P.pos[i * 3] = pos.x; P.pos[i * 3 + 1] = pos.y; P.pos[i * 3 + 2] = pos.z; }
+      P.geo.attributes.position.needsUpdate = true;
+    }
+    cLife.fill(0); cCol.fill(0);
+    cGeo.attributes.position.needsUpdate = true;
+    cGeo.attributes.color.needsUpdate = true;
+  }
+  function update(pos, dt) {
+    tG += dt;
+    if (style === 'ribbon') {
+      pushT += dt;
+      if (pushT < 0.035) return;
+      pushT = 0;
+      pushRibbon(R, pos.x, pos.y, pos.z);
+    } else if (style === 'comet') {
+      cEmitT += dt;
+      while (cEmitT > 0.05) {
+        cEmitT -= 0.05;
+        const i = cCursor; cCursor = (cCursor + 1) % n;
+        cPos[i * 3] = pos.x; cPos[i * 3 + 1] = pos.y; cPos[i * 3 + 2] = pos.z;
+        const a = Math.random() * Math.PI * 2, sp = 0.6 + Math.random() * 1.4;
+        cVel[i * 3] = Math.cos(a) * sp;
+        cVel[i * 3 + 1] = (Math.random() - 0.2) * 1.2;
+        cVel[i * 3 + 2] = Math.sin(a) * sp;
+        cLife[i] = COMET_LIFE;
+      }
+      const drag = Math.max(0, 1 - dt * 1.5);
+      for (let i = 0; i < n; i++) {
+        if (cLife[i] <= 0) continue;
+        cLife[i] -= dt;
+        const f = Math.max(cLife[i], 0) / COMET_LIFE;
+        cPos[i * 3] += cVel[i * 3] * dt;
+        cPos[i * 3 + 1] += cVel[i * 3 + 1] * dt;
+        cPos[i * 3 + 2] += cVel[i * 3 + 2] * dt;
+        cVel[i * 3] *= drag; cVel[i * 3 + 1] *= drag; cVel[i * 3 + 2] *= drag;
+        cCol[i * 3] = color.r * f; cCol[i * 3 + 1] = color.g * f; cCol[i * 3 + 2] = color.b * f;
+      }
+      cGeo.attributes.position.needsUpdate = true;
+      cGeo.attributes.color.needsUpdate = true;
+    } else { // ghost: two soft ribbons with a slow lateral weave
+      pushT += dt;
+      if (pushT < 0.05) return;
+      pushT = 0;
+      const wx = Math.cos(tG * 1.3) * 0.55, wz = Math.sin(tG * 1.3) * 0.55;
+      pushRibbon(G1, pos.x + wx, pos.y, pos.z + wz);
+      pushRibbon(G2, pos.x - wx, pos.y, pos.z - wz);
+    }
+  }
+
+  setStyle('ribbon');
+  return { group, setStyle, setColor, update, clear, getStyle: () => style };
 }
 
-function clearTrail() {
-  for (let i = 0; i < TRAIL_N; i++) {
-    trailPos[i * 3] = wisp.position.x;
-    trailPos[i * 3 + 1] = wisp.position.y;
-    trailPos[i * 3 + 2] = wisp.position.z;
-  }
-  trailGeo.attributes.position.needsUpdate = true;
-}
-function pushTrail(dt) {
-  trailTimer += dt;
-  if (trailTimer < 0.035) return;
-  trailTimer = 0;
-  trailPos.copyWithin(0, 3); // drop oldest
-  const o = (TRAIL_N - 1) * 3;
-  trailPos[o] = wisp.position.x;
-  trailPos[o + 1] = wisp.position.y;
-  trailPos[o + 2] = wisp.position.z;
-  trailGeo.attributes.position.needsUpdate = true;
-}
+// Local trail (full length). Thin wrappers keep the old call sites working.
+const localTrail = makeTrail(60, 1);
+function retintTrail(hex) { localTrail.setColor(hex); }
+function clearTrail() { localTrail.clear(wisp.position); }
+function pushTrail(dt) { localTrail.update(wisp.position, dt); }
 
 /* ---------------- wisp customization: skins & hats ----------------
    Attuning a realm (all 5 echoes) unlocks cosmetics. Unlocks + equipped
@@ -237,16 +353,18 @@ const REALM_SKIN = { realm1: 'prism', realm2: 'tide', realm3: 'volt', realm4: 's
 const SKIN_ORDER = ['drifter', 'prism', 'tide', 'volt', 'sage', 'voidwalker'];
 const HAT_ORDER = ['none', 'party', 'top', 'crown'];
 
-// limbo_unlocks: { attuned:[realmKeys], skins:[ids], hats:[ids] }
-// limbo_wisp:   { skin, hat } — equipped look
+// limbo_unlocks: { attuned:[realmKeys], skins:[ids], hats:[ids], trailStyles:[ids], trailColors:[ids] }
+// limbo_wisp:   { skin, hat, trailStyle, trailColor } — equipped look
 function loadUnlocks() {
-  const d = { attuned: [], skins: ['drifter'], hats: [] };
+  const d = { attuned: [], skins: ['drifter'], hats: [], trailStyles: ['ribbon'], trailColors: ['white'] };
   try {
     const raw = JSON.parse(localStorage.getItem('limbo_unlocks') || 'null');
     if (raw && typeof raw === 'object') {
       if (Array.isArray(raw.attuned)) d.attuned = raw.attuned.filter((k) => REALM_DEFS.some((r) => r.key === k));
       if (Array.isArray(raw.skins)) d.skins = ['drifter', ...raw.skins.filter((s) => SKINS[s] && s !== 'drifter')];
       if (Array.isArray(raw.hats)) d.hats = raw.hats.filter((h) => HATS[h] && h !== 'none');
+      if (Array.isArray(raw.trailStyles)) d.trailStyles = ['ribbon', ...raw.trailStyles.filter((t) => TRAIL_STYLES[t] && t !== 'ribbon')];
+      if (Array.isArray(raw.trailColors)) d.trailColors = ['white', ...raw.trailColors.filter((t) => TRAIL_COLORS[t] && t !== 'white')];
     }
   } catch (e) { /* ignore — defaults */ }
   return d;
@@ -255,11 +373,13 @@ function saveUnlocks() {
   try { localStorage.setItem('limbo_unlocks', JSON.stringify(unlocks)); } catch (e) { /* ignore */ }
 }
 function loadWisp() {
-  const d = { skin: 'drifter', hat: 'none' };
+  const d = { skin: 'drifter', hat: 'none', trailStyle: 'ribbon', trailColor: 'white' };
   try {
     const raw = JSON.parse(localStorage.getItem('limbo_wisp') || 'null');
     if (raw && SKINS[raw.skin]) d.skin = raw.skin;
     if (raw && HATS[raw.hat]) d.hat = raw.hat;
+    if (raw && TRAIL_STYLES[raw.trailStyle]) d.trailStyle = raw.trailStyle;
+    if (raw && TRAIL_COLORS[raw.trailColor]) d.trailColor = raw.trailColor;
   } catch (e) { /* ignore — defaults */ }
   return d;
 }
@@ -274,7 +394,14 @@ function applySkin(skinId) {
   wispCore.material.color.setHex(s.core);
   wispGlow.material.color.setHex(s.glow);
   wispLight.color.setHex(s.light);
-  retintTrail(s.trail);
+  // Trail color is its own customization now (applyTrail) — skins no longer re-tint it.
+}
+
+// Dress the local trail in the equipped style + color.
+function applyTrail() {
+  localTrail.setStyle(equipped.trailStyle);
+  const c = TRAIL_COLORS[equipped.trailColor] || TRAIL_COLORS.white;
+  localTrail.setColor(c.hex);
 }
 
 function buildHat(hatId) {
@@ -372,18 +499,36 @@ function onRealmAttuned(realmKey, realmName) {
     unlocks.skins.push('voidwalker');
     fresh.push('Voidwalker skin unlocked');
   }
+  const tc = REALM_TRAIL_COLOR[realmKey];
+  if (tc && !unlocks.trailColors.includes(tc)) {
+    unlocks.trailColors.push(tc);
+    fresh.push(`${TRAIL_COLORS[tc].name} trail unlocked`);
+  }
+  if (n >= 2 && !unlocks.trailStyles.includes('ghost')) {
+    unlocks.trailStyles.push('ghost');
+    fresh.push('Ghost trail unlocked');
+  }
+  if (n >= 4 && !unlocks.trailColors.includes('gold')) {
+    unlocks.trailColors.push('gold');
+    fresh.push('Gold trail unlocked');
+  }
   saveUnlocks();
   if (fresh.length) {
-    showUnlockToast([`${realmName} attuned`, ...fresh]);
+    const printTitle = (REALM_PRINT[realmKey] && REALM_PRINT[realmKey].title) || '';
+    const lines = [`${realmName} attuned`, ...fresh];
+    if (printTitle) lines.push(`own "${printTitle}" — PRINTS in settings`);
+    showUnlockToast(lines);
     addSystemLine(`${realmName} attuned — ${fresh.join(' · ').toLowerCase()}`);
   }
   renderWispSection();
+  renderPrintsSection();
 }
 
-// Settings panel "WISP" section: skin swatches + hat buttons. Locked items
-// show their requirement; tapping an owned item equips it immediately.
+// Settings panel "WISP" section: skin swatches + hat buttons + trail styles
+// + trail colors. Locked items show their requirement; tapping an owned
+// item equips it immediately.
 function renderWispSection() {
-  if (!wispSkinsEl || !wispHatsEl) return;
+  if (!wispSkinsEl || !wispHatsEl || !wispTrailStylesEl || !wispTrailColorsEl) return;
   wispSkinsEl.innerHTML = '';
   for (const id of SKIN_ORDER) {
     const s = SKINS[id];
@@ -419,14 +564,90 @@ function renderWispSection() {
     });
     wispHatsEl.appendChild(b);
   }
+  wispTrailStylesEl.innerHTML = '';
+  for (const id of TRAIL_STYLE_ORDER) {
+    const ts = TRAIL_STYLES[id];
+    const owned = unlocks.trailStyles.includes(id);
+    const b = document.createElement('button');
+    b.className = 'wisp-hat' + (equipped.trailStyle === id ? ' equipped' : '') + (owned ? '' : ' locked');
+    b.title = owned ? ts.name : `${ts.name} — ${ts.req}`;
+    b.setAttribute('aria-label', b.title);
+    b.textContent = owned ? ts.name : ts.req;
+    if (owned) b.addEventListener('click', () => {
+      equipped.trailStyle = id; saveWisp(); applyTrail(); renderWispSection(); b.blur();
+    });
+    wispTrailStylesEl.appendChild(b);
+  }
+  wispTrailColorsEl.innerHTML = '';
+  for (const id of TRAIL_COLOR_ORDER) {
+    const tc = TRAIL_COLORS[id];
+    const owned = unlocks.trailColors.includes(id);
+    const b = document.createElement('button');
+    b.className = 'wisp-swatch' + (equipped.trailColor === id ? ' equipped' : '') + (owned ? '' : ' locked');
+    const hex = '#' + tc.hex.toString(16).padStart(6, '0');
+    b.style.setProperty('--sw', owned ? hex : '#3a4152');
+    b.title = owned ? tc.name : `${tc.name} — ${tc.req}`;
+    b.setAttribute('aria-label', b.title);
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = owned ? tc.name : tc.req;
+    b.append(dot, lbl);
+    if (owned) b.addEventListener('click', () => {
+      equipped.trailColor = id; saveWisp(); applyTrail(); renderWispSection(); b.blur();
+    });
+    wispTrailColorsEl.appendChild(b);
+  }
+}
+
+// Settings panel "PRINTS" section: each realm's artwork as a real giclée
+// print. Attuned realms get a small ✓. Buttons open the shop in a new tab.
+function renderPrintsSection() {
+  if (!printsListEl) return;
+  printsListEl.innerHTML = '';
+  for (const r of REALM_DEFS) {
+    const p = REALM_PRINT[r.key];
+    if (!p) continue;
+    const row = document.createElement('div');
+    row.className = 'print-row';
+    const dot = document.createElement('span');
+    dot.className = 'print-dot';
+    dot.style.background = '#' + r.accent.toString(16).padStart(6, '0');
+    const label = document.createElement('span');
+    label.className = 'print-title';
+    const attuned = unlocks.attuned.includes(r.key);
+    label.textContent = (attuned ? '✓ ' : '') + p.title;
+    const btn = document.createElement('button');
+    btn.className = 'print-btn';
+    btn.textContent = 'own the print';
+    btn.addEventListener('click', () => {
+      window.open(printUrl(r.key), '_blank', 'noopener');
+      btn.blur();
+    });
+    row.appendChild(dot);
+    row.appendChild(label);
+    row.appendChild(btn);
+    printsListEl.appendChild(row);
+  }
 }
 
 // Boot: dress the wisp in the saved look; net reads the equipped look
 // for every ~12Hz broadcast so peers see it too.
 applySkin(equipped.skin);
 applyHat(equipped.hat);
+applyTrail();
 renderWispSection(); // populate the settings WISP section for first open
-net.cosmetics = () => ({ s: equipped.skin, h: equipped.hat });
+renderPrintsSection(); // populate the settings PRINTS section
+net.cosmetics = () => {
+  const tc = TRAIL_COLORS[equipped.trailColor] || TRAIL_COLORS.white;
+  return {
+    s: equipped.skin,
+    h: equipped.hat,
+    t: equipped.trailStyle,
+    c: tc.hex.toString(16).padStart(6, '0'),
+  };
+};
 
 /* ---------------- world builders ---------------- */
 
@@ -717,7 +938,7 @@ function finishBoot() {
   }
 
   active = worlds.nexus;
-  active.scene.add(wisp, trail, peerLayer);
+  active.scene.add(wisp, localTrail.group, peerLayer);
   wisp.position.copy(active.spawn);
   yaw = active.spawnYaw;
   clearTrail();
@@ -979,7 +1200,7 @@ function goTo(key) {
   fadeEl.classList.add('on');
   setTimeout(() => {
     active = worlds[key];
-    active.scene.add(wisp, trail, peerLayer); // re-parents from the previous scene
+    active.scene.add(wisp, localTrail.group, peerLayer); // re-parents from the previous scene
     clearPeerVisuals();                       // old room's drifters stay in the old room
     net.join(roomKeyFor(active.key));         // hop to this location's P2P room
     updatePeerCount();
@@ -1006,6 +1227,14 @@ function collectEcho(echo) {
   collectedTotal++;
   echoCountEl.textContent = `ECHOES ${collectedTotal} / ${TOTAL_ECHOES}`;
   audio.chime(collectedTotal);
+  // Earnable trail style: 10 total echoes unlocks the Comet trail.
+  if (collectedTotal >= 10 && !unlocks.trailStyles.includes('comet')) {
+    unlocks.trailStyles.push('comet');
+    saveUnlocks();
+    showUnlockToast(['10 echoes gathered', 'Comet trail unlocked']);
+    addSystemLine('10 echoes gathered — comet trail unlocked');
+    renderWispSection();
+  }
 }
 
 /* ---------------- remote drifters (multiplayer visuals) ---------------- */
@@ -1053,7 +1282,7 @@ function createPeerVisual(id, name) {
   tag.position.y = 1.8;
   bob.add(core, glow);
   group.add(bob, tag);
-  return { id, group, bob, core, glow, hat: null, tag, target: new THREE.Vector3(), name, skin: null, hatId: null, phase: Math.random() * Math.PI * 2 };
+  return { id, group, bob, core, glow, hat: null, tag, target: new THREE.Vector3(), name, skin: null, hatId: null, trailObj: makeTrail(24, 0.9), trailStyle: null, trailColor: null, phase: Math.random() * Math.PI * 2 };
 }
 
 // Dress a remote wisp in the peer's equipped skin (unknown id = old client,
@@ -1078,6 +1307,19 @@ function applyPeerHat(pv, hatId) {
   }
 }
 
+// Dress a remote wisp's trail in the peer's equipped style + color.
+// Unknown/missing style -> ribbon; missing color (old clients) -> the stable
+// per-peer hash tint, so every drifter still gets a playful trail.
+function applyPeerTrail(pv, styleId, hexStr) {
+  const t = pv.trailObj;
+  if (!t) return;
+  t.setStyle(styleId || 'ribbon');
+  let hex = null;
+  if (typeof hexStr === 'string' && /^[0-9a-fA-F]{6}$/.test(hexStr)) hex = parseInt(hexStr, 16);
+  if (hex === null || Number.isNaN(hex)) hex = peerColor(pv.id).getHex();
+  t.setColor(hex);
+}
+
 function retagPeer(pv, name) {
   pv.group.remove(pv.tag);
   pv.tag = makeNameTag(name);
@@ -1086,7 +1328,10 @@ function retagPeer(pv, name) {
 }
 
 function clearPeerVisuals() {
-  for (const pv of peerVisuals.values()) peerLayer.remove(pv.group);
+  for (const pv of peerVisuals.values()) {
+    peerLayer.remove(pv.group);
+    if (pv.trailObj) peerLayer.remove(pv.trailObj.group);
+  }
   peerVisuals.clear();
   peerPositions.clear(); // new room, new neighborhood
 }
@@ -1119,10 +1364,14 @@ function handleWisp(id, d) {
     pv = createPeerVisual(id, nm);
     pv.skin = d.s || null; applyPeerSkin(pv, pv.skin);
     pv.hatId = d.h || null; applyPeerHat(pv, pv.hatId);
+    pv.trailStyle = d.t || null; pv.trailColor = d.c || null;
+    applyPeerTrail(pv, pv.trailStyle, pv.trailColor);
     pv.target.set(d.p[0], d.p[1], d.p[2]);
     pv.group.position.copy(pv.target); // snap on first sight
+    pv.trailObj.clear(pv.group.position); // no streak from the origin
     peerVisuals.set(id, pv);
     peerLayer.add(pv.group);
+    peerLayer.add(pv.trailObj.group);
     addSystemLine(`${nm} drifted in`);
     updatePeerCount();
   } else {
@@ -1131,6 +1380,11 @@ function handleWisp(id, d) {
     const s = d.s || null, h = d.h || null;
     if (pv.skin !== s) { pv.skin = s; applyPeerSkin(pv, s); }
     if (pv.hatId !== h) { pv.hatId = h; applyPeerHat(pv, h); }
+    const ts = d.t || null, tc = d.c || null;
+    if (pv.trailStyle !== ts || pv.trailColor !== tc) {
+      pv.trailStyle = ts; pv.trailColor = tc;
+      applyPeerTrail(pv, ts, tc);
+    }
   }
 }
 
@@ -1139,6 +1393,7 @@ function handlePeerLeave(id) {
   if (pv) {
     addSystemLine(`${pv.name} drifted away`);
     peerLayer.remove(pv.group);
+    if (pv.trailObj) peerLayer.remove(pv.trailObj.group);
     peerVisuals.delete(id);
   }
   peerPositions.delete(id);
@@ -1401,6 +1656,11 @@ function loop() {
     for (const pv of peerVisuals.values()) {
       pv.group.position.lerp(pv.target, k);
       pv.bob.position.y = Math.sin(t * 2.2 + pv.phase) * 0.3;      // Floating chat bubbles: rise, fade, vanish after BUBBLE_SECS.
+      // Remote trails: short + low-res, skipped beyond 150m for perf.
+      const pd = pv.group.position.distanceTo(wisp.position);
+      const showTrail = pd < 150;
+      pv.trailObj.group.visible = showTrail;
+      if (showTrail) pv.trailObj.update(pv.group.position, dt);
       if (pv.bubble) {
         const remain = pv.bubble.expires - t;
         if (remain <= 0) {
@@ -1446,15 +1706,23 @@ window.__limbo = {
   showChatBubble,
   PROXIMITY_R,
   build: net.build,
-  // customization (build 8)
+  // customization (build 8) + trails (build 9)
   SKINS,
   HATS,
   SKIN_ORDER,
   HAT_ORDER,
+  TRAIL_STYLES,
+  TRAIL_COLORS,
+  TRAIL_STYLE_ORDER,
+  TRAIL_COLOR_ORDER,
   unlocks: () => JSON.parse(JSON.stringify(unlocks)),
   equipped: () => ({ ...equipped }),
   grantAttunement: onRealmAttuned,
   applySkin,
   applyHat,
+  applyTrail,
+  localTrail,
+  applyPeerTrail,
+  collectEcho,
   renderWispSection,
 };
