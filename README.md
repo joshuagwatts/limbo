@@ -8,9 +8,14 @@ echo orbs in each realm (20 total). When a realm's echoes are all collected,
 it becomes *attuned*.
 
 Drift with others: **serverless P2P multiplayer** (WebRTC via Trystero —
-no server, no backend, no accounts) plus **room-local text chat**. Each
-location (Nexus + 4 realms) is its own room; you see and chat with whoever
-is drifting in the same place as you.
+no server, no backend, no accounts) plus **room-local proximity text
+chat**. Each location (Nexus + 4 realms) is its own room; you see and chat
+with whoever is drifting in the same place as you.
+
+Attuning a realm (all 5 echoes) unlocks **wisp customization**: each realm
+grants its own wisp skin, and attunement milestones grant hats (party hat,
+top hat, crown). Pick your look in the settings panel — other drifters see
+your skin and hat too.
 
 Everything is static files — no build step, no backend, no audio files
 (all sound is synthesized live with WebAudio).

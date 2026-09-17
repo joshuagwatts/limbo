@@ -26,6 +26,9 @@
 <!-- shown once per realm when all 5 echoes are collected -->
 <div id="attuned">REALM ATTUNED</div>
 
+<!-- celebration toast when attuning unlocks a skin or hat -->
+<div id="unlock-toast"></div>
+
 <!-- persistent HUD -->
 <div id="hud">
   <div id="realm-name">THE NEXUS</div>
@@ -35,12 +38,17 @@
   <div id="mute-label">SOUND ON</div>
 </div>
 
-<!-- settings (gear) — debug readout, sound, drifter name -->
+<!-- settings (gear) — wisp skins/hats, sound, drifter name, debug readout -->
 <button id="gear-btn" aria-label="settings">&#9881;</button>
 <div id="settings-panel">
   <div class="set-head"><span>SETTINGS</span><button id="settings-close" aria-label="close">&#10005;</button></div>
   <div class="set-row"><span class="set-label">SOUND</span><button id="sound-toggle">ON</button></div>
   <div class="set-row"><span class="set-label">DRIFTER NAME</span><input id="settings-name" maxlength="16" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+  <div class="set-debug-head">WISP</div>
+  <div class="set-sub">SKIN</div>
+  <div id="wisp-skins" class="wisp-row"></div>
+  <div class="set-sub">HAT</div>
+  <div id="wisp-hats" class="wisp-row"></div>
   <div class="set-debug-head">NET DEBUG</div>
   <div id="settings-debug"></div>
 </div>
@@ -70,6 +78,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=7"></script>
+<script type="module" src="js/game.js?v=8"></script>
 </body>
 </html>
