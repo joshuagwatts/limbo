@@ -42,6 +42,38 @@
 <!-- take the decks — only visible inside the sound room -->
 <button id="decks-btn" style="display:none">take the decks</button>
 
+<!-- jam room — only visible inside the sound room -->
+<button id="jam-btn" style="display:none">&#127925; jam</button>
+<div id="jam-panel">
+  <div class="jam-head"><span>&#127925; JAM ROOM</span><button id="jam-close" aria-label="close">&#10005;</button></div>
+  <div class="jam-transport">
+    <div class="jam-bpm-wrap"><div id="jam-bpm">120</div><div class="jam-bpm-label">BPM</div></div>
+    <div class="jam-clock"><span id="jam-clock-dot"></span><span id="jam-clock-status">clock stopped</span></div>
+    <button id="jam-tap">tap</button>
+    <button id="jam-bpm-down" aria-label="slower">−</button>
+    <button id="jam-bpm-up" aria-label="faster">+</button>
+  </div>
+  <div class="jam-sub">SYNTH</div>
+  <div class="jam-synth-row">
+    <button class="jam-wave" data-wave="sawtooth">saw</button>
+    <button class="jam-wave" data-wave="square">square</button>
+    <button class="jam-wave" data-wave="mix">mix</button>
+  </div>
+  <div class="jam-knobs">
+    <label>cutoff <input id="jam-cutoff" type="range" min="300" max="8000" value="1800"></label>
+    <label>reso <input id="jam-reso" type="range" min="0" max="12" step="0.5" value="5"></label>
+  </div>
+  <div id="jam-keys"></div>
+  <div class="jam-sub">SAMPLER</div>
+  <div class="jam-sampler-row">
+    <button id="jam-grab">grab loop</button>
+    <div id="jam-pads"></div>
+  </div>
+  <div id="jam-hint" class="jam-hint"></div>
+  <div class="jam-sub">IN THE ROOM</div>
+  <div id="jam-jammers" class="jam-jammers">the room is quiet — play something &#127925;</div>
+</div>
+
 <!-- settings (gear) — wisp skins/hats, sound, drifter name, debug readout -->
 <button id="gear-btn" aria-label="settings">&#9881;</button>
 <div id="settings-panel">
@@ -96,6 +128,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=12"></script>
+<script type="module" src="js/game.js?v=13"></script>
 </body>
 </html>

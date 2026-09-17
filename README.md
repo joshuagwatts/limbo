@@ -31,6 +31,14 @@ can **take the decks** (desktop Chrome shares tab audio over WebRTC) while
 everyone in the room hears the mix; the room's lights pulse with the bass.
 Friends who are DJing show "on the decks" in the friends list.
 
+The sound room is also a **JAM ROOM**: a pocket synth (one chromatic octave,
+waveform + filter controls), a 4-pad **sampler** that grabs loops from the
+DJ's stream, and **auto-BPM detection** listening to the music. The DJ is
+the shared beat clock — note and pad events are tiny messages and every
+client synthesizes the sound locally on the grid, so the jam feels tight
+despite network latency. Tap tempo + BPM steppers let the DJ override the
+tempo; the friends list shows who's jamming.
+
 Everything is static files — no build step, no backend, no audio files
 (all sound is synthesized live with WebAudio).
 
