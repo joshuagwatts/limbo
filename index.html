@@ -30,17 +30,25 @@
 <div id="hud">
   <div id="realm-name">THE NEXUS</div>
   <div id="echo-counter">ECHOES 0 / 20</div>
-  <div id="controls-hint">WASD / ARROWS — FLY&nbsp;&nbsp;·&nbsp;&nbsp;DRAG — LOOK&nbsp;&nbsp;·&nbsp;&nbsp;SPACE / SHIFT — RISE / SINK&nbsp;&nbsp;·&nbsp;&nbsp;M — MUTE</div>
+  <div id="peer-count">DRIFTERS HERE: 1</div>
+  <div id="controls-hint">WASD / ARROWS — FLY&nbsp;&nbsp;·&nbsp;&nbsp;DRAG — LOOK&nbsp;&nbsp;·&nbsp;&nbsp;SPACE / SHIFT — RISE / SINK&nbsp;&nbsp;·&nbsp;&nbsp;T — CHAT&nbsp;&nbsp;·&nbsp;&nbsp;M — MUTE</div>
   <div id="mute-label">SOUND ON</div>
 </div>
 
 <!-- loading indicator while art textures download -->
 <div id="loading"><span>summoning limbo</span></div>
 
+<!-- room-local text chat with whoever is drifting here -->
+<div id="chat">
+  <div id="chat-log"></div>
+  <input id="chat-input" maxlength="140" placeholder="say something to the drifters here…" autocomplete="off" autocapitalize="off" spellcheck="false">
+</div>
+
 <!-- start overlay: the click also unlocks WebAudio -->
 <div id="start-overlay">
   <h1>LIMBO</h1>
   <p class="sub">a portal universe</p>
+  <input id="name-input" maxlength="16" placeholder="what do other drifters call you?" autocomplete="off" autocapitalize="off" spellcheck="false">
   <button id="drift-btn" disabled>loading…</button>
   <p class="tiny">headphones recommended · 4 realms · 20 echoes</p>
 </div>
