@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>LIMBO — a portal universe</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="css/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<!-- full-screen fade used for portal transitions -->
+<div id="fade"></div>
+
+<!-- realm name title card shown after each transition -->
+<div id="title-card"></div>
+
+<!-- shown once per realm when all 5 echoes are collected -->
+<div id="attuned">REALM ATTUNED</div>
+
+<!-- persistent HUD -->
+<div id="hud">
+  <div id="realm-name">THE NEXUS</div>
+  <div id="echo-counter">ECHOES 0 / 20</div>
+  <div id="controls-hint">WASD / ARROWS — FLY&nbsp;&nbsp;·&nbsp;&nbsp;DRAG — LOOK&nbsp;&nbsp;·&nbsp;&nbsp;SPACE / SHIFT — RISE / SINK&nbsp;&nbsp;·&nbsp;&nbsp;M — MUTE</div>
+  <div id="mute-label">SOUND ON</div>
+</div>
+
+<!-- loading indicator while art textures download -->
+<div id="loading"><span>summoning limbo</span></div>
+
+<!-- start overlay: the click also unlocks WebAudio -->
+<div id="start-overlay">
+  <h1>LIMBO</h1>
+  <p class="sub">a portal universe</p>
+  <button id="drift-btn" disabled>loading…</button>
+  <p class="tiny">headphones recommended · 4 realms · 20 echoes</p>
+</div>
+
+<!-- minimal touch joystick UI -->
+<div id="joy-base"><div id="joy-knob"></div></div>
+
+<script type="module" src="js/game.js"></script>
+</body>
+</html>
