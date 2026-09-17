@@ -82,7 +82,7 @@ html, body {
 #hud { position: fixed; inset: 0; pointer-events: none; z-index: 30; }
 
 #realm-name {
-  position: absolute; top: 22px; left: 26px;
+  position: absolute; top: 22px; left: 62px; /* gear button sits at top-left */
   font-weight: 300; font-size: 13px;
   letter-spacing: 0.45em;
   color: var(--ink-dim);
@@ -118,6 +118,86 @@ html, body {
   letter-spacing: 0.4em;
   color: var(--ink-faint);
 }
+/* while discovery is still running, a soft pulsing dot says "be patient" */
+#peer-count.searching::after {
+  content: " \25CF";
+  color: #9fd8ff;
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+@keyframes pulse-dot { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+#peer-count.settled { color: var(--ink-faint); }
+
+/* ---------- settings ---------- */
+#gear-btn {
+  position: fixed; top: 14px; left: 14px; z-index: 46;
+  width: 40px; height: 40px; border-radius: 50%;
+  background: rgba(4, 8, 18, 0.55);
+  border: 1px solid rgba(140, 170, 255, 0.3);
+  color: var(--ink-dim); font-size: 18px; line-height: 1;
+  cursor: pointer; touch-action: manipulation;
+}
+#gear-btn:active { background: rgba(140, 170, 255, 0.15); }
+#settings-panel {
+  position: fixed; top: 62px; left: 14px; z-index: 45;
+  width: min(340px, 86vw); max-height: 72vh; overflow-y: auto;
+  background: rgba(4, 8, 18, 0.94);
+  border: 1px solid rgba(140, 170, 255, 0.3);
+  border-radius: 12px;
+  padding: 14px 16px;
+  display: none;
+  font-weight: 300;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+}
+#settings-panel.open { display: block; }
+.set-head {
+  display: flex; justify-content: space-between; align-items: center;
+  letter-spacing: 0.4em; font-size: 12px;
+  color: var(--ink-dim); margin-bottom: 6px;
+}
+#settings-close {
+  background: none; border: none;
+  color: var(--ink-dim); font-size: 15px;
+  cursor: pointer; padding: 6px 8px; touch-action: manipulation;
+}
+.set-row {
+  display: flex; justify-content: space-between; align-items: center;
+  margin: 12px 0;
+  font-size: 11px; letter-spacing: 0.25em;
+  color: var(--ink-dim);
+}
+#sound-toggle {
+  background: rgba(235, 240, 255, 0.06);
+  border: 1px solid rgba(140, 170, 255, 0.35);
+  border-radius: 8px;
+  color: var(--ink); font-family: inherit;
+  letter-spacing: 0.25em; font-size: 11px;
+  padding: 7px 16px; cursor: pointer; touch-action: manipulation;
+}
+#settings-name {
+  width: 150px;
+  background: transparent; border: none;
+  border-bottom: 1px solid rgba(235, 240, 255, 0.25);
+  color: var(--ink); font-family: inherit;
+  font-size: 12px; letter-spacing: 0.12em;
+  text-align: right; padding: 6px 2px; outline: none;
+  -webkit-user-select: text; user-select: text;
+}
+.set-debug-head {
+  margin-top: 14px;
+  letter-spacing: 0.4em; font-size: 11px;
+  color: var(--ink-faint);
+}
+#debug-hud {
+  margin-top: 6px; padding: 8px 10px;
+  background: rgba(2, 4, 10, 0.6);
+  border: 1px solid rgba(140, 170, 255, 0.25);
+  border-radius: 8px;
+  color: #bcd2ff;
+  font: 10.5px/1.55 ui-monospace, Menlo, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 38vh; overflow-y: auto;
+  pointer-events: none;
+}
 
 /* ---------- chat (room-local) ---------- */
 #chat {
@@ -126,6 +206,18 @@ html, body {
   z-index: 32;
   display: flex; flex-direction: column; gap: 6px;
 }
+#chat-toggle {
+  position: absolute; top: -32px; right: 0;
+  background: rgba(4, 8, 18, 0.55);
+  border: 1px solid rgba(140, 170, 255, 0.25);
+  border-radius: 50%;
+  width: 30px; height: 30px;
+  font-size: 14px; line-height: 1;
+  cursor: pointer; touch-action: manipulation;
+  opacity: 0.85;
+}
+#chat-toggle.off { opacity: 0.35; }
+#chat-log.hidden { display: none; }
 #chat-log {
   display: flex; flex-direction: column; gap: 5px;
   max-height: 170px;
@@ -144,7 +236,9 @@ html, body {
 }
 .chat-line .chat-name { color: #9fd8ff; letter-spacing: 0.14em; }
 .chat-line.sys { color: var(--ink-faint); font-style: italic; letter-spacing: 0.14em; }
+#chat-row { display: flex; gap: 6px; align-items: center; }
 #chat-input {
+  flex: 1; min-width: 0;
   background: rgba(2, 2, 8, 0.55);
   border: none;
   border-bottom: 1px solid rgba(235, 240, 255, 0.22);
@@ -157,6 +251,15 @@ html, body {
 }
 #chat-input::placeholder { color: var(--ink-faint); }
 #chat-input:focus { border-bottom-color: rgba(159, 216, 255, 0.8); background: rgba(2, 2, 10, 0.75); }
+#chat-send {
+  flex: none;
+  width: 34px; height: 34px; border-radius: 50%;
+  background: rgba(4, 8, 18, 0.55);
+  border: 1px solid rgba(140, 170, 255, 0.35);
+  color: #9fd8ff; font-size: 14px; line-height: 1;
+  cursor: pointer; touch-action: manipulation;
+}
+#chat-send:active { background: rgba(140, 170, 255, 0.2); }
 
 /* ---------- drifter name ---------- */
 #name-input {
