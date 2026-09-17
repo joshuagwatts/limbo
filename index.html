@@ -34,9 +34,13 @@
   <div id="realm-name">THE NEXUS</div>
   <div id="echo-counter">ECHOES 0 / 20</div>
   <div id="peer-count">DRIFTERS HERE: 1</div>
+  <div id="dj-line" style="display:none"></div>
   <div id="controls-hint">WASD / ARROWS — FLY&nbsp;&nbsp;·&nbsp;&nbsp;DRAG — LOOK&nbsp;&nbsp;·&nbsp;&nbsp;SPACE / SHIFT — RISE / SINK&nbsp;&nbsp;·&nbsp;&nbsp;T — CHAT&nbsp;&nbsp;·&nbsp;&nbsp;M — MUTE</div>
   <div id="mute-label">SOUND ON</div>
 </div>
+
+<!-- take the decks — only visible inside the sound room -->
+<button id="decks-btn" style="display:none">take the decks</button>
 
 <!-- settings (gear) — wisp skins/hats, sound, drifter name, debug readout -->
 <button id="gear-btn" aria-label="settings">&#9881;</button>
@@ -86,12 +90,12 @@
   <!-- loading indicator while art textures download: in the overlay's column
        (under the button) so it can never overlap the title/subtitle -->
   <div id="loading"><span>summoning limbo</span></div>
-  <p class="tiny">headphones recommended · 4 realms · 20 echoes</p>
+  <p class="tiny">headphones recommended · 4 realms + sound room · 20 echoes</p>
 </div>
 
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=11"></script>
+<script type="module" src="js/game.js?v=12"></script>
 </body>
 </html>

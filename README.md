@@ -9,7 +9,7 @@ it becomes *attuned*.
 
 Drift with others: **serverless P2P multiplayer** (WebRTC via Trystero —
 no server, no backend, no accounts) plus **room-local proximity text
-chat**. Each location (Nexus + 4 realms) is its own room; you see and chat
+chat**. Each location (Nexus + 4 realms + the sound room) is its own room; you see and chat
 with whoever is drifting in the same place as you.
 
 Attuning a realm (all 5 echoes) unlocks **wisp customization**: each realm
@@ -24,6 +24,12 @@ real giclée print in the shop, one tap away.
 The **FRIENDS** section keeps a local friends list and shows who's live:
 every client heartbeats into a shared lobby room, so you can see which
 realm a friend is drifting in and hop straight to them.
+
+The Nexus has a 5th portal — the **SOUND ROOM**, a social listening space
+with the four realm artworks hanging as a gallery. One drifter at a time
+can **take the decks** (desktop Chrome shares tab audio over WebRTC) while
+everyone in the room hears the mix; the room's lights pulse with the bass.
+Friends who are DJing show "on the decks" in the friends list.
 
 Everything is static files — no build step, no backend, no audio files
 (all sound is synthesized live with WebAudio).
