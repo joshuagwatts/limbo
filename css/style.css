@@ -112,6 +112,69 @@ html, body {
   color: var(--ink-faint);
 }
 
+#peer-count {
+  position: absolute; top: 46px; right: 26px;
+  font-weight: 300; font-size: 11px;
+  letter-spacing: 0.4em;
+  color: var(--ink-faint);
+}
+
+/* ---------- chat (room-local) ---------- */
+#chat {
+  position: fixed; left: 22px; bottom: 22px;
+  width: min(330px, 62vw);
+  z-index: 32;
+  display: flex; flex-direction: column; gap: 6px;
+}
+#chat-log {
+  display: flex; flex-direction: column; gap: 5px;
+  max-height: 170px;
+  overflow-y: auto; overflow-x: hidden;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, black 24%);
+  mask-image: linear-gradient(to bottom, transparent, black 24%);
+}
+#chat-log::-webkit-scrollbar { display: none; }
+.chat-line {
+  font-weight: 300; font-size: 11.5px;
+  letter-spacing: 0.08em; line-height: 1.5;
+  color: var(--ink-dim);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9);
+  overflow-wrap: break-word;
+}
+.chat-line .chat-name { color: #9fd8ff; letter-spacing: 0.14em; }
+.chat-line.sys { color: var(--ink-faint); font-style: italic; letter-spacing: 0.14em; }
+#chat-input {
+  background: rgba(2, 2, 8, 0.55);
+  border: none;
+  border-bottom: 1px solid rgba(235, 240, 255, 0.22);
+  color: var(--ink);
+  font-family: inherit; font-weight: 300; font-size: 12px;
+  letter-spacing: 0.1em;
+  padding: 8px 4px;
+  outline: none;
+  -webkit-user-select: text; user-select: text;
+}
+#chat-input::placeholder { color: var(--ink-faint); }
+#chat-input:focus { border-bottom-color: rgba(159, 216, 255, 0.8); background: rgba(2, 2, 10, 0.75); }
+
+/* ---------- drifter name ---------- */
+#name-input {
+  width: min(300px, 70vw);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid rgba(235, 240, 255, 0.25);
+  color: var(--ink);
+  font-family: inherit; font-weight: 300; font-size: 13px;
+  letter-spacing: 0.3em;
+  text-align: center;
+  padding: 10px 6px;
+  outline: none;
+  -webkit-user-select: text; user-select: text;
+}
+#name-input::placeholder { color: var(--ink-faint); letter-spacing: 0.22em; }
+#name-input:focus { border-bottom-color: rgba(235, 240, 255, 0.7); }
+
 /* ---------- loading ---------- */
 #loading {
   position: fixed; inset: 0;
