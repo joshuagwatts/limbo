@@ -9,8 +9,8 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js';
-import { LimboNet } from './net.js';
+import { AudioEngine } from './audio.js?v=3';
+import { LimboNet } from './net.js?v=3';
 
 /* ---------------- configuration ---------------- */
 
@@ -461,6 +461,11 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     chatInput.focus();
   }
+  if (e.code === 'KeyD' && started && !chatFocused) {
+    debugHudOn = !debugHudOn;
+    debugHud.style.display = debugHudOn ? 'block' : 'none';
+    if (debugHudOn) updateDebugHud();
+  }
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
@@ -558,10 +563,22 @@ canvas.addEventListener('touchmove', (e) => {
   }
   e.preventDefault();
 }, { passive: false });
+let lastTapAt = 0, tapCount = 0; // triple-tap -> debug HUD (no D key on phones)
 function endTouch(e) {
   for (const t of e.changedTouches) {
     if (t.identifier === joy.id) { joy.id = null; joy.x = 0; joy.y = 0; joyBase.style.display = 'none'; }
     if (t.identifier === look.id) look.id = null;
+  }
+  // Triple-tap (no drag) toggles the debug HUD — phones have no D key.
+  const now = performance.now();
+  if (now - lastTapAt < 600) tapCount++;
+  else tapCount = 1;
+  lastTapAt = now;
+  if (tapCount >= 3 && started) {
+    tapCount = 0;
+    debugHudOn = !debugHudOn;
+    debugHud.style.display = debugHudOn ? 'block' : 'none';
+    if (debugHudOn) updateDebugHud();
   }
 }
 canvas.addEventListener('touchend', endTouch);
@@ -717,6 +734,55 @@ net.onChatCb = (d) => {
 };
 net.onQuietCb = () =>
   addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
+
+/* ---------------- debug HUD (press D) ----------------
+   Diagnoses multiplayer live on the device: ICE states, candidate types
+   (host/srflx/relay — 'relay' means TURN allocation worked), selected
+   pair, and trystero's own join-error text. Works with zero peers. */
+
+const debugHud = document.createElement('div');
+debugHud.id = 'debug-hud';
+debugHud.style.cssText = [
+  'position:fixed', 'top:8px', 'left:8px', 'z-index:50',
+  'max-width:min(92vw,430px)', 'padding:8px 10px',
+  'background:rgba(4,8,18,0.82)', 'border:1px solid rgba(140,170,255,0.35)',
+  'border-radius:8px', 'color:#bcd2ff',
+  'font:11px/1.55 ui-monospace,Menlo,Consolas,monospace',
+  'white-space:pre-wrap', 'word-break:break-word',
+  'pointer-events:none', 'display:none',
+].join(';');
+document.body.appendChild(debugHud);
+let debugHudOn = false;
+
+async function updateDebugHud() {
+  if (!debugHudOn) return;
+  let s;
+  try {
+    s = await net.getDebugSnapshot();
+  } catch (e) {
+    debugHud.textContent = 'debug snapshot failed: ' + e.message;
+    return;
+  }
+  const L = [];
+  L.push(`LIMBO net debug · build ${s.build} · ${s.enabled ? 'online' : 'OFFLINE (single-player)'}`);
+  L.push(`strategy: ${s.strategy} · room: ${s.roomKey}`);
+  L.push(`peers: ${s.peerCount} · turn user: ${s.turnUser}`);
+  if (s.peers.length === 0) {
+    L.push('no peer connections — signaling found nobody (or room not joined yet)');
+  }
+  for (const p of s.peers) {
+    L.push(`— peer ${p.id}`);
+    L.push(`  ice:${p.ice} gather:${p.gathering} conn:${p.conn}`);
+    L.push(`  local candidates: ${p.localTypes.length ? p.localTypes.join(',') : '(none yet)'}`);
+    L.push(`  selected pair: ${p.selectedType}`);
+  }
+  if (s.lastJoinError) {
+    L.push(`LAST JOIN ERROR [${s.lastJoinError.at}] peer ${s.lastJoinError.peerId}:`);
+    L.push(`  ${s.lastJoinError.error}`);
+  }
+  debugHud.textContent = L.join('\n');
+}
+setInterval(updateDebugHud, 1000);
 
 /* ---------------- start ---------------- */
 

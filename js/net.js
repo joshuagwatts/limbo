@@ -23,6 +23,9 @@
 const APP_ID = 'limbo_by_holowatts';
 const MAX_NAME = 16;
 const NEXUS_ROOM = 'limbo-nexus';
+/* Bump on every deploy — shown in the debug HUD (press D) so we can tell
+   whether a phone is actually running the latest code or a cached copy. */
+const BUILD = '3';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -30,8 +33,10 @@ const FALLBACK_AFTER_MS = 15000;
 const QUIET_AFTER_MS = 20000;
 
 const STRATEGIES = [
-  { name: 'torrent', url: 'https://esm.sh/@trystero-p2p/torrent' },
-  { name: 'nostr', url: 'https://esm.sh/@trystero-p2p/nostr' },
+  // Pinned to 0.25.4: unpinned esm.sh URLs resolve "latest", which could
+  // silently change the module's export shape and break the import.
+  { name: 'torrent', url: 'https://esm.sh/@trystero-p2p/torrent@0.25.4' },
+  { name: 'nostr', url: 'https://esm.sh/@trystero-p2p/nostr@0.25.4' },
 ];
 
 /* OpenRelay static-auth (no signup): time-limited HMAC-SHA1 credentials. */
@@ -81,6 +86,7 @@ function buildIceServers(creds) {
 
 export class LimboNet {
   constructor() {
+    this.build = BUILD; // deploy stamp, shown in the debug HUD
     this.enabled = false;
     this.mods = []; // lazy-loaded strategy modules, indexed like STRATEGIES
     this.stratIdx = 0; // which signaling strategy is currently in use
@@ -100,6 +106,7 @@ export class LimboNet {
     this.fallbackTimer = null;
     this.quietTimer = null;
     this.quietFired = false;
+    this.lastJoinError = null; // {error, peerId, at} from trystero onJoinError
   }
 
   cleanName(n) {
@@ -154,7 +161,19 @@ export class LimboNet {
   _joinWithStrategy() {
     try {
       const room = (this.room = this.mod.joinRoom(
-        { appId: APP_ID, rtcConfig: this.rtcConfig },
+        {
+          appId: APP_ID,
+          rtcConfig: this.rtcConfig,
+          // Trystero calls this when SDP was exchanged but the peer
+          // connection failed — carries the real reason (ICE/TURN/etc).
+          onJoinError: (details) => {
+            this.lastJoinError = {
+              error: String((details && details.error) || details || 'unknown'),
+              peerId: details && details.peerId ? String(details.peerId).slice(0, 8) : '?',
+              at: new Date().toLocaleTimeString(),
+            };
+          },
+        },
         this.roomKey
       ));
       const [sendWisp, onWisp] = room.makeAction('wisp');
@@ -280,6 +299,69 @@ export class LimboNet {
 
   peerCount() {
     return this.peers.size;
+  }
+
+  /* Raw RTCPeerConnections keyed by peerId (trystero's getPeers() returns
+     a plain object: peerId -> RTCPeerConnection). Empty when signaling has
+     found nobody — which is itself diagnostic. */
+  getPeerConnections() {
+    try {
+      return this.room ? this.room.getPeers() : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  /* Snapshot for the debug HUD (press D). Works with zero peers — that's
+     the whole point. localTypes tells us whether TURN allocation worked:
+     'relay' present = TURN is alive; host+srflx only = TURN is dead. */
+  async getDebugSnapshot() {
+    const pcs = this.getPeerConnections();
+    const peers = [];
+    for (const [id, pc] of Object.entries(pcs)) {
+      const info = {
+        id: String(id).slice(0, 8),
+        ice: '?',
+        gathering: '?',
+        conn: '?',
+        localTypes: [],
+        selectedType: 'none',
+      };
+      try {
+        info.ice = pc.iceConnectionState || '?';
+        info.gathering = pc.iceGatheringState || '?';
+        info.conn = pc.connectionState || '?';
+        const stats = await pc.getStats();
+        const localById = new Map();
+        const types = new Set();
+        let selectedLocalId = null;
+        stats.forEach((s) => {
+          if (s.type === 'local-candidate') {
+            localById.set(s.id, s.candidateType || '?');
+            if (s.candidateType) types.add(s.candidateType);
+          } else if (s.type === 'candidate-pair' && (s.nominated || s.selected) && s.state === 'succeeded') {
+            selectedLocalId = s.localCandidateId;
+          }
+        });
+        info.localTypes = [...types].sort();
+        if (selectedLocalId && localById.has(selectedLocalId)) {
+          info.selectedType = localById.get(selectedLocalId);
+        }
+      } catch (e) {
+        info.ice = 'stats-err';
+      }
+      peers.push(info);
+    }
+    return {
+      build: this.build,
+      enabled: this.enabled,
+      strategy: STRATEGIES[this.stratIdx] ? STRATEGIES[this.stratIdx].name : '?',
+      roomKey: this.roomKey || '(none)',
+      peerCount: this.peers.size,
+      peers,
+      lastJoinError: this.lastJoinError,
+      turnUser: this.turnCreds ? this.turnCreds.username : '(none)',
+    };
   }
 }
 
