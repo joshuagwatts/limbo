@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=18';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=18';
+import { LimboNet } from './net.js?v=19';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=19';
 
 /* ---------------- configuration ---------------- */
 
@@ -2278,10 +2278,11 @@ function buildSoundRoom(textures) {
     scene.add(m);
   }
 
-  // Gallery: the four realm artworks, framed, one per wall.
+  // Gallery: the realm artworks, framed, one per wall — except the north
+  // wall, where the community wall lives now (build 19 removed the
+  // REALM_DEFS[0] piece that used to hang behind it).
   const galleryFiles = [];
   const frameDefs = [
-    { def: REALM_DEFS[0], p: [0, 8, -33.7], r: 0 },
     { def: REALM_DEFS[1], p: [33.7, 8, 0], r: -Math.PI / 2 },
     { def: REALM_DEFS[2], p: [0, 8, 33.7], r: Math.PI },
     { def: REALM_DEFS[3], p: [-33.7, 8, 0], r: Math.PI / 2 },
@@ -2292,6 +2293,7 @@ function buildSoundRoom(textures) {
     const aspect = img ? img.width / img.height : 1;
     const AW = 15, AH = Math.min(AW / aspect, 11);
     const frame = new THREE.Group();
+    frame.name = 'gallery-' + f.def.key; // test hook: build 19 removed gallery-realm1
     const back = new THREE.Mesh(
       new THREE.PlaneGeometry(AW + 1.2, AH + 1.2),
       new THREE.MeshStandardMaterial({ color: f.def.accent, emissive: f.def.accent, emissiveIntensity: 0.25, roughness: 0.4, metalness: 0.6 })
@@ -2349,16 +2351,17 @@ function buildSoundRoom(textures) {
   const dust = makeDust(200, 40, accent, 0.6);
   scene.add(dust.pts);
 
-  // Community wall (build 18): a monumental shared paint canvas on the
-  // north wall behind the booth. MeshBasicMaterial so the art reads in the
-  // dark; the CanvasTexture updates live as strokes land.
+  // Community wall (build 18; doubled to 32x16 in build 19 after the
+  // north-wall gallery piece was removed): a monumental shared paint
+  // canvas on the north wall behind the booth. MeshBasicMaterial so the
+  // art reads in the dark; the CanvasTexture updates live as strokes land.
   const wallFrame = new THREE.Group();
   const wallBack = new THREE.Mesh(
-    new THREE.PlaneGeometry(17.4, 9.4),
+    new THREE.PlaneGeometry(34.4, 17.4),
     new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 0.35, roughness: 0.4, metalness: 0.6 })
   );
   const wallMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(16, 8),
+    new THREE.PlaneGeometry(32, 16),
     new THREE.MeshBasicMaterial({ map: wall.tex })
   );
   wallMesh.position.z = 0.08;
@@ -3552,6 +3555,11 @@ window.__limbo = {
   worldKeys: () => Object.keys(worlds),
   nexusPortals: () => (worlds.nexus ? worlds.nexus.portals.map((p) => p.target) : []),
   galleryFiles: () => (worlds.soundroom && worlds.soundroom.gallery ? worlds.soundroom.gallery.slice() : []),
+  // build 19: is a named gallery frame ('gallery-realm1' etc.) in the sound room scene?
+  galleryFramePresent: (key) => {
+    const s = worlds.soundroom && worlds.soundroom.scene;
+    return !!(s && s.getObjectByName('gallery-' + key));
+  },
   takeDecks,
   stopDecks,
   // DJ source fallback chain (build 14) + mobile decks (build 15)
@@ -3650,13 +3658,20 @@ window.__limbo = {
     const b = jam.pads[i];
     return b ? Array.from(b.getChannelData(0).slice(0, n || 256)) : null;
   },
-  // community wall (build 18)
-  wallState: () => ({
-    strokes: wall.strokeCount, w: WALL_W, h: WALL_H,
-    hasTexture: !!(wall.tex && wall.tex.isCanvasTexture),
-    planeInScene: !!(worlds.soundroom && worlds.soundroom.anim && worlds.soundroom.anim.wallMesh),
-    paintOpen: paint.open,
-  }),
+  // community wall (build 18; build 19: planeW/planeH report the
+  // in-world size so tests can verify the 2x scale-up)
+  wallState: () => {
+    const wm = worlds.soundroom && worlds.soundroom.anim && worlds.soundroom.anim.wallMesh;
+    const pg = wm && wm.geometry && wm.geometry.parameters;
+    return {
+      strokes: wall.strokeCount, w: WALL_W, h: WALL_H,
+      hasTexture: !!(wall.tex && wall.tex.isCanvasTexture),
+      planeInScene: !!wm,
+      planeW: pg ? pg.width : null,
+      planeH: pg ? pg.height : null,
+      paintOpen: paint.open,
+    };
+  },
   wallTex: () => wall.tex,
   wallPixel: (x, y) => {
     const d = wall.ctx.getImageData(x | 0, y | 0, 1, 1).data;
