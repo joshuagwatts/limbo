@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=19';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=19';
+import { LimboNet } from './net.js?v=20';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=20';
 
 /* ---------------- configuration ---------------- */
 
@@ -1226,11 +1226,14 @@ function stopDecks(yielded = false, byName = '') {
        Date.now() epoch for beat 0; beat = (now - startWall) * bpm/60000.
        Re-broadcast on BPM change, DJ takeover, and every 15s while
        DJing (keeps late joiners on the grid).
-     jamNote {n, midi, vel, beat, w, c, r} — any jammer -> room. beat is
-       the target beat on the shared clock (null = free-time, play now).
-       w/c/r carry the sender's patch (wave, cutoff, resonance) so every
-       client renders the same timbre. v1 choice: patch rides each note
-       (3 tiny fields) instead of a separate jamPatch message.
+     jamNote {n, midi, vel, beat, inst, drum, chord, w, c, r} — any jammer
+       -> room. beat is the target beat on the shared clock (null =
+       free-time, play now). inst is the sender's instrument
+       (lead/bass/drums/pad, build 20) so every client renders the note
+       with the SENDER's voice, never its own. drums uses drum (kick,
+       snare, clap, chat, ohat, shaker); pad uses chord (0-3, i-VI-III-VII
+       in A minor); lead/bass use midi. w/c/r carry the lead patch (wave,
+       cutoff, resonance) so every client renders the same timbre.
      jamPad {n, pad, beat, lenBars} — pad trigger. The loop audio itself
        is NEVER sent: every client grabs its own local copy of the same
        DJ stream (see the ring buffer below), so triggers quantized to
@@ -1253,6 +1256,25 @@ const jamGrabEl = document.getElementById('jam-grab');
 const jamPadsEl = document.getElementById('jam-pads');
 const jamHintEl = document.getElementById('jam-hint');
 const jamJammersEl = document.getElementById('jam-jammers');
+const jamInstTabsEl = document.getElementById('jam-inst-tabs');
+const jamBeatDotsEl = document.getElementById('jam-beat-dots');
+const jamMetroToggleEl = document.getElementById('jam-metro-toggle');
+const jamMetroVolEl = document.getElementById('jam-metro-vol');
+const jamBassKeysEl = document.getElementById('jam-bass-keys');
+const jamDrumsEl = document.getElementById('jam-drums');
+const jamChordsEl = document.getElementById('jam-chords');
+
+/* Build 20 instruments. Every player picks one; the pick rides every
+   jamNote (inst) so each client renders the SENDER's voice, and each
+   player's wisp glow takes their instrument's color. */
+const JAM_INSTRUMENTS = {
+  lead: { label: 'LEAD', color: '#37e6ff', glow: 0x37e6ff },
+  bass: { label: 'BASS', color: '#b388ff', glow: 0xb388ff },
+  drums: { label: 'DRUMS', color: '#ffc24d', glow: 0xffc24d },
+  pad: { label: 'PAD', color: '#ff7ad9', glow: 0xff7ad9 },
+};
+const JAM_INST_IDS = Object.keys(JAM_INSTRUMENTS);
+const jamPeerInst = new Map(); // peerId -> instrument id (from their notes)
 
 const jam = {
   open: false,
@@ -1260,16 +1282,21 @@ const jam = {
   startWall: null, // Date.now() epoch of beat 0; null = clock stopped
   clockBy: null, // whose clock we're following
   manual: false, // DJ overrode BPM this session (auto-detect paused)
+  instrument: 'lead', // build 20: this player's instrument
   wave: 'sawtooth',
   cutoff: 1800,
   reso: 5,
   pads: [null, null, null, null], // AudioBuffers, local to this client
   padRound: 0, // next pad to fill on grab (round-robin)
   rec: null, // ring-buffer recorder on the DJ stream
-  jammers: new Map(), // name -> last note/pad timestamp (30s window)
+  jammers: new Map(), // name -> {t, inst} (30s window)
   detector: null, // OnsetDetector, while we're the DJ
   detStable: 0,
   detLast: null,
+  chain: null, // build 20: jam master bus (bus -> sends -> comp -> master)
+  metro: { on: false, vol: 0.5, nextBeat: null, clicks: 0 }, // local-only metronome
+  lastVoice: null, // {inst, ...} of the most recently rendered voice (test hook)
+  beatUiIdx: -2, // last beat index the dot row rendered
 };
 const jamQueue = []; // pending {beat, play(audioTime)} — the lookahead scheduler's list
 let jamVoicesSpawned = 0; // diagnostic counter for the test hook
@@ -1298,6 +1325,7 @@ function jamEnqueue(ev) {
    falls within the next 120ms. The standard WebAudio pattern — absorbs
    network jitter so remote notes land on the grid. */
 function jamSchedulerTick() {
+  jamMetroTick(); // personal metronome rides the same 25ms tick
   if (!jamQueue.length) return;
   const ctx = audio.ctx;
   if (!ctx || jamBeatNow() == null) {
@@ -1319,14 +1347,143 @@ function jamSchedulerTick() {
 }
 setInterval(jamSchedulerTick, 25);
 
-/* Render one synth note through the shared-voice builder. Every note
+/* ---------------- personal metronome (build 20) ----------------
+   Accented click on beat 1, plain clicks otherwise, scheduled against
+   the shared beat clock ~180ms ahead. Audible ONLY locally — never
+   broadcast, never in anyone else's mix. Off by default. */
+function jamMetroTick() {
+  const m = jam.metro;
+  const ctx = audio.ctx;
+  if (!m.on || !ctx || !audio.master) return;
+  const bn = jamBeatNow();
+  if (bn == null) return;
+  if (m.nextBeat == null || m.nextBeat < bn - 1) m.nextBeat = Math.ceil(bn - 1e-6);
+  const horizon = bn + 0.18;
+  let guard = 0;
+  while (m.nextBeat <= horizon && guard++ < 16) {
+    const at = jamAudioTimeForBeat(m.nextBeat);
+    if (at != null) {
+      jamMetroClick(ctx, audio.master, {
+        time: at,
+        accent: m.nextBeat % 4 === 0,
+        vol: m.vol,
+      });
+      m.clicks++;
+    }
+    m.nextBeat++;
+  }
+}
+
+function jamSetMetro(on, vol) {
+  jam.metro.on = !!on;
+  if (vol != null && Number.isFinite(Number(vol))) {
+    jam.metro.vol = Math.max(0, Math.min(1, Number(vol)));
+  }
+  if (jam.metro.on) jam.metro.nextBeat = null; // re-sync to the grid
+  if (jamMetroToggleEl) {
+    jamMetroToggleEl.classList.toggle('sel', jam.metro.on);
+    jamMetroToggleEl.textContent = jam.metro.on ? 'metro on' : 'metro';
+  }
+  if (jamMetroVolEl) jamMetroVolEl.value = Math.round(jam.metro.vol * 100);
+}
+
+/* Beat-dot row + pad pulse: the UI breathes with the clock. */
+function jamBeatUiTick() {
+  if (!jam.open) return;
+  const bn = jamBeatNow();
+  const idx = bn == null ? -1 : ((Math.floor(bn) % 4) + 4) % 4;
+  if (idx === jam.beatUiIdx) return;
+  jam.beatUiIdx = idx;
+  if (jamBeatDotsEl) {
+    const dots = jamBeatDotsEl.children;
+    for (let i = 0; i < dots.length; i++) dots[i].classList.toggle('on', i === idx);
+  }
+  if (idx >= 0 && jamPanel) {
+    jamPanel.classList.add('onbeat');
+    setTimeout(() => { if (jamPanel) jamPanel.classList.remove('onbeat'); }, 140);
+  }
+}
+setInterval(jamBeatUiTick, 100);
+
+/* ---------------- jam master bus (build 20) ----------------
+   The "as we grow" chain: every instrument feeds its own gain into one
+   shared bus; the bus splits into a generated-impulse convolution reverb
+   send and a tempo-synced feedback delay send; dry + wet meet at a
+   DynamicsCompressor (safety limiter — six players can't clip the room)
+   and flow into the game's master (so mute/fade still apply). One shared
+   convolver, not per-voice: CPU stays sane. The sampler's ring buffer
+   taps the bus post-compressor, so grabs capture what the room hears. */
+function jamEnsureChain() {
+  const ctx = audio.ctx;
+  if (!ctx) return null;
+  if (jam.chain) return jam.chain;
+  try {
+    const bus = ctx.createGain();
+    bus.gain.value = 0.9;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -18;
+    comp.knee.value = 20;
+    comp.ratio.value = 8;
+    comp.attack.value = 0.003;
+    comp.release.value = 0.24;
+    // generated-impulse room reverb (no audio files)
+    const conv = ctx.createConvolver();
+    conv.buffer = makeImpulseResponse(ctx, 1.9, 2.4);
+    const revSend = ctx.createGain(); revSend.gain.value = 0.32;
+    const revRet = ctx.createGain(); revRet.gain.value = 0.5;
+    // tempo-synced dotted-eighth feedback delay
+    const delay = ctx.createDelay(2.0);
+    delay.delayTime.value = (60 / jam.bpm) * 0.75;
+    const fb = ctx.createGain(); fb.gain.value = 0.38;
+    const dlySend = ctx.createGain(); dlySend.gain.value = 0.2;
+    const dlyRet = ctx.createGain(); dlyRet.gain.value = 0.45;
+    bus.connect(comp); // dry
+    bus.connect(revSend); revSend.connect(conv); conv.connect(revRet); revRet.connect(comp);
+    bus.connect(dlySend); dlySend.connect(delay);
+    delay.connect(fb); fb.connect(delay);
+    delay.connect(dlyRet); dlyRet.connect(comp);
+    comp.connect(audio.master);
+    const gains = {};
+    const levels = { lead: 0.9, bass: 1.0, drums: 0.85, pad: 0.8 };
+    for (const id of JAM_INST_IDS) {
+      const g = ctx.createGain();
+      g.gain.value = levels[id];
+      g.connect(bus);
+      gains[id] = g;
+    }
+    jam.chain = { bus, comp, conv, delay, revSend, dlySend, gains };
+    return jam.chain;
+  } catch (e) {
+    return null;
+  }
+}
+
+/* Where an instrument's voice lands: its bus gain, or the game master
+   when the chain isn't built yet (audio not initialized). */
+function jamDestFor(inst) {
+  const ch = jamEnsureChain();
+  if (ch && ch.gains[inst]) return ch.gains[inst];
+  return audio.master;
+}
+
+/* Keep the delay musical under tempo changes — dotted eighth, eased. */
+function jamSyncDelayToBpm() {
+  const ch = jam.chain;
+  if (!ch || !audio.ctx) return;
+  try {
+    ch.delay.delayTime.setTargetAtTime((60 / jam.bpm) * 0.75, audio.ctx.currentTime, 0.1);
+  } catch (e) { /* ignore */ }
+}
+
+/* Render one LEAD note through the shared-voice builder. Every note
    spawns fresh nodes — no voice stealing, so overlapping notes from
-   several jammers just layer. */
+   several jammers just layer. Subtle per-note stereo spread. */
 function jamRenderNote(midi, vel, audioTime, patch) {
   const ctx = audio.ctx;
   if (!ctx || !audio.master) return;
   jamVoicesSpawned++;
-  playSynthNote(ctx, audio.master, {
+  jam.lastVoice = { inst: 'lead', wave: (patch && patch.w) || jam.wave };
+  playSynthNote(ctx, jamDestFor('lead'), {
     midi,
     vel,
     time: audioTime,
@@ -1336,43 +1493,142 @@ function jamRenderNote(midi, vel, audioTime, patch) {
   });
 }
 
+function jamRenderBass(midi, vel, audioTime) {
+  const ctx = audio.ctx;
+  if (!ctx || !audio.master) return;
+  jamVoicesSpawned++;
+  jam.lastVoice = { inst: 'bass', midi };
+  playBassNote(ctx, jamDestFor('bass'), { midi, vel, time: audioTime });
+}
+
+function jamRenderDrum(drum, vel, audioTime) {
+  const ctx = audio.ctx;
+  if (!ctx || !audio.master) return;
+  jamVoicesSpawned++;
+  jam.lastVoice = { inst: 'drums', drum };
+  playDrum(ctx, jamDestFor('drums'), { drum, vel, time: audioTime });
+}
+
+function jamRenderChord(chord, vel, audioTime) {
+  const ctx = audio.ctx;
+  if (!ctx || !audio.master) return;
+  jamVoicesSpawned++;
+  jam.lastVoice = { inst: 'pad', chord };
+  playPadChord(ctx, jamDestFor('pad'), { chord, vel, time: audioTime });
+}
+
+/* Route an inbound event to the SENDER's instrument voice — never the
+   receiver's. d = {inst, midi, vel, drum, chord, patch}. */
+function jamRenderRemote(d, audioTime) {
+  const inst = JAM_INSTRUMENTS[d.inst] ? d.inst : 'lead';
+  const vel = d.vel;
+  if (inst === 'drums') {
+    if (JAM_DRUMS.includes(d.drum)) jamRenderDrum(d.drum, vel, audioTime);
+  } else if (inst === 'pad') {
+    const c = Number(d.chord);
+    if (Number.isInteger(c) && c >= 0 && c < JAM_CHORDS.length) jamRenderChord(c, vel, audioTime);
+  } else if (inst === 'bass') {
+    jamRenderNoteBassSafe(d.midi, vel, audioTime);
+  } else {
+    jamRenderNote(d.midi, vel, audioTime, d.patch);
+  }
+}
+
+function jamRenderNoteBassSafe(midi, vel, audioTime) {
+  const m = Math.max(0, Math.min(127, Math.round(Number(midi) || 48)));
+  jamRenderBass(m, vel, audioTime);
+}
+
 /* YOUR note: plays locally immediately (zero latency for you) and
-   broadcasts quantized to the next 16th so the room hears it on-grid. */
+   broadcasts quantized to the next 16th so the room hears it on-grid.
+   `kind` selects the instrument; every broadcast carries inst so peers
+   render your voice, not theirs. */
+function jamBroadcastNote(payload) {
+  if (net.enabled && net.sendJamNote && active && active.key === SOUND_ROOM_KEY) {
+    try {
+      net.sendJamNote({ n: myName, inst: jam.instrument, ...payload });
+    } catch (e) { /* ignore */ }
+  }
+}
+
 function jamPlayLocal(midi, vel = 0.9) {
   const ctx = audio.ctx;
   jamRenderNote(midi, vel, ctx ? ctx.currentTime + 0.01 : 0, null);
   const beatNow = jamBeatNow();
   const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
-  if (net.enabled && net.sendJamNote && active && active.key === SOUND_ROOM_KEY) {
-    try {
-      net.sendJamNote({
-        n: myName, midi, vel, beat,
-        w: jam.wave, c: Math.round(jam.cutoff), r: jam.reso,
-      });
-    } catch (e) { /* ignore */ }
-  }
-  jamMarkJammer(myName);
+  jamBroadcastNote({
+    midi, vel, beat, inst: 'lead',
+    w: jam.wave, c: Math.round(jam.cutoff), r: jam.reso,
+  });
+  jamMarkJammer(myName, 'lead');
   renderJamJammers();
 }
 
-/* Someone else's note: schedule it on the grid (or play now, free-time). */
+function jamPlayBassLocal(midi, vel = 0.9) {
+  const ctx = audio.ctx;
+  jamRenderBass(midi, vel, ctx ? ctx.currentTime + 0.01 : 0);
+  const beatNow = jamBeatNow();
+  const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
+  jamBroadcastNote({ midi, vel, beat, inst: 'bass' });
+  jamMarkJammer(myName, 'bass');
+  renderJamJammers();
+}
+
+function jamHitDrumLocal(drum, vel = 0.95) {
+  if (!JAM_DRUMS.includes(drum)) return;
+  const ctx = audio.ctx;
+  jamRenderDrum(drum, vel, ctx ? ctx.currentTime + 0.01 : 0);
+  const beatNow = jamBeatNow();
+  const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
+  jamBroadcastNote({ midi: JAM_DRUMS.indexOf(drum), vel, beat, inst: 'drums', drum });
+  jamMarkJammer(myName, 'drums');
+  renderJamJammers();
+}
+
+/* Chord stabs quantize to the bar — changes land like an arrangement. */
+function jamHitChordLocal(chord, vel = 0.85) {
+  chord = Math.max(0, Math.min(JAM_CHORDS.length - 1, chord | 0));
+  const ctx = audio.ctx;
+  jamRenderChord(chord, vel, ctx ? ctx.currentTime + 0.01 : 0);
+  const beatNow = jamBeatNow();
+  const beat = beatNow != null ? quantizeUp(beatNow, 4) : null;
+  jamBroadcastNote({ midi: 48, vel, beat, inst: 'pad', chord });
+  jamMarkJammer(myName, 'pad');
+  renderJamJammers();
+}
+
+/* Someone else's note: schedule it on the grid (or play now, free-time).
+   Routes to the SENDER's instrument voice — the inst rides the message.
+   Their wisp glow takes their instrument's color (jam notes only exist
+   in the sound room, so the peer is here with us). */
 function handleJamNote(d, peerId) {
   if (!d || !Number.isFinite(Number(d.midi))) return;
   const midi = Math.max(0, Math.min(127, Math.round(Number(d.midi))));
   const vel = Math.max(0.05, Math.min(1.2, Number(d.vel) || 0.9));
   const name = String(d.n || 'drifter').slice(0, 16);
   const beat = d.beat == null ? null : Number(d.beat);
+  const inst = JAM_INSTRUMENTS[d.inst] ? d.inst : 'lead';
   const patch = {
     w: ['sawtooth', 'square', 'mix'].includes(d.w) ? d.w : 'sawtooth',
     c: Number.isFinite(Number(d.c)) ? Number(d.c) : 1800,
     r: Number.isFinite(Number(d.r)) ? Number(d.r) : 5,
   };
-  jamMarkJammer(name);
+  const drum = JAM_DRUMS.includes(d.drum) ? d.drum : null;
+  const chord = Number.isInteger(Number(d.chord)) ? Number(d.chord) : null;
+  jamMarkJammer(name, inst);
   renderJamJammers();
+  if (peerId) {
+    jamPeerInst.set(peerId, inst);
+    const pv = peerVisuals.get(peerId);
+    if (pv && pv.glow) {
+      try { pv.glow.material.color.setHex(JAM_INSTRUMENTS[inst].glow); } catch (e) {}
+    }
+  }
+  const remote = { inst, midi, vel, drum, chord, patch };
   if (beat != null && Number.isFinite(beat) && jamBeatNow() != null) {
-    jamEnqueue({ beat, play: (at) => jamRenderNote(midi, vel, at, patch) });
+    jamEnqueue({ beat, play: (at) => jamRenderRemote(remote, at) });
   } else {
-    jamRenderNote(midi, vel, audio.ctx ? audio.ctx.currentTime + 0.01 : 0, patch);
+    jamRenderRemote(remote, audio.ctx ? audio.ctx.currentTime + 0.01 : 0);
   }
 }
 
@@ -1383,7 +1639,7 @@ function handleJamPad(d, peerId) {
   if (!d || !Number.isInteger(d.pad) || d.pad < 0 || d.pad > 3) return;
   const name = String(d.n || 'drifter').slice(0, 16);
   const buf = jam.pads[d.pad];
-  jamMarkJammer(name);
+  jamMarkJammer(name, peerId ? jamPeerInst.get(peerId) : undefined);
   renderJamJammers();
   if (!buf) return;
   const beat = d.beat == null ? null : Number(d.beat);
@@ -1404,6 +1660,7 @@ function handleJamClock(d, peerId) {
   jam.bpm = Math.max(60, Math.min(200, Number(d.bpm)));
   jam.startWall = Number(d.startWall);
   jam.clockBy = String(d.by || w.name).slice(0, 16);
+  jamSyncDelayToBpm();
   renderJamTransport();
 }
 
@@ -1426,6 +1683,7 @@ function jamSetBpm(bpm, opts = {}) {
   jam.startWall = Date.now() - (nowBeat != null ? nowBeat : 0) * (60000 / bpm);
   if (manual) jam.manual = true; // DJ override pauses auto-detect for the session
   if (broadcast) jamBroadcastClock();
+  jamSyncDelayToBpm(); // the dotted-eighth stays musical
   renderJamTransport();
 }
 
@@ -1516,6 +1774,7 @@ function jamStopRecorder() {
   try { rec.src.disconnect(); } catch (e) {}
   try { rec.proc.disconnect(); } catch (e) {}
   try { rec.sink.disconnect(); } catch (e) {}
+  try { if (rec.jamTap) rec.jamTap.disconnect(); } catch (e) {}
 }
 
 function jamEnsureRecorder() {
@@ -1547,6 +1806,19 @@ function jamEnsureRecorder() {
     src.connect(proc);
     proc.connect(sink);
     sink.connect(ctx.destination);
+    /* Build 20: the sampler grabs the jam bus post-effects too — the ring
+       now hears decks + jam (reverb, delay, limiter), i.e. what the room
+       hears. The tap is parallel; the DJ's own path is untouched. */
+    const ch = jamEnsureChain();
+    if (ch && ch.comp) {
+      try {
+        const tap = ctx.createGain();
+        tap.gain.value = 1;
+        ch.comp.connect(tap);
+        tap.connect(proc);
+        rec.jamTap = tap;
+      } catch (e) { /* decks-only grab still works */ }
+    }
     jam.rec = rec;
     return rec;
   } catch (e) {
@@ -1612,7 +1884,7 @@ function jamPlayPad(i, audioTime) {
     const g = ctx.createGain();
     g.gain.value = 0.85;
     src.connect(g);
-    g.connect(audio.master);
+    g.connect(jamDestFor('pad')); // through the jam bus: room sound, not dry
     src.start(t);
   } catch (e) { /* ignore */ }
 }
@@ -1991,21 +2263,44 @@ if (paintBtn) {
 
 /* ---------------- who's jamming ---------------- */
 
-function jamMarkJammer(name) {
-  jam.jammers.set(String(name || 'drifter').slice(0, 16), Date.now());
+function jamMarkJammer(name, inst) {
+  const k = String(name || 'drifter').slice(0, 16);
+  const prev = jam.jammers.get(k);
+  jam.jammers.set(k, {
+    t: Date.now(),
+    inst: (inst && JAM_INSTRUMENTS[inst]) ? inst : (prev && prev.inst) || null,
+  });
 }
 
 function renderJamJammers() {
   if (!jamJammersEl) return;
   const now = Date.now();
-  const names = [];
-  for (const [n, t] of jam.jammers) {
-    if (now - t < 30000) names.push(n);
+  const entries = [];
+  for (const [n, v] of jam.jammers) {
+    if (now - v.t < 30000) entries.push([n, v.inst]);
     else jam.jammers.delete(n);
   }
-  jamJammersEl.textContent = names.length
-    ? 'jamming now: ' + names.join(', ')
-    : 'the room is quiet — play something \u{1F3B9}';
+  jamJammersEl.innerHTML = '';
+  if (!entries.length) {
+    jamJammersEl.textContent = 'the room is quiet — play something \u{1F3B9}';
+    return;
+  }
+  const label = document.createElement('span');
+  label.textContent = 'jamming now: ';
+  jamJammersEl.appendChild(label);
+  entries.forEach(([n, inst], i) => {
+    if (i > 0) jamJammersEl.appendChild(document.createTextNode(', '));
+    const dot = document.createElement('span');
+    dot.className = 'jammer-dot';
+    dot.style.background = inst ? JAM_INSTRUMENTS[inst].color : '#9fd8ff';
+    if (inst) dot.style.boxShadow = `0 0 8px ${JAM_INSTRUMENTS[inst].color}`;
+    const nm = document.createElement('span');
+    nm.textContent = n;
+    const wrap = document.createElement('span');
+    wrap.appendChild(dot);
+    wrap.appendChild(nm);
+    jamJammersEl.appendChild(wrap);
+  });
 }
 setInterval(() => { if (jam.open) renderJamJammers(); }, 5000);
 
@@ -2016,11 +2311,35 @@ function setJamPanel(open) {
   if (jamPanel) jamPanel.classList.toggle('open', jam.open);
   chatFocused = jam.open; // reuse the chat guard: keys never fly the wisp mid-jam
   if (jam.open) {
+    jamEnsureChain(); // the master bus exists before the first note
+    selectJamInstrument(jam.instrument); // sync tabs, panels, wisp tint
+    jamBeatUiTick();
     renderJamTransport();
     renderJamPads();
     renderJamSamplerHint();
     renderJamJammers();
+  } else {
+    try { applySkin(equipped.skin); } catch (e) {} // wisp glow back to the skin
   }
+}
+
+/* Pick an instrument: tabs + panels swap, the panel accents take the
+   instrument's color, and the wisp glow takes it too. The pick rides
+   every jamNote so peers render the sender's voice. */
+function selectJamInstrument(id) {
+  if (!JAM_INSTRUMENTS[id]) return;
+  jam.instrument = id;
+  if (jamInstTabsEl) {
+    jamInstTabsEl.querySelectorAll('.jam-inst-tab').forEach((t) =>
+      t.classList.toggle('sel', t.dataset.inst === id));
+  }
+  document.querySelectorAll('.jam-inst-panel').forEach((p) => {
+    p.hidden = p.id !== 'jam-inst-' + id;
+  });
+  if (jamPanel) jamPanel.style.setProperty('--inst', JAM_INSTRUMENTS[id].color);
+  try { wispGlow.material.color.setHex(JAM_INSTRUMENTS[id].glow); } catch (e) {}
+  jamMarkJammer(myName, id);
+  renderJamJammers();
 }
 
 function renderJamTransport() {
@@ -2085,6 +2404,60 @@ function buildJamKeys() {
   }
 }
 
+function buildJamBassKeys() {
+  if (!jamBassKeysEl) return;
+  jamBassKeysEl.innerHTML = '';
+  const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  for (let i = 0; i <= 12; i++) {
+    const midi = 48 + i; // C3–C4 on the keys; the voice drops an octave
+    const black = [1, 3, 6, 8, 10].includes(i % 12);
+    const b = document.createElement('button');
+    b.className = 'jam-key' + (black ? ' black' : '');
+    b.textContent = black ? '' : names[i % 12];
+    b.setAttribute('aria-label', 'bass ' + names[i % 12] + (3 + Math.floor(i / 12)));
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamPlayBassLocal(midi, 0.95); });
+    jamBassKeysEl.appendChild(b);
+  }
+}
+
+function buildJamDrums() {
+  if (!jamDrumsEl) return;
+  jamDrumsEl.innerHTML = '';
+  const labels = { kick: 'KICK', snare: 'SNARE', clap: 'CLAP', chat: 'HAT', ohat: 'O-HAT', shaker: 'SHAKER' };
+  for (const d of JAM_DRUMS) {
+    const b = document.createElement('button');
+    b.className = 'jam-drum';
+    b.dataset.drum = d;
+    const s = document.createElement('span');
+    s.className = 'jam-drum-name';
+    s.textContent = labels[d] || d;
+    b.appendChild(s);
+    b.setAttribute('aria-label', 'drum ' + (labels[d] || d));
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamHitDrumLocal(d, 0.95); });
+    jamDrumsEl.appendChild(b);
+  }
+}
+
+function buildJamChords() {
+  if (!jamChordsEl) return;
+  jamChordsEl.innerHTML = '';
+  JAM_CHORDS.forEach((ch, i) => {
+    const b = document.createElement('button');
+    b.className = 'jam-chord';
+    const num = document.createElement('span');
+    num.className = 'jam-chord-num';
+    num.textContent = ch.numeral;
+    const nm = document.createElement('span');
+    nm.className = 'jam-chord-name';
+    nm.textContent = ch.name;
+    b.appendChild(num);
+    b.appendChild(nm);
+    b.setAttribute('aria-label', 'chord ' + ch.name);
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamHitChordLocal(i, 0.85); });
+    jamChordsEl.appendChild(b);
+  });
+}
+
 if (jamBtn) {
   jamBtn.addEventListener('click', () => {
     setJamPanel(!jam.open);
@@ -2096,6 +2469,18 @@ if (jamTapEl) jamTapEl.addEventListener('click', () => { jamTapTempo(); jamTapEl
 if (jamBpmDownEl) jamBpmDownEl.addEventListener('click', () => { jamSetBpm(jam.bpm - 1, { manual: true }); jamBpmDownEl.blur(); });
 if (jamBpmUpEl) jamBpmUpEl.addEventListener('click', () => { jamSetBpm(jam.bpm + 1, { manual: true }); jamBpmUpEl.blur(); });
 if (jamGrabEl) jamGrabEl.addEventListener('click', () => { jamGrabLoop(); jamGrabEl.blur(); });
+if (jamInstTabsEl) {
+  jamInstTabsEl.querySelectorAll('.jam-inst-tab').forEach((b) => {
+    b.addEventListener('click', () => { selectJamInstrument(b.dataset.inst); b.blur(); });
+  });
+}
+if (jamMetroToggleEl) jamMetroToggleEl.addEventListener('click', () => {
+  jamSetMetro(!jam.metro.on);
+  jamMetroToggleEl.blur();
+});
+if (jamMetroVolEl) jamMetroVolEl.addEventListener('input', () => {
+  jamSetMetro(jam.metro.on, Number(jamMetroVolEl.value) / 100);
+});
 document.querySelectorAll('.jam-wave').forEach((b) => {
   b.addEventListener('click', () => {
     jam.wave = b.dataset.wave || 'sawtooth';
@@ -2132,6 +2517,9 @@ renderWispSection(); // populate the settings WISP section for first open
 renderPrintsSection(); // populate the settings PRINTS section
 renderFriendsSection(); // populate the settings FRIENDS section
 buildJamKeys(); // one-octave synth keyboard for the jam panel
+buildJamBassKeys(); // bass keys (the voice drops an octave)
+buildJamDrums(); // 6 synthesized drum pads
+buildJamChords(); // 4 chord pads (i–VI–III–VII)
 net.cosmetics = () => {
   const tc = TRAIL_COLORS[equipped.trailColor] || TRAIL_COLORS.white;
   return {
@@ -3593,6 +3981,7 @@ window.__limbo = {
     clockOn: jam.startWall != null,
     by: jam.clockBy,
     manual: jam.manual,
+    instrument: jam.instrument,
     wave: jam.wave,
     cutoff: jam.cutoff,
     reso: jam.reso,
@@ -3628,6 +4017,24 @@ window.__limbo = {
   setJamPanel: (o) => setJamPanel(o),
   jamOpen: () => jam.open,
   jamAudioTimeForBeat: (b) => jamAudioTimeForBeat(b),
+  // instruments + master bus + metronome (build 20)
+  jamInstruments: () => JAM_INST_IDS.slice(),
+  jamInstrument: () => jam.instrument,
+  jamSelectInstrument: (id) => selectJamInstrument(id),
+  jamPlayBass: (m, v) => jamPlayBassLocal(m, v),
+  jamHitDrum: (d, v) => jamHitDrumLocal(d, v),
+  jamHitChord: (i, v) => jamHitChordLocal(i, v),
+  jamLastVoice: () => (jam.lastVoice ? { ...jam.lastVoice } : null),
+  jamEnsureChain: () => !!jamEnsureChain(),
+  jamChain: () => (jam.chain ? {
+    hasConv: !!(jam.chain.conv && jam.chain.conv.buffer),
+    hasComp: !!jam.chain.comp,
+    delayTime: jam.chain.delay ? jam.chain.delay.delayTime.value : null,
+    gains: Object.keys(jam.chain.gains || {}),
+  } : null),
+  jamSetMetro: (on, vol) => jamSetMetro(on, vol),
+  jamMetro: () => ({ ...jam.metro }),
+  jamPeerInst: (pid) => jamPeerInst.get(pid) || null,
   // test helper: simulate holding the decks without real media capture
   jamSimulateDj: (on) => { dj.active = !!on; renderDjHud(); renderJamTransport(); },
   // test helpers (build 17): drive the sampler's ring buffer deterministically

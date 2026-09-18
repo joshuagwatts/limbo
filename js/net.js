@@ -37,7 +37,7 @@ const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
 const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '19';
+const BUILD = '20';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -149,7 +149,7 @@ export class LimboNet {
     this.onRemoteTrackCb = null; // (track, stream, peerId) — someone's audio arrived
     // --- jam room (build 13) ---
     this.sendJamClock = null; // (data) — {bpm, startWall, by}, DJ -> room
-    this.sendJamNote = null; // (data) — {n, midi, vel, beat}, any jammer -> room
+    this.sendJamNote = null; // (data) — {n, midi, vel, beat, inst, drum, chord, w, c, r}, any jammer -> room
     this.sendJamPad = null; // (data) — {n, pad, beat, lenBars}, any jammer -> room
     this.onJamClockCb = null; // (data, peerId)
     this.onJamNoteCb = null; // (data, peerId)
