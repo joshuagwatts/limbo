@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=20';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=20';
+import { LimboNet } from './net.js?v=21';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=21';
 
 /* ---------------- configuration ---------------- */
 
@@ -93,6 +93,8 @@ const paintCanvas     = document.getElementById('paint-canvas');
 const paintPaletteEl  = document.getElementById('paint-palette');
 const paintSizesEl    = document.getElementById('paint-sizes');
 const paintDoneBtn    = document.getElementById('paint-done');
+const jukeBtn         = document.getElementById('juke-btn');
+const jukePanel       = document.getElementById('juke-panel');
 const paintEraserBtn  = document.getElementById('paint-eraser');
 
 /* ---------------- multiplayer state ---------------- */
@@ -864,7 +866,9 @@ function renderDjHud() {
   const inRoom = !!(active && active.key === SOUND_ROOM_KEY);
   if (jamBtn) jamBtn.style.display = inRoom ? '' : 'none';
   if (paintBtn) paintBtn.style.display = inRoom ? '' : 'none';
+  if (jukeBtn) jukeBtn.style.display = inRoom ? '' : 'none';
   if (!inRoom && paint.open) setPaintOpen(false); // paint mode can't leave the room
+  if (!inRoom) jukeLeaveRoom(); // the jukebox only plays in the sound room
   if (decksBtn) {
     decksBtn.style.display = inRoom ? '' : 'none';
     if (inRoom) decksBtn.textContent = dj.active ? 'leave the decks' : 'take the decks';
@@ -2089,6 +2093,806 @@ function wallSample() {
     strokes: wall.strokeCount,
   };
 }
+
+/* ---------------- jukebox: synced queue playback (build 21) ----------------
+   The honest architecture: we cannot relay Spotify/SoundCloud audio between
+   users (DRM + ToS + no API for it), and we don't try. Instead every client
+   plays the SAME track at the SAME wall-clock offset through an embedded
+   player on their own device. Same song, same moment, ~1s sync — good
+   enough for hanging out. Everyone can queue; anyone's preferred listening
+   method is honored via the "open in my app" + manual countdown path.
+
+   Protocol (sound-room scoped, same pattern as jam/wall actions):
+     jukeAdd      {id, url, provider, videoId, title, addedBy, addedAt}
+     jukeRemove   {id, by}
+     jukePlay     {id, url, provider, videoId, title, addedBy, startedAt,
+                   durationMs, by} | {stopped:true, by}
+     jukeSkipVote {id, voter}
+     jukeStateReq {reqId} / jukeState {reqId, now, queue}
+   Advance duty: whoever queued the finished track broadcasts the next
+   jukePlay. Watchdog: if a track has been over >8s with no new jukePlay,
+   ANY peer may broadcast the advance — first jukePlay wins, ties broken
+   by earliest startedAt (1.5s contention window).
+   While a DJ is live on the decks the jukebox auto-pauses; when the DJ
+   leaves, someone resumes the queue with a fresh startedAt (jittered,
+   first broadcast wins). */
+
+const juke = {
+  open: false,
+  queue: [],          // FIFO of {id, url, provider, videoId, title, addedBy, addedAt}
+  now: null,          // current play payload (not stopped)
+  nowStartedAt: 0,    // adopted startedAt (tie-breaks)
+  adoptedAt: 0,       // Date.now() when we adopted the current play
+  lastPlaySeenAt: 0,  // newest startedAt we've seen (watchdog + resume guards)
+  skips: {},          // trackId -> Set of voter names
+  answeredReq: new Set(),
+  player: null,       // {kind, play, pause, seekTo(sec), pos()->sec|null, dur()->sec|null, setVolume(0-100), destroy}
+  volume: 0.7,
+  ytApiReady: false, ytApiLoading: false, ytApiQueue: [],
+  scApiReady: false, scApiLoading: false, scApiQueue: [],
+  resyncTimer: null, endTimer: null, progressTimer: null,
+  overSince: 0,       // Date.now() when the current track was first seen over
+  pausedForDj: false,
+  djResumeTimer: null,
+  joinWaiting: false, // autoplay blocked: pulsing "tap to join the music"
+  playerFactory: null, // test seam: {youtube(d, offset, hooks), soundcloud(d, offset, hooks)}
+  extTimer: null, extCount: 0,
+};
+const JUKE_SKIP_VOTES = 2;      // votes needed to skip
+const JUKE_RESYNC_MS = 20000;  // resync nudge cadence
+const JUKE_DRIFT_S = 2.5;      // seek if further off than this
+const JUKE_WATCHDOG_MS = 8000; // track over this long with no advance -> anyone may advance
+const JUKE_CONTENTION_MS = 1500; // competing jukePlays: earliest startedAt wins
+
+/* Provider detection from a pasted URL. */
+function jukeDetectProvider(raw) {
+  let u;
+  try { u = new URL(String(raw || '').trim()); }
+  catch (e) { return { provider: 'invalid' }; }
+  if (!/^https?:$/.test(u.protocol)) return { provider: 'invalid' };
+  const host = u.hostname.replace(/^(www\.|m\.|mobile\.)/, '').toLowerCase();
+  if (host === 'youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com') {
+    let vid = null;
+    if (host === 'youtu.be') vid = u.pathname.slice(1).split(/[?/#]/)[0];
+    else if (u.pathname === '/watch') vid = u.searchParams.get('v');
+    else if (u.pathname.startsWith('/shorts/')) vid = u.pathname.split('/')[2];
+    else if (u.pathname.startsWith('/embed/')) vid = u.pathname.split('/')[2];
+    vid = (vid || '').split(/[?/#]/)[0];
+    if (vid && /^[A-Za-z0-9_-]{6,20}$/.test(vid)) return { provider: 'youtube', videoId: vid };
+    return { provider: 'external' }; // some other youtube page (playlist, channel…)
+  }
+  if (host === 'soundcloud.com' || host.endsWith('.soundcloud.com')) {
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts.length >= 2 && !parts.includes('sets')) return { provider: 'soundcloud' };
+    return { provider: 'external' }; // profile / playlist page
+  }
+  return { provider: 'external' };
+}
+
+/* Best-effort title for youtube links via noembed; 4s timeout, silent fallback. */
+async function jukeFetchTitle(url, provider) {
+  const fb = provider === 'youtube' ? 'a youtube track'
+    : provider === 'soundcloud' ? 'a soundcloud track' : 'a track';
+  if (provider !== 'youtube') return fb;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 4000);
+    const r = await fetch('https://noembed.com/embed?url=' + encodeURIComponent(url), { signal: ctl.signal });
+    clearTimeout(t);
+    const jj = await r.json();
+    if (jj && jj.title) return String(jj.title).slice(0, 120);
+  } catch (e) { /* offline / blocked -> fallback */ }
+  return fb;
+}
+
+function jukeValidAdd(d) {
+  if (!d || typeof d !== 'object') return false;
+  if (typeof d.id !== 'string' || !d.id || d.id.length > 40) return false;
+  if (typeof d.url !== 'string' || !d.url || d.url.length > 500) return false;
+  if (!['youtube', 'soundcloud', 'external'].includes(d.provider)) return false;
+  if (typeof d.title !== 'string' || !d.title || d.title.length > 140) return false;
+  if (typeof d.addedBy !== 'string' || !d.addedBy || d.addedBy.length > 16) return false;
+  if (typeof d.addedAt !== 'number') return false;
+  if (d.videoId != null && (typeof d.videoId !== 'string' || d.videoId.length > 24)) return false;
+  return true;
+}
+function jukeValidPlay(d) {
+  if (!d || typeof d !== 'object') return false;
+  if (d.stopped) return typeof d.by === 'string';
+  if (typeof d.id !== 'string' || !d.id) return false;
+  if (typeof d.url !== 'string' || !d.url) return false;
+  if (!['youtube', 'soundcloud', 'external'].includes(d.provider)) return false;
+  if (typeof d.title !== 'string') return false;
+  if (typeof d.startedAt !== 'number' || typeof d.by !== 'string') return false;
+  if (typeof d.addedBy !== 'string') return false;
+  if (d.durationMs != null && typeof d.durationMs !== 'number') return false;
+  return true;
+}
+
+/* ---------- queue ops ---------- */
+
+function jukeMakeId() {
+  return Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
+}
+
+/* Queue a link. Runs the title fetch, adds locally, broadcasts, and if
+   the room is idle starts playback right away (inside the user's gesture,
+   so autoplay is allowed). titleHint skips the network fetch (tests). */
+async function jukeAddTrack(rawUrl, titleHint) {
+  const det = jukeDetectProvider(rawUrl);
+  if (det.provider === 'invalid') {
+    jukeHint('that link doesn\u2019t look right — paste a full https url');
+    return null;
+  }
+  const url = String(rawUrl).trim();
+  const title = titleHint || await jukeFetchTitle(url, det.provider);
+  const t = {
+    id: jukeMakeId(), url, provider: det.provider,
+    videoId: det.videoId || null, title,
+    addedBy: myName, addedAt: Date.now(),
+  };
+  juke.queue.push(t);
+  if (net.enabled && net.sendJukeAdd) {
+    try { net.sendJukeAdd(t); } catch (e) { /* best effort */ }
+  }
+  renderJuke();
+  // Room idle and no DJ: we queued it, we start it — inside the tap gesture.
+  if (!juke.now && !juke.pausedForDj && !djWinner()) jukeAdvance();
+  return t;
+}
+
+function handleJukeAdd(d, peerId) {
+  if (!jukeValidAdd(d)) return;
+  if (juke.queue.some((t) => t.id === d.id)) return; // dedupe
+  juke.queue.push(d);
+  juke.queue.sort((a, b) => a.addedAt - b.addedAt); // FIFO by queue time
+  renderJuke();
+}
+
+/* Remove your own queued track. If it's the one playing, that counts as a
+   skip — the queue advances. */
+function jukeRemoveTrack(id) {
+  const i = juke.queue.findIndex((t) => t.id === id);
+  const isNow = juke.now && juke.now.id === id;
+  if (i === -1 && !isNow) return false;
+  const t = isNow ? juke.now : juke.queue[i];
+  if (t.addedBy !== myName && t.by !== myName) {
+    jukeHint('only the drifter who queued it can pull it');
+    return false;
+  }
+  if (i !== -1) juke.queue.splice(i, 1);
+  if (net.enabled && net.sendJukeRemove) {
+    try { net.sendJukeRemove({ id, by: myName }); } catch (e) {}
+  }
+  if (isNow) jukeAdvance(); else renderJuke();
+  return true;
+}
+
+function handleJukeRemove(d, peerId) {
+  if (!d || typeof d.id !== 'string') return;
+  const i = juke.queue.findIndex((t) => t.id === d.id);
+  if (i !== -1) juke.queue.splice(i, 1);
+  if (juke.now && juke.now.id === d.id) {
+    // Someone pulled the playing track: advance, but only the puller
+    // broadcasts — everyone else just clears and waits for the jukePlay.
+    jukeStopPlayback();
+    juke.now = null;
+    renderJuke();
+  } else renderJuke();
+}
+
+/* ---------- skip votes ---------- */
+
+function jukeVoteSkip() {
+  if (!juke.now || juke.now.stopped) return;
+  const id = juke.now.id;
+  if (!juke.skips[id]) juke.skips[id] = new Set();
+  if (juke.skips[id].has(myName)) return; // already voted
+  if (net.enabled && net.sendJukeSkipVote) {
+    try { net.sendJukeSkipVote({ id, voter: myName }); } catch (e) {}
+  }
+  handleJukeSkipVote({ id, voter: myName }, 'self');
+}
+
+function handleJukeSkipVote(d, peerId) {
+  if (!d || typeof d.id !== 'string' || typeof d.voter !== 'string' || !d.voter) return;
+  if (!juke.now || juke.now.id !== d.id) return; // stale vote
+  if (!juke.skips[d.id]) juke.skips[d.id] = new Set();
+  juke.skips[d.id].add(d.voter);
+  renderJuke();
+  if (juke.skips[d.id].size >= JUKE_SKIP_VOTES) {
+    delete juke.skips[d.id];
+    jukeAdvance();
+  }
+}
+
+/* ---------- playback ---------- */
+
+/* Pop the next track FIFO and broadcast it. Whoever calls this becomes
+   the broadcaster (queuer of the finished track, skip voter, watchdog,
+   DJ-leave resumer). */
+function jukeAdvance() {
+  if (juke.pausedForDj) return null;
+  const next = juke.queue.shift() || null;
+  if (!next) {
+    const msg = { stopped: true, by: myName, startedAt: Date.now() };
+    if (net.enabled && net.sendJukePlay) {
+      try { net.sendJukePlay(msg); } catch (e) {}
+    }
+    jukeStopPlayback();
+    juke.now = null;
+    juke.nowStartedAt = 0;
+    juke.lastPlaySeenAt = Date.now();
+    renderJuke();
+    return null;
+  }
+  const play = {
+    id: next.id, url: next.url, provider: next.provider,
+    videoId: next.videoId, title: next.title,
+    addedBy: next.addedBy, startedAt: Date.now(),
+    durationMs: 0, by: myName,
+  };
+  if (net.enabled && net.sendJukePlay) {
+    try { net.sendJukePlay(play); } catch (e) {}
+  }
+  jukeAdoptPlay(play);
+  return play;
+}
+
+function handleJukePlay(d, peerId) {
+  if (!jukeValidPlay(d)) return;
+  if (d.stopped) {
+    jukeStopPlayback();
+    juke.now = null;
+    juke.nowStartedAt = 0;
+    juke.lastPlaySeenAt = Math.max(juke.lastPlaySeenAt, d.startedAt || Date.now());
+    renderJuke();
+    return;
+  }
+  const inContention = Date.now() - juke.adoptedAt < JUKE_CONTENTION_MS;
+  if (juke.now && d.id === juke.now.id && !inContention) return; // duplicate
+  if (inContention && juke.now && d.startedAt >= juke.nowStartedAt) return; // we hold the earlier claim
+  jukeAdoptPlay(d);
+}
+
+function jukeAdoptPlay(d) {
+  juke.now = { ...d };
+  juke.nowStartedAt = d.startedAt;
+  juke.adoptedAt = Date.now();
+  juke.lastPlaySeenAt = Math.max(juke.lastPlaySeenAt, d.startedAt);
+  juke.overSince = 0;
+  juke.skips[d.id] = new Set();
+  // The broadcaster popped it locally; receivers drop it from their queue.
+  const i = juke.queue.findIndex((t) => t.id === d.id);
+  if (i !== -1) juke.queue.splice(i, 1);
+  jukeStartPlayback(d);
+}
+
+/* offset math, shared by the real players and the tests */
+function jukeOffsetFor(d, nowMs) {
+  return Math.max(0, ((nowMs == null ? Date.now() : nowMs) - d.startedAt) / 1000);
+}
+
+function jukeStartPlayback(d) {
+  jukeStopPlayer();
+  juke.joinWaiting = false;
+  if (juke.pausedForDj) { renderJuke(); return; } // DJ live: hold, don't play
+  const offset = jukeOffsetFor(d);
+  if (d.provider === 'youtube') jukePlayYT(d, offset);
+  else if (d.provider === 'soundcloud') jukePlaySC(d, offset);
+  else jukePlayExternal(d);
+  jukeArmEndWatcher();
+  jukeArmResync();
+  jukeArmProgress();
+  renderJuke();
+}
+
+/* ---------- embedded players ---------- */
+
+function jukeLoadYTApi(cb) {
+  if (juke.ytApiReady) { cb(true); return; }
+  juke.ytApiQueue.push(cb);
+  if (juke.ytApiLoading) return;
+  juke.ytApiLoading = true;
+  window.onYouTubeIframeAPIReady = () => {
+    juke.ytApiReady = true; juke.ytApiLoading = false;
+    const q = juke.ytApiQueue.splice(0); q.forEach((f) => { try { f(true); } catch (e) {} });
+  };
+  const s = document.createElement('script');
+  s.src = 'https://www.youtube.com/iframe_api';
+  s.onerror = () => {
+    juke.ytApiLoading = false;
+    const q = juke.ytApiQueue.splice(0); q.forEach((f) => { try { f(false); } catch (e) {} });
+  };
+  document.head.appendChild(s);
+}
+
+function jukeLoadSCApi(cb) {
+  if (juke.scApiReady) { cb(true); return; }
+  juke.scApiQueue.push(cb);
+  if (juke.scApiLoading) return;
+  juke.scApiLoading = true;
+  const s = document.createElement('script');
+  s.src = 'https://w.soundcloud.com/player/api.js';
+  s.onload = () => {
+    juke.scApiReady = !!(window.SC && window.SC.Widget);
+    juke.scApiLoading = false;
+    const q = juke.scApiQueue.splice(0); q.forEach((f) => { try { f(juke.scApiReady); } catch (e) {} });
+  };
+  s.onerror = () => {
+    juke.scApiLoading = false;
+    const q = juke.scApiQueue.splice(0); q.forEach((f) => { try { f(false); } catch (e) {} });
+  };
+  document.head.appendChild(s);
+}
+
+/* After play() is called, poll briefly: if the provider never reaches
+   playing state the browser blocked autoplay — surface the one-tap
+   "tap to join the music" pulse instead of silence. */
+function jukeWatchAutoplay(kind) {
+  let tries = 0;
+  const iv = setInterval(() => {
+    tries++;
+    let playing = false;
+    try {
+      if (!juke.player || juke.player.kind !== kind) { clearInterval(iv); return; }
+      if (kind === 'youtube') playing = juke.player.state() === 1;
+      else if (kind === 'soundcloud') playing = juke.player.playingFlag === true;
+    } catch (e) {}
+    if (playing || tries >= 4) {
+      clearInterval(iv);
+      if (!playing && juke.player && juke.player.kind === kind) {
+        juke.joinWaiting = true;
+        renderJuke();
+      }
+    }
+  }, 700);
+}
+
+/* One-tap join: the user's gesture unblocks provider autoplay. */
+function jukeJoinTap() {
+  if (!juke.player) return;
+  try {
+    const off = juke.now ? jukeOffsetFor(juke.now) : 0;
+    if (off > 1) juke.player.seekTo(off);
+    juke.player.play();
+  } catch (e) {}
+  juke.joinWaiting = false;
+  renderJuke();
+}
+
+function jukePlayYT(d, offset) {
+  if (juke.playerFactory && juke.playerFactory.youtube) {
+    const hooks = { onEnded: () => jukeOnPlayerEnded() };
+    juke.player = juke.playerFactory.youtube(d, offset, hooks);
+    try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+    return;
+  }
+  const holder = document.getElementById('juke-yt-holder');
+  if (!holder) return;
+  holder.style.display = '';
+  document.getElementById('juke-sc-holder').style.display = 'none';
+  holder.innerHTML = '';
+  const div = document.createElement('div');
+  div.id = 'juke-yt-player';
+  holder.appendChild(div);
+  jukeLoadYTApi((ok) => {
+    if (!ok || !juke.now || juke.now.id !== d.id) return;
+    try {
+      const p = new window.YT.Player(div, {
+        width: '100%', height: '110',
+        videoId: d.videoId,
+        playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
+        events: {
+          onReady: (ev) => {
+            const off = juke.now && juke.now.id === d.id ? jukeOffsetFor(juke.now) : 0;
+            try { if (off > 1) ev.target.seekTo(off, true); } catch (e) {}
+            try { ev.target.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+            try { ev.target.playVideo(); } catch (e) {}
+            jukeWatchAutoplay('youtube');
+          },
+          onStateChange: (ev) => {
+            if (ev.data === window.YT.PlayerState.ENDED) jukeOnPlayerEnded();
+          },
+        },
+      });
+      juke.player = {
+        kind: 'youtube',
+        play: () => p.playVideo(),
+        pause: () => p.pauseVideo(),
+        seekTo: (s) => p.seekTo(s, true),
+        pos: () => { try { return p.getCurrentTime(); } catch (e) { return null; } },
+        dur: () => { try { return p.getDuration(); } catch (e) { return null; } },
+        state: () => { try { return p.getPlayerState(); } catch (e) { return -1; } },
+        setVolume: (v) => { try { p.setVolume(v); } catch (e) {} },
+        destroy: () => { try { p.destroy(); } catch (e) {} },
+      };
+    } catch (e) { /* player failed; watchdog still advances on duration */ }
+  });
+}
+
+function jukePlaySC(d, offset) {
+  if (juke.playerFactory && juke.playerFactory.soundcloud) {
+    const hooks = { onEnded: () => jukeOnPlayerEnded() };
+    juke.player = juke.playerFactory.soundcloud(d, offset, hooks);
+    try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+    return;
+  }
+  const holder = document.getElementById('juke-sc-holder');
+  if (!holder) return;
+  holder.style.display = '';
+  document.getElementById('juke-yt-holder').style.display = 'none';
+  holder.innerHTML = '';
+  const iframe = document.createElement('iframe');
+  iframe.width = '100%'; iframe.height = '110';
+  iframe.setAttribute('frameborder', '0');
+  iframe.setAttribute('allow', 'autoplay');
+  iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(d.url) +
+    '&auto_play=false&hide_related=true&show_comments=false&show_user=false&visual=false';
+  holder.appendChild(iframe);
+  jukeLoadSCApi((ok) => {
+    if (!ok || !juke.now || juke.now.id !== d.id) return;
+    try {
+      const w = window.SC.Widget(iframe);
+      let playingFlag = false;
+      w.bind(window.SC.Widget.Events.PLAY, () => { playingFlag = true; });
+      w.bind(window.SC.Widget.Events.PAUSE, () => { playingFlag = false; });
+      w.bind(window.SC.Widget.Events.FINISH, () => { playingFlag = false; jukeOnPlayerEnded(); });
+      w.bind(window.SC.Widget.Events.READY, () => {
+        const off = juke.now && juke.now.id === d.id ? jukeOffsetFor(juke.now) : 0;
+        try { w.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+        try { if (off > 1) w.seekTo(Math.round(off * 1000)); } catch (e) {}
+        try { w.play(); } catch (e) {}
+        jukeWatchAutoplay('soundcloud');
+      });
+      let lastPos = null;
+      juke.player = {
+        kind: 'soundcloud',
+        playingFlag,
+        play: () => w.play(),
+        pause: () => w.pause(),
+        seekTo: (s) => w.seekTo(Math.round(s * 1000)),
+        pos: () => {
+          try { w.getPosition((ms) => { lastPos = ms / 1000; }); } catch (e) {}
+          return lastPos;
+        },
+        dur: () => null, // async via getDuration; end comes from FINISH
+        setVolume: (v) => { try { w.setVolume(v); } catch (e) {} },
+        destroy: () => { try { w.unbind(window.SC.Widget.Events.FINISH); } catch (e) {} },
+      };
+      // keep the autoplay watchdog's flag fresh
+      setInterval(() => { if (juke.player) juke.player.playingFlag = playingFlag; }, 500);
+    } catch (e) { /* widget failed; watchdog still advances on duration */ }
+  });
+}
+
+/* External links (spotify, bandcamp, anything else): no embed exists, so
+   the room counts down together and everyone presses play in their own
+   app. Manual skip ends it — no auto-advance without a duration. */
+function jukePlayExternal(d) {
+  document.getElementById('juke-yt-holder').style.display = 'none';
+  document.getElementById('juke-sc-holder').style.display = 'none';
+  jukeStopPlayer();
+  juke.player = {
+    kind: 'external',
+    play: () => {}, pause: () => {},
+    seekTo: () => {}, pos: () => null, dur: () => null,
+    setVolume: () => {}, destroy: () => {},
+  };
+  const cd = document.getElementById('juke-countdown');
+  juke.extCount = 5;
+  const tick = () => {
+    if (!juke.now || juke.now.id !== d.id) return;
+    if (juke.extCount > 0) {
+      if (cd) { cd.style.display = ''; cd.textContent = `press play in your app in ${juke.extCount}\u2026`; }
+      juke.extCount--;
+      juke.extTimer = setTimeout(tick, 1000);
+    } else if (cd) {
+      cd.textContent = 'playing on your device — skip when it\u2019s done';
+    }
+  };
+  tick();
+  renderJuke();
+}
+
+/* ---------- end detection + watchdog ---------- */
+
+function jukeTrackOver() {
+  if (!juke.now) return false;
+  if (juke.player && juke.player.kind !== 'external') {
+    try {
+      const dur = juke.player.dur();
+      const pos = juke.player.pos();
+      if (dur && dur > 0 && pos != null && pos >= dur - 0.5) return true;
+    } catch (e) {}
+  }
+  const dm = juke.now.durationMs;
+  if (dm && dm > 0 && Date.now() - juke.now.startedAt >= dm) return true;
+  return false;
+}
+
+function jukeOnPlayerEnded() {
+  if (!juke.now || juke.pausedForDj) return;
+  // The queuer advances; everyone else waits for the broadcast (watchdog
+  // covers the queuer vanishing).
+  if (juke.now.addedBy === myName) {
+    setTimeout(() => {
+      if (juke.now && jukeTrackOver() && juke.now.addedBy === myName && !juke.pausedForDj) jukeAdvance();
+    }, 1200);
+  }
+}
+
+function jukeArmEndWatcher() {
+  clearInterval(juke.endTimer);
+  juke.endTimer = setInterval(() => {
+    if (!juke.now || juke.pausedForDj) return;
+    if (!jukeTrackOver()) { juke.overSince = 0; return; }
+    if (!juke.overSince) juke.overSince = Date.now();
+    const overFor = Date.now() - juke.overSince;
+    // Queuer's duty first…
+    if (juke.now.addedBy === myName && overFor > 2000) {
+      if (Date.now() - juke.lastPlaySeenAt > 2000) jukeAdvance();
+      return;
+    }
+    // …watchdog: anyone may advance once it's been over 8s with silence.
+    if (overFor > JUKE_WATCHDOG_MS && Date.now() - juke.lastPlaySeenAt > JUKE_WATCHDOG_MS) {
+      jukeAdvance();
+    }
+  }, 2000);
+}
+
+/* Every 20s: if our player drifted >2.5s from the room's clock, snap it. */
+function jukeResyncTick() {
+  if (!juke.now || juke.pausedForDj) return false;
+  if (!juke.player || juke.player.kind === 'external') return false;
+  const expected = jukeOffsetFor(juke.now);
+  let pos = null;
+  try { pos = juke.player.pos(); } catch (e) {}
+  if (pos == null || expected < 0) return false;
+  if (Math.abs(pos - expected) > JUKE_DRIFT_S) {
+    try { juke.player.seekTo(expected); } catch (e) { return false; }
+    return true;
+  }
+  return false;
+}
+function jukeArmResync() {
+  clearInterval(juke.resyncTimer);
+  juke.resyncTimer = setInterval(jukeResyncTick, JUKE_RESYNC_MS);
+}
+
+function jukeArmProgress() {
+  clearInterval(juke.progressTimer);
+  juke.progressTimer = setInterval(() => {
+    const fill = document.getElementById('juke-progress-fill');
+    if (!fill || !juke.now) return;
+    const dm = juke.now.durationMs;
+    if (dm && dm > 0) {
+      const p = Math.min(1, (Date.now() - juke.now.startedAt) / dm);
+      fill.style.width = (p * 100).toFixed(1) + '%';
+    } else {
+      fill.style.width = '';
+      fill.classList.add('pulse');
+    }
+  }, 1000);
+}
+
+function jukeStopPlayer() {
+  clearTimeout(juke.extTimer);
+  const cd = document.getElementById('juke-countdown');
+  if (cd) { cd.style.display = 'none'; cd.textContent = ''; }
+  if (juke.player) { try { juke.player.destroy(); } catch (e) {} juke.player = null; }
+  const yh = document.getElementById('juke-yt-holder');
+  const sh = document.getElementById('juke-sc-holder');
+  if (yh) { yh.style.display = 'none'; yh.innerHTML = ''; }
+  if (sh) { sh.style.display = 'none'; sh.innerHTML = ''; }
+}
+function jukeStopPlayback() {
+  jukeStopPlayer();
+  clearInterval(juke.endTimer); juke.endTimer = null;
+  clearInterval(juke.resyncTimer); juke.resyncTimer = null;
+  clearInterval(juke.progressTimer); juke.progressTimer = null;
+  juke.overSince = 0;
+  juke.joinWaiting = false;
+}
+
+/* ---------- DJ interaction ---------- */
+
+/* While a DJ is live the jukebox auto-pauses. When the DJ leaves, the
+   queue resumes where it left off — someone re-broadcasts the current
+   track with a fresh startedAt (jittered; first broadcast wins). */
+function jukeDjChanged(live) {
+  if (live && !juke.pausedForDj) {
+    if (juke.now) {
+      juke.pausedForDj = true;
+      jukeStopPlayback();
+      renderJuke();
+    }
+  } else if (!live && juke.pausedForDj) {
+    juke.pausedForDj = false;
+    renderJuke();
+    // Resume: re-broadcast the held track with a fresh startedAt. Jitter
+    // so only one peer does it; first jukePlay wins.
+    clearTimeout(juke.djResumeTimer);
+    const seenAt = juke.lastPlaySeenAt;
+    juke.djResumeTimer = setTimeout(() => {
+      if (juke.lastPlaySeenAt !== seenAt) return; // someone else resumed
+      if (!juke.now || juke.pausedForDj) return;
+      if (active && active.key !== SOUND_ROOM_KEY) return;
+      const d = { ...juke.now, startedAt: Date.now(), by: myName };
+      if (net.enabled && net.sendJukePlay) {
+        try { net.sendJukePlay(d); } catch (e) {}
+      }
+      jukeAdoptPlay(d);
+    }, 1000 + Math.random() * 2000);
+  }
+}
+
+/* ---------- late-joiner state sync ---------- */
+
+function handleJukeStateReq(d, peerId) {
+  if (!d || typeof d.reqId !== 'string' || !d.reqId) return;
+  if (juke.answeredReq.has(d.reqId)) return;
+  if (!juke.now && juke.queue.length === 0) return; // nothing to share
+  juke.answeredReq.add(d.reqId);
+  if (juke.answeredReq.size > 40) {
+    const oldest = juke.answeredReq.values().next().value;
+    juke.answeredReq.delete(oldest);
+  }
+  if (!net.enabled || !net.sendJukeState) return;
+  try {
+    net.sendJukeState({ reqId: d.reqId, now: juke.now, queue: juke.queue.slice(0, 20) });
+  } catch (e) { /* best effort */ }
+}
+
+function handleJukeState(d, peerId) {
+  if (!d || typeof d.reqId !== 'string') return;
+  if (juke.now || juke.queue.length) return; // we already have state; first answer wins
+  const q = Array.isArray(d.queue) ? d.queue.filter(jukeValidAdd) : [];
+  juke.queue = q.slice(0, 20);
+  if (d.now && jukeValidPlay(d.now) && !d.now.stopped) {
+    jukeAdoptPlay(d.now); // offset math puts us in sync mid-track
+  } else renderJuke();
+}
+
+/* ---------- leaving the room ---------- */
+
+function jukeLeaveRoom() {
+  jukeStopPlayback();
+  juke.now = null;
+  juke.queue = [];
+  juke.skips = {};
+  juke.pausedForDj = false;
+  clearTimeout(juke.djResumeTimer);
+  if (juke.open) setJukePanel(false);
+  renderJuke();
+}
+
+/* ---------- UI ---------- */
+
+function setJukePanel(open) {
+  juke.open = !!open;
+  if (jukePanel) jukePanel.style.display = juke.open ? '' : 'none';
+  chatFocused = juke.open; // same guard as jam: keys never fly the wisp
+  if (juke.open) renderJuke();
+  if (jukeBtn) jukeBtn.blur();
+}
+
+function jukeHint(msg) {
+  const el = document.getElementById('juke-hint');
+  if (!el) return;
+  el.textContent = msg;
+  clearTimeout(jukeHint._t);
+  jukeHint._t = setTimeout(() => {
+    el.textContent = 'everyone hears the same track at the same time — on their own device';
+  }, 4000);
+}
+
+function jukeProviderIcon(p) {
+  return p === 'youtube' ? '▶ yt' : p === 'soundcloud' ? '☁ sc' : '↗ ext';
+}
+
+function renderJuke() {
+  if (!jukePanel) return;
+  const titleEl = document.getElementById('juke-now-title');
+  const provEl = document.getElementById('juke-now-provider');
+  const byEl = document.getElementById('juke-now-by');
+  const skipBtn = document.getElementById('juke-skip');
+  const skipCount = document.getElementById('juke-skip-count');
+  const openApp = document.getElementById('juke-open-app');
+  const joinBtn = document.getElementById('juke-join');
+  const djNote = document.getElementById('juke-dj-note');
+  const qEl = document.getElementById('juke-queue');
+  if (djNote) djNote.style.display = juke.pausedForDj ? '' : 'none';
+  if (juke.now && !juke.now.stopped) {
+    if (titleEl) titleEl.textContent = juke.now.title || 'untitled';
+    if (provEl) provEl.textContent = jukeProviderIcon(juke.now.provider);
+    if (byEl) byEl.textContent = `queued by ${juke.now.addedBy || juke.now.by || 'a drifter'}`;
+    const votes = juke.skips[juke.now.id] ? juke.skips[juke.now.id].size : 0;
+    if (skipCount) skipCount.textContent = votes > 0 ? `${votes}/${JUKE_SKIP_VOTES}` : '';
+    if (skipBtn) skipBtn.disabled = false;
+    if (openApp) {
+      openApp.disabled = false;
+      openApp.onclick = () => { try { window.open(juke.now.url, '_blank', 'noopener'); } catch (e) {} };
+    }
+  } else {
+    if (titleEl) titleEl.textContent = juke.pausedForDj ? 'paused for the DJ' : 'nothing playing';
+    if (provEl) provEl.textContent = '';
+    if (byEl) byEl.textContent = '';
+    if (skipCount) skipCount.textContent = '';
+    if (skipBtn) skipBtn.disabled = true;
+    if (openApp) { openApp.disabled = true; openApp.onclick = null; }
+  }
+  if (joinBtn) {
+    joinBtn.style.display = juke.joinWaiting ? '' : 'none';
+    joinBtn.classList.toggle('pulse', juke.joinWaiting);
+  }
+  if (qEl) {
+    qEl.innerHTML = '';
+    if (!juke.queue.length) {
+      qEl.innerHTML = '<div class="juke-empty">queue is empty — drop a link</div>';
+    } else {
+      juke.queue.forEach((t) => {
+        const row = document.createElement('div');
+        row.className = 'juke-row';
+        const nm = document.createElement('span');
+        nm.className = 'juke-row-title';
+        nm.textContent = t.title;
+        const meta = document.createElement('span');
+        meta.className = 'juke-row-meta';
+        meta.textContent = `${jukeProviderIcon(t.provider)} · ${t.addedBy}`;
+        row.appendChild(nm);
+        row.appendChild(meta);
+        if (t.addedBy === myName) {
+          const rm = document.createElement('button');
+          rm.className = 'juke-rm';
+          rm.textContent = '✕';
+          rm.setAttribute('aria-label', 'remove');
+          rm.addEventListener('click', () => jukeRemoveTrack(t.id));
+          row.appendChild(rm);
+        }
+        qEl.appendChild(row);
+      });
+    }
+  }
+}
+
+function jukeSetVolume(v) {
+  juke.volume = Math.max(0, Math.min(1, v));
+  if (juke.player) { try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {} }
+  const el = document.getElementById('juke-vol');
+  if (el && document.activeElement !== el) el.value = Math.round(juke.volume * 100);
+}
+
+if (jukeBtn) {
+  jukeBtn.addEventListener('click', () => setJukePanel(!juke.open));
+}
+const jukeCloseBtn = document.getElementById('juke-close');
+if (jukeCloseBtn) jukeCloseBtn.addEventListener('click', () => setJukePanel(false));
+const jukeAddBtn = document.getElementById('juke-add-btn');
+const jukeAddInput = document.getElementById('juke-add-url');
+if (jukeAddBtn) {
+  const doAdd = () => {
+    const v = jukeAddInput ? jukeAddInput.value : '';
+    if (!v.trim()) return;
+    jukeAddTrack(v.trim());
+    if (jukeAddInput) jukeAddInput.value = '';
+    jukeAddBtn.blur();
+  };
+  jukeAddBtn.addEventListener('click', doAdd);
+  if (jukeAddInput) jukeAddInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doAdd(); }
+    e.stopPropagation(); // don't fly the wisp while typing a link
+  });
+}
+const jukeSkipBtn = document.getElementById('juke-skip');
+if (jukeSkipBtn) jukeSkipBtn.addEventListener('click', () => { jukeVoteSkip(); jukeSkipBtn.blur(); });
+const jukeJoinBtn = document.getElementById('juke-join');
+if (jukeJoinBtn) jukeJoinBtn.addEventListener('click', () => { jukeJoinTap(); jukeJoinBtn.blur(); });
+const jukeVolEl = document.getElementById('juke-vol');
+if (jukeVolEl) jukeVolEl.addEventListener('input', () => jukeSetVolume(jukeVolEl.value / 100));
+
+/* Test seam: inject mock providers so tests never load real iframes. */
+function jukeSetFactory(f) { juke.playerFactory = f || null; }
 
 /* ---------------- paint mode UI (build 18) ----------------
    Fullscreen overlay: the wall aspect-fit, pointer drawing, palette +
@@ -3320,6 +4124,11 @@ function goTo(key) {
         if (active && active.key === SOUND_ROOM_KEY && net.sendWallSyncReq) {
           try { net.sendWallSyncReq({ reqId }); } catch (e) { /* best effort */ }
         }
+        // Jukebox (build 21): same late-joiner pattern — ask the room for
+        // the current queue + now-playing so we land in sync mid-track.
+        if (active && active.key === SOUND_ROOM_KEY && net.sendJukeStateReq) {
+          try { net.sendJukeStateReq({ reqId: reqId + '-juke' }); } catch (e) { /* best effort */ }
+        }
       }, 2000);
     }
     fadeEl.classList.remove('on');
@@ -3554,6 +4363,7 @@ net.onDjCb = () => {
     jamStopRecorder();
     jamStopClock(); // no DJ, no clock
   }
+  jukeDjChanged(!!w); // DJ live -> jukebox pauses; DJ gone -> queue resumes
   renderDjHud();
   if (settingsOpen) renderFriendsSection();
 };
@@ -3577,6 +4387,13 @@ net.onWallStrokeCb = handleWallStroke;
 net.onWallSyncReqCb = handleWallSyncReq;
 net.onWallSyncCb = handleWallSync;
 net.onJamTickCb = () => jamBroadcastClock(); // 15s clock re-broadcast while we hold the decks
+// Jukebox (build 21): synced queue playback.
+net.onJukeAddCb = handleJukeAdd;
+net.onJukeRemoveCb = handleJukeRemove;
+net.onJukePlayCb = handleJukePlay;
+net.onJukeSkipVoteCb = handleJukeSkipVote;
+net.onJukeStateReqCb = handleJukeStateReq;
+net.onJukeStateCb = handleJukeState;
 
 /* ---------------- settings panel ----------------
    Gear button opens it; D key is a desktop shortcut to the same panel.
@@ -4113,4 +4930,47 @@ window.__limbo = {
   wallHandleSyncReq: (d, pid) => handleWallSyncReq(d, pid || 'test-peer'),
   wallAnswered: () => [...wall.answeredReq],
   wallDjWinner: () => djWinner(),
+  // jukebox (build 21)
+  jukeState: () => ({
+    open: juke.open,
+    queue: juke.queue.map((t) => ({ ...t })),
+    now: juke.now ? { ...juke.now } : null,
+    pausedForDj: juke.pausedForDj,
+    joinWaiting: juke.joinWaiting,
+    volume: juke.volume,
+    hasPlayer: !!juke.player,
+    playerKind: juke.player ? juke.player.kind : null,
+  }),
+  jukeOpen: () => setJukePanel(true),
+  jukeClose: () => setJukePanel(false),
+  jukeIsOpen: () => juke.open,
+  jukeBtnVisible: () => !!(jukeBtn && jukeBtn.style.display !== 'none'),
+  jukeDetect: (u) => jukeDetectProvider(u),
+  jukeAdd: (u, t) => jukeAddTrack(u, t),
+  jukeRemove: (id) => jukeRemoveTrack(id),
+  jukeHandleAdd: (d, pid) => handleJukeAdd(d, pid || 'test-peer'),
+  jukeHandleRemove: (d, pid) => handleJukeRemove(d, pid || 'test-peer'),
+  jukeHandlePlay: (d, pid) => handleJukePlay(d, pid || 'test-peer'),
+  jukeHandleSkip: (d, pid) => handleJukeSkipVote(d, pid || 'test-peer'),
+  jukeHandleState: (d, pid) => handleJukeState(d, pid || 'test-peer'),
+  jukeHandleStateReq: (d, pid) => handleJukeStateReq(d, pid || 'test-peer'),
+  jukeAdvance: () => jukeAdvance(),
+  jukeVoteSkip: () => jukeVoteSkip(),
+  jukeOffsetFor: (d, nowMs) => jukeOffsetFor(d, nowMs),
+  jukeValidPlay: (d) => jukeValidPlay(d),
+  jukeResyncTick: () => jukeResyncTick(),
+  jukeTrackOver: () => jukeTrackOver(),
+  jukeSetFactory: (f) => jukeSetFactory(f),
+  jukeSetVolume: (v) => jukeSetVolume(v),
+  jukeDjChanged: (live) => jukeDjChanged(live),
+  jukeDjResumeNow: () => { // test helper: run the DJ-leave resume immediately
+    clearTimeout(juke.djResumeTimer);
+    if (!juke.now || juke.pausedForDj) return null;
+    const d = { ...juke.now, startedAt: Date.now(), by: myName };
+    if (net.enabled && net.sendJukePlay) { try { net.sendJukePlay(d); } catch (e) {} }
+    jukeAdoptPlay(d);
+    return d;
+  },
+  jukeJoinTap: () => jukeJoinTap(),
+  jukeSkipVotes: (id) => (juke.skips[id] ? [...juke.skips[id]] : []),
 };

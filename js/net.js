@@ -37,7 +37,7 @@ const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
 const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '20';
+const BUILD = '21';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -161,6 +161,12 @@ export class LimboNet {
     this.onWallStrokeCb = null; // (data, peerId)
     this.onWallSyncReqCb = null; // (data, peerId)
     this.onWallSyncCb = null; // (data, peerId)
+    this.onJukeAddCb = null; // (data, peerId)
+    this.onJukeRemoveCb = null; // (data, peerId)
+    this.onJukePlayCb = null; // (data, peerId)
+    this.onJukeSkipVoteCb = null; // (data, peerId)
+    this.onJukeStateReqCb = null; // (data, peerId)
+    this.onJukeStateCb = null; // (data, peerId)
     this.onJamTickCb = null; // () — fires on our 15s DJ heartbeat while we hold the decks
     this.fallbackTimer = null;
     this.quietTimer = null;
@@ -472,6 +478,41 @@ export class LimboNet {
       wallSyncAction.onMessage = (d, info) => {
         if (this.onWallSyncCb) this.onWallSyncCb(d, info && info.peerId);
       };
+      /* Jukebox (build 21): synchronized queue playback in the sound room.
+         Everyone queues track links; every client plays the same track at
+         the same wall-clock offset through embedded players on their own
+         device — no audio relay, no DRM games. Created on every room like
+         the jam actions (cheap); only the sound room ever uses them. */
+      const jukeAddAction = room.makeAction('jukeAdd');
+      const jukeRemoveAction = room.makeAction('jukeRemove');
+      const jukePlayAction = room.makeAction('jukePlay');
+      const jukeSkipVoteAction = room.makeAction('jukeSkipVote');
+      const jukeStateReqAction = room.makeAction('jukeStateReq');
+      const jukeStateAction = room.makeAction('jukeState');
+      this.sendJukeAdd = (data) => jukeAddAction.send(data);
+      this.sendJukeRemove = (data) => jukeRemoveAction.send(data);
+      this.sendJukePlay = (data) => jukePlayAction.send(data);
+      this.sendJukeSkipVote = (data) => jukeSkipVoteAction.send(data);
+      this.sendJukeStateReq = (data) => jukeStateReqAction.send(data);
+      this.sendJukeState = (data) => jukeStateAction.send(data);
+      jukeAddAction.onMessage = (d, info) => {
+        if (this.onJukeAddCb) this.onJukeAddCb(d, info && info.peerId);
+      };
+      jukeRemoveAction.onMessage = (d, info) => {
+        if (this.onJukeRemoveCb) this.onJukeRemoveCb(d, info && info.peerId);
+      };
+      jukePlayAction.onMessage = (d, info) => {
+        if (this.onJukePlayCb) this.onJukePlayCb(d, info && info.peerId);
+      };
+      jukeSkipVoteAction.onMessage = (d, info) => {
+        if (this.onJukeSkipVoteCb) this.onJukeSkipVoteCb(d, info && info.peerId);
+      };
+      jukeStateReqAction.onMessage = (d, info) => {
+        if (this.onJukeStateReqCb) this.onJukeStateReqCb(d, info && info.peerId);
+      };
+      jukeStateAction.onMessage = (d, info) => {
+        if (this.onJukeStateCb) this.onJukeStateCb(d, info && info.peerId);
+      };
       room.onPeerJoin = (id) => {
         this.peers.set(id, true);
         this._hsTouch(String(id).slice(0, 8), 'joined');
@@ -597,6 +638,12 @@ export class LimboNet {
     this.sendWallStroke = null;
     this.sendWallSyncReq = null;
     this.sendWallSync = null;
+    this.sendJukeAdd = null;
+    this.sendJukeRemove = null;
+    this.sendJukePlay = null;
+    this.sendJukeSkipVote = null;
+    this.sendJukeStateReq = null;
+    this.sendJukeState = null;
   }
 
   /* ---------------- lobby presence (build 11) ----------------
