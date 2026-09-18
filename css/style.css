@@ -983,6 +983,12 @@ html, body {
 }
 .juke-queue { display: flex; flex-direction: column; gap: 6px; max-height: 22vh; overflow-y: auto; }
 .juke-empty { font-size: 12px; color: var(--ink-faint); letter-spacing: 0.08em; padding: 6px 0; }
+.juke-group-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-top: 6px; padding: 4px 2px;
+  font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: #8dff7a; border-bottom: 1px solid rgba(141, 255, 122, 0.25);
+}
 .juke-row {
   display: flex; align-items: center; gap: 8px;
   background: rgba(255, 255, 255, 0.04);
