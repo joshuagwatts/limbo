@@ -43,6 +43,16 @@ client synthesizes the sound locally on the grid, so the jam feels tight
 despite network latency. Tap tempo + BPM steppers let the DJ override the
 tempo; the friends list shows who's jamming.
 
+The sound room also has a **COMMUNITY WALL**: a monumental shared paint
+canvas on the north wall. Hit **🎨 paint** to go fullscreen and draw —
+strokes appear live for everyone in the room, and late joiners get the
+current canvas synced automatically. The room drinks the wall's colors:
+ambient light tints toward the painting's average hue (never near-black)
+and the booth glow pulses with paint energy. There's no wipe button —
+the only way paint leaves the wall is the **eraser** in paint mode
+(background-colored strokes over the same live path); otherwise the wall
+persists. The wall lives for the session — refresh and it starts blank again.
+
 Everything is static files — no build step, no backend, no audio files
 (all sound is synthesized live with WebAudio).
 

@@ -61,6 +61,28 @@
 
 <!-- jam room — only visible inside the sound room -->
 <button id="jam-btn" style="display:none">&#127925; jam</button>
+
+<!-- community wall paint mode — only visible inside the sound room (build 18) -->
+<button id="paint-btn" style="display:none">&#127912; paint</button>
+<div id="paint-overlay" style="display:none">
+  <div class="paint-head">
+    <span>&#127912; COMMUNITY WALL</span>
+    <div class="paint-head-btns">
+      <button id="paint-done">done</button>
+    </div>
+  </div>
+  <div id="paint-wrap"><canvas id="paint-canvas"></canvas></div>
+  <div class="paint-tools">
+    <div id="paint-palette"></div>
+    <button id="paint-eraser" aria-label="eraser">&#9003; erase</button>
+    <div id="paint-sizes">
+      <button data-size="6">S</button>
+      <button data-size="16" class="sel">M</button>
+      <button data-size="34">L</button>
+    </div>
+  </div>
+  <div class="paint-hint">it paints live for everyone in the sound room</div>
+</div>
 <div id="jam-panel">
   <div class="jam-head"><span>&#127925; JAM ROOM</span><button id="jam-close" aria-label="close">&#10005;</button></div>
   <div class="jam-transport">
@@ -145,6 +167,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=17"></script>
+<script type="module" src="js/game.js?v=18"></script>
 </body>
 </html>
