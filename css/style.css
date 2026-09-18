@@ -902,6 +902,14 @@ html, body {
   padding: 0 16px; cursor: pointer; touch-action: manipulation;
 }
 #paint-eraser.sel { border-style: solid; border-color: #fff; background: rgba(255, 255, 255, 0.14); }
+#paint-undo {
+  flex-shrink: 0; height: 44px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  color: #e8e8f2; font-family: inherit; font-size: 12px; letter-spacing: 0.08em;
+  padding: 0 16px; cursor: pointer; touch-action: manipulation;
+}
+#paint-undo:active { background: rgba(255, 255, 255, 0.16); }
 #paint-sizes { display: flex; gap: 8px; }
 #paint-sizes button {
   width: 44px; height: 44px; border-radius: 50%;
