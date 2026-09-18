@@ -198,7 +198,7 @@ Fly into a portal ring to travel. Fly into a glowing echo orb to collect it.
 - Touch controls are functional but basic; desktop is the primary target.
 - No VR mode, no persistence backend — those are phase 2+.
 
-## Jukebox (builds 21–23) — synchronized playback, not audio relay
+## Jukebox (builds 21–25) — synchronized playback, not audio relay
 
 The sound room has a jukebox: anyone can queue a track link, and everyone
 hears the same track at the same moment. The honest architecture: we do
@@ -207,11 +207,46 @@ it). Instead every client plays the same track at the same wall-clock
 offset through an embedded player on their own device — same song, same
 moment, ~1s sync. Good enough for hanging out.
 
-- **Supported providers:** YouTube (embedded IFrame player, seek-synced) and
-  SoundCloud (embedded widget, seek-synced). Anything else (Spotify,
-  Bandcamp, …) gets the **external path**: the room counts down together
-  ("press play in your app in 5…") and everyone presses play manually, plus
-  an "open in my app ↗" button per track.
+- **Supported providers:** YouTube (embedded IFrame player, seek-synced),
+  SoundCloud (embedded widget, seek-synced), and **direct audio links**
+  (build 25): paste an `.mp3`/`.ogg`/`.wav`/`.m4a`/`.aac`/`.opus`/`.flac`
+  URL and it plays through the game's **own WebAudio chain** — reverb and
+  delay sends, limiter, master volume, aura-ducking, all of it. The
+  sampler's "grab loop" captures it natively, no tab-capture needed.
+  Extensionless links (signed URLs, redirects) get one HEAD request at
+  queue time to sniff the content-type. Anything else (Spotify, Bandcamp,
+  …) gets the **external path**: the room counts down together
+  ("press play in your app in 5…") and everyone presses play manually,
+  plus an "open in my app ↗" button per track.
+- **Invisible players (build 25):** the YouTube/SoundCloud players live in
+  1px holders pinned off-screen (`position:fixed; left:-9999px`, zero
+  opacity, no pointer events) — never `display:none`, which throttles some
+  players, and never inside the panel, so closing the panel can't tear them
+  down. Nothing about them can intercept touches or overlap the game.
+- **Warm persistent players (build 25):** one YouTube player and one
+  SoundCloud widget are built once, inside the start-tap gesture (so
+  autoplay is allowed), and reused for every track via `cueVideoById` /
+  `widget.load()` — no per-track iframe churn, no reload flash. First play
+  after queueing starts inside your tap.
+- **Playback watchdog (build 25):** if a track shows no progress ~6s after
+  it should be playing, the client tries one recovery (re-cue / reload at
+  the room offset); if that fails too, the room gets the honest error
+  instead of silence. Autoplay blocks still surface the pulsing "tap to
+  join the music" button — one tap and you're in.
+- **Direct-audio paths (build 25):** a CORS-open host → fetch +
+  `decodeAudioData` into a buffer source on the jam bus (sample-accurate,
+  seekable, the premium path). A host **without** CORS headers → the
+  element just plays: audible and synced, but outside the chain, and the
+  room is told plainly ("that host blocks audio capture — it'll play, but
+  the sampler can't grab it"). `captureStream()` is **not** a fallback for
+  cross-origin media — Chromium throws `SecurityError: Cannot capture from
+  element with cross-origin data`, probed live. No fake capture is ever
+  claimed.
+- **SoundCloud API (build 25 research):** app registration is open again
+  (soundcloud.com/you/apps) with ~15,000 play-stream requests/day per
+  `client_id`. Native SC playback through api-v2 stream URLs is possible in
+  a future build once an app is registered and a client_id is provided —
+  keyless stream-URL scraping is not a shippable foundation.
 - **Link shapes that work (build 23):** full `soundcloud.com/artist/track`
   URLs **and** mobile share links (`on.soundcloud.com/xxx` — the kind the
   SoundCloud app's Share button gives you; the game resolves it to the
@@ -238,6 +273,20 @@ moment, ~1s sync. Good enough for hanging out.
 - **Advance duty:** whoever queued the finished track broadcasts the next
   `jukePlay`. Watchdog: if a track has been over >8s with no advance, any
   peer may advance — first broadcast wins (earliest `startedAt` wins ties).
+- **Phone vs desktop (build 25, verified on a phone-class browser —
+  390×844, touch, mobile UA, every interaction a real tap):** everything
+  above works on phones. WebAudio unlocks to `running` from the start tap;
+  a tap-queued mp3 from a CORS-open host plays on the WebAudio chain
+  (rms ≈ 0.12, same as desktop) with the friendly filename title and no
+  "tap to join" prompt on the gesture path; a no-CORS host plays audibly
+  through the plain-element fallback with the honest "that host blocks
+  audio capture" hint; hidden YT/SC players start from taps (`warm=true`)
+  and a 140-point touch sweep found zero iframe touch interception. The
+  jam "grab loop" captures a direct-audio track **natively on phones**
+  (`getDisplayMedia` undefined — no tab-capture API involved). The one
+  desktop-only feature in the whole room is the "🎙 sample the room"
+  button (build 24, tab-audio capture needs desktop Chrome/Edge) — and the
+  button says so itself on phones. No pretending.
 
 ## Room sampler (build 24) — sample the room mix
 
@@ -245,22 +294,34 @@ The sampler's "🎙 sample the room" button records the whole room mix
 (jukebox + jam + decks) straight into the next pad — same grab length as
 "grab loop" (2 bars on the clock, 4s free-time), same pad slot behavior.
 
-The honest part: the jukebox plays through YouTube/SoundCloud iframes,
-and **no page API can touch iframe audio** (no WebAudio node, no
+The honest part: YouTube/SoundCloud tracks play through iframes, and
+**no page API can touch iframe audio** (no WebAudio node, no
 `captureStream` — nothing). So the game uses the only browser-native path
 that exists: **tab-audio capture** (`getDisplayMedia`), which asks you to
 pick the LIMBO tab. That API exists on **desktop Chrome/Edge only** —
 mobile browsers don't offer any site a tab-audio track, so **on phones the
 button just says so**: "Room sampling needs Chrome or Edge on desktop —
 phones can't capture the embedded player's audio." No fake functionality.
+(Build 25 note: **direct audio links** — mp3 etc. from CORS-open hosts —
+ride the game's own WebAudio chain, so the sampler's "grab loop" captures
+those natively with no tab capture at all. `captureStream()` was probed as
+a bridge for no-CORS hosts and rejected: Chromium throws SecurityError on
+cross-origin media without CORS.)
 
 We also probed (build 24) whether a public SoundCloud track's direct
 stream URL could be resolved keylessly so the page could fetch the audio
 itself: no — the stream URLs 401 without a `client_id`, and the only
 client_ids floating around are undocumented ones scraped from SoundCloud's
-own player bundles. Not a shippable foundation, so mobile capture stays
-impossible via page APIs. The countdown + "open in my app" jukebox path is
-the phone story for now.
+own player bundles. Not a shippable foundation, so tab-audio capture of
+**embedded** (YouTube/SoundCloud iframe) playback stays impossible on
+phones via page APIs — the "🎙 sample the room" button stays
+**desktop-only** and says so on phones. But **direct audio links**
+(build 25: mp3 etc. from CORS-open hosts) ride the game's own WebAudio
+chain, so the jam pads' **"grab loop" captures them natively on phones**
+— verified on a phone-class browser (390×844, touch) with
+`getDisplayMedia` entirely undefined: ring hears the track, grab lands on
+a pad with real signal. That's the phone's sampling answer: paste an mp3
+link, sample it straight into a pad.
 
 Safety: the captured stream is recorded with `MediaRecorder` and **never
 connected to the WebAudio graph at all** — it cannot feed back into your
@@ -274,6 +335,7 @@ speakers. The share is released the instant the take lands.
   music" button.
 - **Limits:** no seeking UI (skip + re-add covers it), no Spotify direct
   playback (needs Premium + an OAuth app — use the external path), no
-  persistence across sessions, iframe audio can't route through the game's
-  WebAudio chain so the volume slider drives each provider player's own
-  volume API.
+  persistence across sessions. YouTube/SoundCloud iframe audio can't route
+  through the game's WebAudio chain, so the volume slider drives each
+  provider player's own volume API — but **direct audio links** (mp3 etc.)
+  ride the full chain natively, volume slider and all.

@@ -85,13 +85,15 @@
   <div class="juke-sub">UP NEXT</div>
   <div id="juke-queue" class="juke-queue"><div class="juke-empty">queue is empty — drop a link</div></div>
   <div class="juke-add-row">
-    <input id="juke-add-url" placeholder="paste a youtube / soundcloud link…" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <input id="juke-add-url" placeholder="paste a youtube / soundcloud / mp3 link…" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="juke-add-btn">queue it</button>
   </div>
   <div id="juke-hint" class="juke-hint">everyone hears the same track at the same time — on their own device</div>
-  <div id="juke-yt-holder" class="juke-embed" style="display:none"></div>
-  <div id="juke-sc-holder" class="juke-embed" style="display:none"></div>
 </div>
+<!-- jukebox provider players: persistent + permanently invisible (build 25).
+     They live at body level so closing the panel never tears them down. -->
+<div id="juke-yt-holder" class="juke-embed"></div>
+<div id="juke-sc-holder" class="juke-embed"></div>
 <div id="paint-overlay" style="display:none">
   <div class="paint-head">
     <span>&#127912; COMMUNITY WALL</span>
@@ -219,6 +221,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=24"></script>
+<script type="module" src="js/game.js?v=25"></script>
 </body>
 </html>
