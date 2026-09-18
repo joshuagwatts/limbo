@@ -533,3 +533,27 @@ scheduled), `● N here`. Updates on join/leave/error/handshake + 2s poll —
 the next human test reports the pill text instead of "no connection".
 Debug HUD (settings panel) now shows per-strategy load/join/connection
 counts, ICE retry countdown, and cid.
+
+## Build 31 — stuck-"connecting…" watchdog + ?debug=net
+Real two-phone build-30 test (Android Chrome + iPhone Safari, sound room):
+the pill said `○ connecting…` forever — discovery worked (peer announced
+via signaling) but the WebRTC data channel never opened, and Trystero fired
+neither `onPeerJoin` nor `onJoinError`, so nothing ever retried. Fix: a
+**handshake watchdog** on the 2s tick — if the pill is in "connecting…"
+with zero fully-joined peers for >20s (`WATCHDOG_MS`), it's treated as a
+failure: pill flips to `○ couldn't connect · retrying…` and the client
+takes the same leave+rejoin ICE-retry path (backoff preserved). Re-arms
+automatically — never sits silent. (Both phones were almost certainly on
+cellular symmetric NAT, so the TURN relay path in `buildIceServers` is the
+suspect; TURN allocate from the VM sandbox was inconclusive — the egress
+proxy mangles non-HTTP traffic — so TURN is UNVERIFIED, not proven-dead.)
+New **`?debug=net` on-screen net log** (build 31): when the URL carries
+`?debug=net`, a small toggleable monospace panel (tap header to collapse,
+z-index above the paint overlay) renders timestamped net events — strategy
+module load ok/fail, rooms joined per strategy, peer announced per strategy
++ initiator flag, nostr announce/signal frames, ICE connection state
+transitions per peer connection, local ICE candidate TYPES once gathering
+completes (`relay` present = TURN alive; host+srflx only = TURN dead),
+join errors, ICE retry countdowns, watchdog triggers. Zero UI change
+without the param. The 2s tick now runs on every platform (pill stays
+touch-only) so the watchdog protects desktop too.
