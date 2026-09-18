@@ -303,6 +303,49 @@ html, body {
 }
 #decks-btn:active { background: rgba(255, 194, 77, 0.25); }
 
+/* ---------- DJ source chooser (build 14) ---------- */
+#dj-chooser {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(2, 5, 12, 0.72);
+  display: flex; align-items: center; justify-content: center;
+}
+.dj-chooser-box {
+  width: min(360px, 88vw);
+  background: rgba(4, 8, 18, 0.96);
+  border: 1px solid rgba(255, 194, 77, 0.5); border-radius: 14px;
+  padding: 22px 20px;
+  text-align: center;
+}
+.dj-chooser-title {
+  color: #ffd88a; font-size: 12px; font-weight: 600;
+  letter-spacing: 0.24em; margin-bottom: 6px;
+}
+.dj-chooser-sub {
+  color: var(--ink-dim); font-size: 12px; letter-spacing: 0.12em;
+  margin-bottom: 14px;
+}
+#dj-src-hint {
+  color: #ffb35c; font-size: 12px; line-height: 1.5;
+  background: rgba(255, 194, 77, 0.08);
+  border: 1px solid rgba(255, 194, 77, 0.3); border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 12px;
+}
+#dj-chooser button:not(#dj-file-input) {
+  display: block; width: 100%;
+  margin: 8px 0; padding: 14px 12px; min-height: 48px;
+  background: rgba(255, 194, 77, 0.1);
+  border: 1px solid rgba(255, 194, 77, 0.45); border-radius: 10px;
+  color: #ffd88a; font-family: inherit; font-size: 12px;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  cursor: pointer; touch-action: manipulation;
+}
+#dj-chooser button:not(#dj-file-input):active { background: rgba(255, 194, 77, 0.25); }
+#dj-src-cancel { opacity: 0.65; }
+#dj-src-note {
+  min-height: 18px; margin-top: 8px;
+  color: var(--ink-faint); font-size: 11px; letter-spacing: 0.1em;
+}
+
 /* ---------- settings ---------- */
 #gear-btn {
   position: fixed; top: 14px; left: 14px; z-index: 46;
