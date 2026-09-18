@@ -198,7 +198,7 @@ Fly into a portal ring to travel. Fly into a glowing echo orb to collect it.
 - Touch controls are functional but basic; desktop is the primary target.
 - No VR mode, no persistence backend — those are phase 2+.
 
-## Jukebox (build 21) — synchronized playback, not audio relay
+## Jukebox (builds 21–23) — synchronized playback, not audio relay
 
 The sound room has a jukebox: anyone can queue a track link, and everyone
 hears the same track at the same moment. The honest architecture: we do
@@ -212,10 +212,29 @@ moment, ~1s sync. Good enough for hanging out.
   Bandcamp, …) gets the **external path**: the room counts down together
   ("press play in your app in 5…") and everyone presses play manually, plus
   an "open in my app ↗" button per track.
+- **Link shapes that work (build 23):** full `soundcloud.com/artist/track`
+  URLs **and** mobile share links (`on.soundcloud.com/xxx` — the kind the
+  SoundCloud app's Share button gives you; the game resolves it to the
+  canonical track through SoundCloud's oEmbed), `m.soundcloud.com` links, and links with tracking
+  query params (`?si=…`). If a short link won't resolve, the game hands it
+  to the widget anyway — SoundCloud usually resolves it server-side.
+- **Playlists (build 23):** paste a SoundCloud set (`…/sets/…`) or a YouTube
+  URL with `list=` and the game pulls the whole track list (keyless — via
+  the widget's `getSounds()` / the IFrame API's `getPlaylist()`) and queues
+  every track as its own item, grouped under a "🎶 playlist • N tracks"
+  header. Skip still works per track; the ✕ on the header pulls the whole
+  remaining set. Real track titles resolve (SoundCloud oEmbed / noembed).
+- **When a link won't play:** the panel says so — "couldn't load that link
+  — is it public?" (private/deleted/region-blocked tracks), and the queuer's
+  client moves the room on to the next track instead of stalling in silence.
+  If SoundCloud's player script itself won't load: "soundcloud isn't
+  loading — check your connection". If the browser blocks autoplay, a
+  pulsing "tap to join the music" button appears — one tap and you're in.
 - **Queue:** FIFO; anyone can queue, only the queuer can remove their track.
   Skip takes 2 votes. Late joiners get the full queue + now-playing and land
   mid-track via offset math. A 20s resync nudge re-seeks anyone who drifted
-  >2.5s.
+  >2.5s. The first link pasted into an empty queue starts playing
+  immediately, inside your tap.
 - **Advance duty:** whoever queued the finished track broadcasts the next
   `jukePlay`. Watchdog: if a track has been over >8s with no advance, any
   peer may advance — first broadcast wins (earliest `startedAt` wins ties).
