@@ -1047,5 +1047,7 @@ html, body {
   margin-top: 10px; font-size: 11px; letter-spacing: 0.08em;
   color: var(--ink-faint); text-align: center;
 }
-.juke-embed { margin-top: 10px; border-radius: 8px; overflow: hidden; }
-.juke-embed iframe { display: block; border: none; }
+/* Build 25: provider players are permanently invisible — 1px, off-screen,
+   no pointer events. Never display:none (that throttles some players). */
+.juke-embed { position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; overflow: hidden; }
+.juke-embed iframe { display: block; border: none; width: 1px !important; height: 1px !important; }
