@@ -238,6 +238,33 @@ moment, ~1s sync. Good enough for hanging out.
 - **Advance duty:** whoever queued the finished track broadcasts the next
   `jukePlay`. Watchdog: if a track has been over >8s with no advance, any
   peer may advance — first broadcast wins (earliest `startedAt` wins ties).
+
+## Room sampler (build 24) — sample the room mix
+
+The sampler's "🎙 sample the room" button records the whole room mix
+(jukebox + jam + decks) straight into the next pad — same grab length as
+"grab loop" (2 bars on the clock, 4s free-time), same pad slot behavior.
+
+The honest part: the jukebox plays through YouTube/SoundCloud iframes,
+and **no page API can touch iframe audio** (no WebAudio node, no
+`captureStream` — nothing). So the game uses the only browser-native path
+that exists: **tab-audio capture** (`getDisplayMedia`), which asks you to
+pick the LIMBO tab. That API exists on **desktop Chrome/Edge only** —
+mobile browsers don't offer any site a tab-audio track, so **on phones the
+button just says so**: "Room sampling needs Chrome or Edge on desktop —
+phones can't capture the embedded player's audio." No fake functionality.
+
+We also probed (build 24) whether a public SoundCloud track's direct
+stream URL could be resolved keylessly so the page could fetch the audio
+itself: no — the stream URLs 401 without a `client_id`, and the only
+client_ids floating around are undocumented ones scraped from SoundCloud's
+own player bundles. Not a shippable foundation, so mobile capture stays
+impossible via page APIs. The countdown + "open in my app" jukebox path is
+the phone story for now.
+
+Safety: the captured stream is recorded with `MediaRecorder` and **never
+connected to the WebAudio graph at all** — it cannot feed back into your
+speakers. The share is released the instant the take lands.
 - **DJ interaction:** while a DJ is live on the decks the jukebox
   auto-pauses ("DJ is live — jukebox paused"); when the DJ leaves, someone
   resumes the queue with a fresh `startedAt`.
