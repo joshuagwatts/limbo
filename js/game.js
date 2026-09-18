@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=17';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=17';
+import { LimboNet } from './net.js?v=18';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=18';
 
 /* ---------------- configuration ---------------- */
 
@@ -87,6 +87,13 @@ const friendsListEl   = document.getElementById('friends-list');
 const friendsLiveEl   = document.getElementById('friends-live');
 const friendAddInput  = document.getElementById('friend-add-input');
 const friendAddBtn    = document.getElementById('friend-add-btn');
+const paintBtn        = document.getElementById('paint-btn');
+const paintOverlay    = document.getElementById('paint-overlay');
+const paintCanvas     = document.getElementById('paint-canvas');
+const paintPaletteEl  = document.getElementById('paint-palette');
+const paintSizesEl    = document.getElementById('paint-sizes');
+const paintDoneBtn    = document.getElementById('paint-done');
+const paintEraserBtn  = document.getElementById('paint-eraser');
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -856,6 +863,8 @@ function djWinner() {
 function renderDjHud() {
   const inRoom = !!(active && active.key === SOUND_ROOM_KEY);
   if (jamBtn) jamBtn.style.display = inRoom ? '' : 'none';
+  if (paintBtn) paintBtn.style.display = inRoom ? '' : 'none';
+  if (!inRoom && paint.open) setPaintOpen(false); // paint mode can't leave the room
   if (decksBtn) {
     decksBtn.style.display = inRoom ? '' : 'none';
     if (inRoom) decksBtn.textContent = dj.active ? 'leave the decks' : 'take the decks';
@@ -1629,6 +1638,357 @@ function jamTriggerPad(i) {
   return true;
 }
 
+/* ---------------- community wall (build 18) ----------------
+   A shared 1024x512 paint canvas. One per client (not per room) so the
+   art survives realm hops; a THREE.CanvasTexture shows it on a monumental
+   wall plane inside the sound room. Strokes sync over Trystero; the room's
+   lights drink the wall's colors (hues + paint energy, never content). */
+const WALL_W = 1024, WALL_H = 512;
+const WALL_BG = '#0b0b13';
+const WALL_BG_RGB = [11, 11, 19];
+const WALL_AMB_BASE = 0x99aacc; // sound room's default ambient tint
+const wall = {
+  canvas: null, ctx: null, tex: null,
+  strokeCount: 0,      // local + remote strokes this session; >0 means "has ink"
+  strokeTimes: [],     // Date.now() of recent strokes (5s activity window)
+  texDirty: false,
+  answeredReq: new Set(), // wallSyncReq ids we've already answered
+};
+wall.canvas = document.createElement('canvas');
+wall.canvas.width = WALL_W;
+wall.canvas.height = WALL_H;
+wall.ctx = wall.canvas.getContext('2d', { willReadFrequently: true });
+wall.ctx.fillStyle = WALL_BG;
+wall.ctx.fillRect(0, 0, WALL_W, WALL_H);
+wall.tex = new THREE.CanvasTexture(wall.canvas);
+wall.tex.colorSpace = THREE.SRGBColorSpace;
+
+function wallMarkDirty() { wall.texDirty = true; }
+
+function wallPruneTimes() {
+  const now = Date.now();
+  while (wall.strokeTimes.length && now - wall.strokeTimes[0] > 5000) wall.strokeTimes.shift();
+}
+
+function wallNoteStroke() {
+  wall.strokeCount++;
+  wall.strokeTimes.push(Date.now());
+  wallPruneTimes();
+  wallMarkDirty();
+}
+
+/* Raw polyline draw — no bookkeeping. Callers note the stroke once per
+   gesture/message. pts are normalized 0..1; size is wall pixels. */
+function wallDrawSeg(pts, color, sizePx) {
+  const c = wall.ctx;
+  if (!c || !pts || pts.length === 0) return;
+  c.save();
+  c.strokeStyle = color;
+  c.fillStyle = color;
+  c.lineCap = 'round';
+  c.lineJoin = 'round';
+  c.lineWidth = Math.max(1, sizePx);
+  if (pts.length === 1) {
+    c.beginPath();
+    c.arc(pts[0][0] * WALL_W, pts[0][1] * WALL_H, sizePx / 2, 0, Math.PI * 2);
+    c.fill();
+  } else {
+    c.beginPath();
+    c.moveTo(pts[0][0] * WALL_W, pts[0][1] * WALL_H);
+    for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0] * WALL_W, pts[i][1] * WALL_H);
+    c.stroke();
+  }
+  c.restore();
+}
+
+function wallDrawPolyline(pts, color, sizePx) {
+  wallDrawSeg(pts, color, sizePx);
+  wallNoteStroke();
+}
+
+/* Strict shape check for incoming strokes — small messages only. */
+function wallValidStroke(d) {
+  if (!d || typeof d !== 'object') return false;
+  if (typeof d.c !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(d.c)) return false;
+  if (typeof d.s !== 'number' || !(d.s >= 1 && d.s <= 120)) return false;
+  if (!Array.isArray(d.pts) || d.pts.length === 0 || d.pts.length > 64) return false;
+  for (const p of d.pts) {
+    if (!Array.isArray(p) || p.length !== 2) return false;
+    if (typeof p[0] !== 'number' || typeof p[1] !== 'number') return false;
+    if (!(p[0] >= 0 && p[0] <= 1 && p[1] >= 0 && p[1] <= 1)) return false;
+  }
+  return true;
+}
+
+function handleWallStroke(d, peerId) {
+  if (!wallValidStroke(d)) return;
+  wallDrawPolyline(d.pts, d.c, d.s);
+  if (paint.open) paintMirror(); // someone's painting while we paint
+}
+
+/* Late-joiner sync: downscaled JPEG snapshot. */
+function wallSnapshot() {
+  try {
+    const t = document.createElement('canvas');
+    t.width = 512;
+    t.height = 256;
+    t.getContext('2d').drawImage(wall.canvas, 0, 0, 512, 256);
+    return t.toDataURL('image/jpeg', 0.7);
+  } catch (e) { return null; }
+}
+
+function wallApplySnapshot(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      wall.ctx.drawImage(img, 0, 0, WALL_W, WALL_H);
+      wall.strokeCount = Math.max(wall.strokeCount, 1); // it has ink now
+      wallMarkDirty();
+      resolve(true);
+    };
+    img.onerror = () => resolve(false);
+    img.src = dataUrl;
+  });
+}
+
+function handleWallSyncReq(d, peerId) {
+  if (!d || typeof d.reqId !== 'string' || !d.reqId) return;
+  if (wall.answeredReq.has(d.reqId)) return; // answer each request once
+  if (wall.strokeCount <= 0) return;         // blank wall: nothing to share
+  wall.answeredReq.add(d.reqId);
+  if (wall.answeredReq.size > 40) {
+    const oldest = wall.answeredReq.values().next().value;
+    wall.answeredReq.delete(oldest);
+  }
+  if (!net.enabled || !net.sendWallSync) return;
+  try {
+    const img = wallSnapshot();
+    if (img) net.sendWallSync({ reqId: d.reqId, img });
+  } catch (e) { /* best effort */ }
+}
+
+function handleWallSync(d, peerId) {
+  if (!d || typeof d.img !== 'string' || !d.img.startsWith('data:image/')) return;
+  wallApplySnapshot(d.img);
+}
+
+/* NOTE: there is deliberately no wall-clear action. The only way paint
+   leaves the wall is the eraser tool in paint mode (bg-colored strokes
+   over the same wallStroke path) — otherwise the wall persists. */
+
+/* 8x8 downsample: average color + ink coverage + recent-stroke activity.
+   Colors and paint energy only — no content recognition. */
+const wallSampleCanvas = document.createElement('canvas');
+wallSampleCanvas.width = 8;
+wallSampleCanvas.height = 8;
+const wallSampleCtx = wallSampleCanvas.getContext('2d', { willReadFrequently: true });
+const _wallTmpColor = new THREE.Color(); // scratch for the room-reactivity lerp
+/* One room-reactivity sample: read the wall's colors + paint energy and
+   retarget the room lights. Called ~1s from the sound room's update(). */
+function wallReactSample(a) {
+  const s = wallSample();
+  if (wall.strokeCount === 0 || s.coverage <= 0.001) {
+    a.wallTarget.set(WALL_AMB_BASE);
+  } else {
+    // 55% toward the wall's average hue — never near-black, since the
+    // other 45% is always the room's base tint.
+    a.wallTarget.set(WALL_AMB_BASE).lerp(_wallTmpColor.setRGB(s.r, s.g, s.b), 0.55);
+  }
+  const energy = Math.min(1, (s.recent / 6) * 0.8 + s.coverage * 1.5);
+  a.wallPulse += (energy - a.wallPulse) * 0.5;
+}
+function wallSample() {
+  wallPruneTimes();
+  let r = 0, g = 0, b = 0, ink = 0;
+  try {
+    wallSampleCtx.drawImage(wall.canvas, 0, 0, 8, 8);
+    const px = wallSampleCtx.getImageData(0, 0, 8, 8).data;
+    for (let i = 0; i < 64; i++) {
+      const R = px[i * 4], G = px[i * 4 + 1], B = px[i * 4 + 2];
+      r += R; g += G; b += B;
+      const dist = Math.abs(R - WALL_BG_RGB[0]) + Math.abs(G - WALL_BG_RGB[1]) + Math.abs(B - WALL_BG_RGB[2]);
+      if (dist > 24) ink++;
+    }
+  } catch (e) { /* keep zeros */ }
+  return {
+    r: r / 64 / 255, g: g / 64 / 255, b: b / 64 / 255,
+    coverage: ink / 64,
+    recent: wall.strokeTimes.length,
+    strokes: wall.strokeCount,
+  };
+}
+
+/* ---------------- paint mode UI (build 18) ----------------
+   Fullscreen overlay: the wall aspect-fit, pointer drawing, palette +
+   brush sizes. Local strokes render immediately on the wall canvas;
+   chunks flush over Trystero every ~80ms while drawing and on release. */
+const PAINT_COLORS = [
+  '#ffffff', '#000000', '#7ae0ff', '#b388ff', '#ff7ad9',
+  '#ffc24d', '#8dff7a', '#ffe95c', '#ff5c5c', '#5cc8ff',
+];
+const paint = {
+  open: false,
+  color: '#7ae0ff',
+  size: 16,
+  drawing: false,
+  pts: [],          // normalized [u,v] of the current stroke
+  lastFlush: 0,
+  mirrorQueued: false,
+};
+const paintCtx = paintCanvas ? paintCanvas.getContext('2d') : null;
+if (paintCanvas) { paintCanvas.width = WALL_W; paintCanvas.height = WALL_H; }
+
+function paintBuildPalette() {
+  if (!paintPaletteEl || paintPaletteEl.children.length) return;
+  for (const c of PAINT_COLORS) {
+    const b = document.createElement('button');
+    b.className = 'paint-swatch' + (c === paint.color ? ' sel' : '');
+    b.style.background = c;
+    b.setAttribute('aria-label', c);
+    b.addEventListener('click', () => {
+      paint.color = c;
+      paintPaletteEl.querySelectorAll('.paint-swatch').forEach((x) => x.classList.toggle('sel', x === b));
+      if (paintEraserBtn) paintEraserBtn.classList.remove('sel');
+      b.blur();
+    });
+    paintPaletteEl.appendChild(b);
+  }
+}
+
+function paintMirror() {
+  // redraw the overlay from the wall canvas (remote strokes while open)
+  if (!paint.open || !paintCtx || paint.mirrorQueued) return;
+  paint.mirrorQueued = true;
+  requestAnimationFrame(() => {
+    paint.mirrorQueued = false;
+    if (!paint.open || !paintCtx) return;
+    paintCtx.drawImage(wall.canvas, 0, 0, WALL_W, WALL_H);
+  });
+}
+
+function paintUvFromEvent(e) {
+  const r = paintCanvas.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  const u = (e.clientX - r.left) / r.width;
+  const v = (e.clientY - r.top) / r.height;
+  if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+  return [u, v];
+}
+
+function paintDrawLocalSeg(a, b) {
+  // wall canvas (uv space)
+  wallDrawSeg([a, b], paint.color, paint.size);
+  // overlay mirror (wall-pixel space; canvas is WALL_W x WALL_H)
+  if (paintCtx) {
+    paintCtx.save();
+    paintCtx.strokeStyle = paint.color;
+    paintCtx.lineCap = 'round';
+    paintCtx.lineJoin = 'round';
+    paintCtx.lineWidth = paint.size;
+    paintCtx.beginPath();
+    paintCtx.moveTo(a[0] * WALL_W, a[1] * WALL_H);
+    paintCtx.lineTo(b[0] * WALL_W, b[1] * WALL_H);
+    paintCtx.stroke();
+    paintCtx.restore();
+  }
+}
+
+function paintFlush() {
+  if (!paint.pts.length) return;
+  const chunk = paint.pts.splice(0, 60); // cap message size
+  wallNoteStroke(); // one gesture's worth of bookkeeping per flush
+  if (net.enabled && net.sendWallStroke && active && active.key === SOUND_ROOM_KEY) {
+    try {
+      net.sendWallStroke({
+        n: myName,
+        c: paint.color,
+        s: paint.size,
+        pts: chunk.map((p) => [Math.round(p[0] * 1000) / 1000, Math.round(p[1] * 1000) / 1000]),
+      });
+    } catch (e) { /* best effort */ }
+  }
+  paint.lastFlush = Date.now();
+}
+
+function paintEndStroke() {
+  if (!paint.drawing) return;
+  paint.drawing = false;
+  paintFlush();
+  paint.pts.length = 0;
+}
+
+function setPaintOpen(open) {
+  paint.open = !!open;
+  if (paintOverlay) paintOverlay.style.display = paint.open ? '' : 'none';
+  chatFocused = paint.open; // reuse the chat guard: keys never fly the wisp mid-paint
+  if (paint.open) {
+    paintBuildPalette();
+    if (paintCtx) paintCtx.drawImage(wall.canvas, 0, 0, WALL_W, WALL_H);
+  } else {
+    paintEndStroke();
+  }
+}
+
+if (paintCanvas) {
+  paintCanvas.addEventListener('pointerdown', (e) => {
+    if (!paint.open) return;
+    e.preventDefault();
+    const uv = paintUvFromEvent(e);
+    if (!uv) return;
+    paint.drawing = true;
+    paint.pts = [uv];
+    paint.lastFlush = Date.now();
+    wallDrawSeg([uv], paint.color, paint.size); // dot for taps
+    if (paintCtx) {
+      paintCtx.save();
+      paintCtx.fillStyle = paint.color;
+      paintCtx.beginPath();
+      paintCtx.arc(uv[0] * WALL_W, uv[1] * WALL_H, paint.size / 2, 0, Math.PI * 2);
+      paintCtx.fill();
+      paintCtx.restore();
+    }
+    try { paintCanvas.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  paintCanvas.addEventListener('pointermove', (e) => {
+    if (!paint.open || !paint.drawing) return;
+    e.preventDefault();
+    const uv = paintUvFromEvent(e);
+    if (!uv) return;
+    const prev = paint.pts[paint.pts.length - 1];
+    paint.pts.push(uv);
+    paintDrawLocalSeg(prev, uv);
+    if (Date.now() - paint.lastFlush >= 80 || paint.pts.length >= 60) paintFlush();
+  });
+  const endEv = (e) => { if (paint.open) paintEndStroke(); };
+  paintCanvas.addEventListener('pointerup', endEv);
+  paintCanvas.addEventListener('pointercancel', endEv);
+}
+if (paintSizesEl) {
+  paintSizesEl.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => {
+      paint.size = parseInt(b.dataset.size, 10) || 16;
+      paintSizesEl.querySelectorAll('button').forEach((x) => x.classList.toggle('sel', x === b));
+      b.blur();
+    });
+  });
+}
+if (paintDoneBtn) paintDoneBtn.addEventListener('click', () => { setPaintOpen(false); paintDoneBtn.blur(); });
+/* Eraser: just the wall's background color on the normal stroke path.
+   Eraser strokes broadcast like any other stroke — the only way paint
+   leaves the wall is painting over it. */
+if (paintEraserBtn) paintEraserBtn.addEventListener('click', () => {
+  paint.color = WALL_BG;
+  paintEraserBtn.classList.add('sel');
+  if (paintPaletteEl) paintPaletteEl.querySelectorAll('.paint-swatch').forEach((x) => x.classList.remove('sel'));
+  paintEraserBtn.blur();
+});
+if (paintBtn) {
+  paintBtn.addEventListener('click', () => {
+    setPaintOpen(!paint.open);
+    paintBtn.blur();
+  });
+}
+
 /* ---------------- who's jamming ---------------- */
 
 function jamMarkJammer(name) {
@@ -1891,7 +2251,8 @@ function buildSoundRoom(textures) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x020204);
   scene.fog = new THREE.FogExp2(0x0a0610, 0.012);
-  scene.add(new THREE.AmbientLight(0x99aacc, 0.5));
+  const amb = new THREE.AmbientLight(WALL_AMB_BASE, 0.5); // tinted by the community wall (build 18)
+  scene.add(amb);
 
   // Floor.
   const floor = new THREE.Mesh(
@@ -1988,6 +2349,23 @@ function buildSoundRoom(textures) {
   const dust = makeDust(200, 40, accent, 0.6);
   scene.add(dust.pts);
 
+  // Community wall (build 18): a monumental shared paint canvas on the
+  // north wall behind the booth. MeshBasicMaterial so the art reads in the
+  // dark; the CanvasTexture updates live as strokes land.
+  const wallFrame = new THREE.Group();
+  const wallBack = new THREE.Mesh(
+    new THREE.PlaneGeometry(17.4, 9.4),
+    new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 0.35, roughness: 0.4, metalness: 0.6 })
+  );
+  const wallMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(16, 8),
+    new THREE.MeshBasicMaterial({ map: wall.tex })
+  );
+  wallMesh.position.z = 0.08;
+  wallFrame.add(wallBack, wallMesh);
+  wallFrame.position.set(0, 9, -33.4);
+  scene.add(wallFrame);
+
   // Return portal to the Nexus.
   const { group, ring } = makePortal(makeSoundTexture(), accent, 'RETURN', 1.7, 0.14);
   group.position.set(0, 3, 26);
@@ -2001,7 +2379,11 @@ function buildSoundRoom(textures) {
     gallery: galleryFiles, // realm artwork files on the walls — tests check these are real
     spawn: new THREE.Vector3(0, 2, 20), spawnYaw: 0, // face the booth (-Z)
     bound: 'realm',
-    anim: { dust, lightA, lightB, boothGlow, bass: 0 },
+    anim: {
+      dust, lightA, lightB, boothGlow, bass: 0,
+      amb, wallMesh, wallSampleAt: 0, wallPulse: 0,
+      wallTarget: new THREE.Color(WALL_AMB_BASE),
+    },
     attunedShown: true, // n/a: no echoes here, nothing to attune
     setBass(v) { this.anim.bass = Math.max(0, Math.min(1, v)); },
     update(dt, t) {
@@ -2014,10 +2396,21 @@ function buildSoundRoom(textures) {
         pt.pos.copy(pt.group.position);
       }
       // The room breathes with the music; idle when nobody's on the decks.
+      // Community wall (build 18): ~1s sampler reads the wall's average
+      // color + paint energy and tints the room. Blank wall -> default look.
+      // (elapsedTime, not accumulated dt: dt is clamped and headless GPUs
+      // run few frames per real second.)
+      const a = this.anim;
+      if (t - (a.wallSampleAt || 0) >= 1) {
+        a.wallSampleAt = t;
+        wallReactSample(a);
+      }
+      a.amb.color.lerp(a.wallTarget, Math.min(1, dt * 1.5));
+      const wp = a.wallPulse;
       const pulse = 1 + bass * 2.2 + Math.sin(t * 1.4) * 0.08;
-      lightA.intensity = 1.2 * pulse;
-      lightB.intensity = 1.2 * (2 - pulse) + 1.2 + bass; // counter-phase shimmer
-      boothGlow.material.opacity = 0.4 + bass * 0.5;
+      lightA.intensity = 1.2 * pulse * (1 + wp * 0.15);
+      lightB.intensity = (1.2 * (2 - pulse) + 1.2 + bass) * (1 + wp * 0.15); // counter-phase shimmer
+      boothGlow.material.opacity = 0.4 + bass * 0.5 + wp * 0.12;
       const gs = 16 + bass * 6;
       boothGlow.scale.set(gs, gs * 0.62, 1);
       scene.fog.density = 0.012 + bass * 0.008;
@@ -2527,6 +2920,17 @@ function goTo(key) {
     audio.setRoot(active.root);
     showTitleCard(active.name);
     renderDjHud(); // show/hide the decks button + DJ line for this room
+    // Community wall (build 18): late joiner asks the room for the current
+    // canvas. Delayed so the data channel has a moment to connect; peers
+    // with ink answer once per reqId (see handleWallSyncReq).
+    if (key === SOUND_ROOM_KEY && net.enabled && net.sendWallSyncReq) {
+      const reqId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+      setTimeout(() => {
+        if (active && active.key === SOUND_ROOM_KEY && net.sendWallSyncReq) {
+          try { net.sendWallSyncReq({ reqId }); } catch (e) { /* best effort */ }
+        }
+      }, 2000);
+    }
     fadeEl.classList.remove('on');
     lastTransition = clock.elapsedTime;
     setTimeout(() => { transitioning = false; }, 700);
@@ -2777,6 +3181,10 @@ net.onRemoteTrackCb = (track, stream, peerId) => {
 net.onJamClockCb = handleJamClock;
 net.onJamNoteCb = handleJamNote;
 net.onJamPadCb = handleJamPad;
+// Community wall (build 18): paint strokes + late-joiner sync.
+net.onWallStrokeCb = handleWallStroke;
+net.onWallSyncReqCb = handleWallSyncReq;
+net.onWallSyncCb = handleWallSync;
 net.onJamTickCb = () => jamBroadcastClock(); // 15s clock re-broadcast while we hold the decks
 
 /* ---------------- settings panel ----------------
@@ -3035,6 +3443,12 @@ function loop() {
     if (active.key === SOUND_ROOM_KEY && active.setBass) active.setBass(djBassSmooth);
   }
 
+  // Community wall (build 18): push new strokes to the GPU texture.
+  if (wall.texDirty && wall.tex) {
+    wall.tex.needsUpdate = true;
+    wall.texDirty = false;
+  }
+
   updatePlayer(dt);
   checkPortals();
   checkEchoes();
@@ -3236,4 +3650,45 @@ window.__limbo = {
     const b = jam.pads[i];
     return b ? Array.from(b.getChannelData(0).slice(0, n || 256)) : null;
   },
+  // community wall (build 18)
+  wallState: () => ({
+    strokes: wall.strokeCount, w: WALL_W, h: WALL_H,
+    hasTexture: !!(wall.tex && wall.tex.isCanvasTexture),
+    planeInScene: !!(worlds.soundroom && worlds.soundroom.anim && worlds.soundroom.anim.wallMesh),
+    paintOpen: paint.open,
+  }),
+  wallTex: () => wall.tex,
+  wallPixel: (x, y) => {
+    const d = wall.ctx.getImageData(x | 0, y | 0, 1, 1).data;
+    return [d[0], d[1], d[2], d[3]];
+  },
+  wallStrokeLocal: (pts, color, size) => { wallDrawPolyline(pts, color, size); return wall.strokeCount; },
+  wallSample: () => wallSample(),
+  wallAmbColor: () => {
+    const a = worlds.soundroom && worlds.soundroom.anim;
+    return a && a.amb ? a.amb.color.getHex() : null;
+  },
+  // deterministic room-reactivity check: sample now, snap the light to target
+  wallReactSnap: () => {
+    const a = worlds.soundroom && worlds.soundroom.anim;
+    if (!a || !a.amb) return null;
+    wallReactSample(a);
+    a.amb.color.copy(a.wallTarget);
+    return a.amb.color.getHex();
+  },
+  wallOpen: (o) => setPaintOpen(o === undefined ? true : !!o),
+  wallPaintVisible: () => !!(paintBtn && paintBtn.style.display !== 'none'),
+  wallValid: (d) => wallValidStroke(d),
+  wallLoopback: (d) => {
+    const ok = wallValidStroke(d);
+    if (net.sendWallStroke) { try { net.sendWallStroke(d); } catch (e) {} }
+    handleWallStroke(d, 'loopback');
+    return ok;
+  },
+  wallSnapshot: () => wallSnapshot(),
+  wallApplySnapshot: (u) => wallApplySnapshot(u),
+  wallSendSyncReq: (id) => { try { return !!(net.sendWallSyncReq && net.sendWallSyncReq({ reqId: id })); } catch (e) { return false; } },
+  wallHandleSyncReq: (d, pid) => handleWallSyncReq(d, pid || 'test-peer'),
+  wallAnswered: () => [...wall.answeredReq],
+  wallDjWinner: () => djWinner(),
 };

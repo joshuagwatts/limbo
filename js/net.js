@@ -37,7 +37,7 @@ const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
 const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '17';
+const BUILD = '18';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -154,6 +154,13 @@ export class LimboNet {
     this.onJamClockCb = null; // (data, peerId)
     this.onJamNoteCb = null; // (data, peerId)
     this.onJamPadCb = null; // (data, peerId)
+    // --- community wall (build 18) ---
+    this.sendWallStroke = null; // (data) — {n, c, s, pts}, any painter -> room
+    this.sendWallSyncReq = null; // (data) — {reqId}, late joiner -> room
+    this.sendWallSync = null; // (data) — {reqId, img}, peer with ink -> requester
+    this.onWallStrokeCb = null; // (data, peerId)
+    this.onWallSyncReqCb = null; // (data, peerId)
+    this.onWallSyncCb = null; // (data, peerId)
     this.onJamTickCb = null; // () — fires on our 15s DJ heartbeat while we hold the decks
     this.fallbackTimer = null;
     this.quietTimer = null;
@@ -447,6 +454,24 @@ export class LimboNet {
       jamPadAction.onMessage = (d, info) => {
         if (this.onJamPadCb) this.onJamPadCb(d, info && info.peerId);
       };
+      /* Community wall (build 18): shared paint canvas in the sound room.
+         Created on every room like the jam actions (cheap); only the
+         sound room ever uses them. */
+      const wallStrokeAction = room.makeAction('wallStroke');
+      const wallSyncReqAction = room.makeAction('wallSyncReq');
+      const wallSyncAction = room.makeAction('wallSync');
+      this.sendWallStroke = (data) => wallStrokeAction.send(data);
+      this.sendWallSyncReq = (data) => wallSyncReqAction.send(data);
+      this.sendWallSync = (data) => wallSyncAction.send(data);
+      wallStrokeAction.onMessage = (d, info) => {
+        if (this.onWallStrokeCb) this.onWallStrokeCb(d, info && info.peerId);
+      };
+      wallSyncReqAction.onMessage = (d, info) => {
+        if (this.onWallSyncReqCb) this.onWallSyncReqCb(d, info && info.peerId);
+      };
+      wallSyncAction.onMessage = (d, info) => {
+        if (this.onWallSyncCb) this.onWallSyncCb(d, info && info.peerId);
+      };
       room.onPeerJoin = (id) => {
         this.peers.set(id, true);
         this._hsTouch(String(id).slice(0, 8), 'joined');
@@ -504,6 +529,7 @@ export class LimboNet {
       this.peers.clear();
       this.sendWisp = this.sendChat = null;
       this.sendJamClock = this.sendJamNote = this.sendJamPad = null;
+      this.sendWallStroke = this.sendWallSyncReq = this.sendWallSync = null;
       this._joinWithStrategy();
       // Keep presence on the working strategy too: the lobby rejoins with
       // the new selfId; stale entries are dropped by the rejoin.
@@ -568,6 +594,9 @@ export class LimboNet {
     this.sendJamClock = null;
     this.sendJamNote = null;
     this.sendJamPad = null;
+    this.sendWallStroke = null;
+    this.sendWallSyncReq = null;
+    this.sendWallSync = null;
   }
 
   /* ---------------- lobby presence (build 11) ----------------
