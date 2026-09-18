@@ -12,6 +12,8 @@ export class AudioEngine {
     this.muted = false;
     this.oscs = [];
     this.currentRoot = 110;
+    this._auraDucked = false; // set pre-init if the game starts in the sound room
+    this._lastAuraRamp = null; // {target, timeConstant} — test seam proving ramps, not hard cuts
   }
 
   /* Must be called from a user gesture (the "click to drift" button). */
@@ -22,10 +24,17 @@ export class AudioEngine {
     const ctx = (this.ctx = new AC());
     this.currentRoot = rootFreq;
 
-    // Master — kept low, fades in gently.
+    // Master — kept low, fades in gently. This is the GAME master: jam
+    // instruments, metronome, sampler and UI-adjacent audio all land here.
     this.master = ctx.createGain();
     this.master.gain.value = 0;
     this.master.connect(ctx.destination);
+
+    // Aura bus — the generative ambient pad (and echo chimes) live here so
+    // the aura can be ducked independently of everything else on the master.
+    this.aura = ctx.createGain();
+    this.aura.gain.value = this._auraDucked ? 0 : 1;
+    this.aura.connect(this.master);
 
     // Pad bus -> lowpass filter (the "air" of the room).
     this.filter = ctx.createBiquadFilter();
@@ -36,7 +45,7 @@ export class AudioEngine {
     this.padBus = ctx.createGain();
     this.padBus.gain.value = 0.55;
     this.padBus.connect(this.filter);
-    this.filter.connect(this.master);
+    this.filter.connect(this.aura);
 
     // Slow LFO sweeping the filter cutoff — the pad "breathes".
     const lfo = ctx.createOscillator();
@@ -59,7 +68,7 @@ export class AudioEngine {
     this.delay.connect(fb);
     fb.connect(this.delay);
     this.delay.connect(wet);
-    wet.connect(this.master);
+    wet.connect(this.aura);
 
     // Three detuned voices: sine root, beating triangle, soft octave.
     const voices = [
@@ -94,6 +103,21 @@ export class AudioEngine {
     }
   }
 
+  /* Duck (or restore) the aura layer — used entering/leaving the sound room.
+   * cancelScheduledValues + setTargetAtTime: rapid toggles never stack
+   * ramps and never click. Pre-init calls are remembered and applied in init()
+   * (aura starts muted, no fade needed). Everything on this.master (jam,
+   * metronome, decks, jukebox, mute toggle) is untouched. */
+  setAuraDucked(ducked, fadeSec = 1.5) {
+    this._auraDucked = !!ducked;
+    if (!this.started || !this.aura) return;
+    const t = this.ctx.currentTime;
+    const tc = Math.max(0.05, fadeSec / 3); // ~95% of the way there within fadeSec
+    this.aura.gain.cancelScheduledValues(t);
+    this.aura.gain.setTargetAtTime(this._auraDucked ? 0 : 1, t, tc);
+    this._lastAuraRamp = { target: this._auraDucked ? 0 : 1, timeConstant: tc };
+  }
+
   /* Soft pluck on echo pickup. `step` climbs a pentatonic ladder so
    * consecutive pickups always sound consonant. */
   chime(step) {
@@ -113,7 +137,7 @@ export class AudioEngine {
     g.gain.exponentialRampToValueAtTime(0.5, t + 0.015);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
     o.connect(g);
-    g.connect(this.master);
+    g.connect(this.aura);
     g.connect(this.delay); // let it bloom in the cavern
     o.start(t);
     o.stop(t + 1.8);

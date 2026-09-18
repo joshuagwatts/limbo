@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=21';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=21';
+import { LimboNet } from './net.js?v=22';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=22';
 
 /* ---------------- configuration ---------------- */
 
@@ -4113,6 +4113,9 @@ function goTo(key) {
     clearTrail();
     realmNameEl.textContent = active.name;
     audio.setRoot(active.root);
+    // Build 22: the ambient aura ducks out in the sound room (jam, decks,
+    // jukebox and metronome all ride the game master and are unaffected).
+    audio.setAuraDucked(key === SOUND_ROOM_KEY);
     showTitleCard(active.name);
     renderDjHud(); // show/hide the decks button + DJ line for this room
     // Community wall (build 18): late joiner asks the room for the current
@@ -4825,6 +4828,15 @@ window.__limbo = {
   jamClockIn: (d, pid) => handleJamClock(d, pid),
   jamPlayLocal: (m, v) => jamPlayLocal(m, v),
   jamGrabLoop: () => jamGrabLoop(),
+  // aura ducking (build 22): ambient pad fades out in the sound room.
+  // gain reads the live AudioParam; lastRamp proves a ramp (not a hard cut).
+  auraState: () => ({
+    started: audio.started,
+    ducked: !!audio._auraDucked,
+    gain: audio.aura ? audio.aura.gain.value : null,
+    lastRamp: audio._lastAuraRamp,
+  }),
+  setAuraDucked: (d) => audio.setAuraDucked(d),
   jamTriggerPad: (i) => jamTriggerPad(i),
   jamOnBecomeDj: () => jamOnBecomeDj(),
   jamStopClock: () => jamStopClock(),
