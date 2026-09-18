@@ -706,6 +706,115 @@ html, body {
   margin-top: 8px; min-height: 14px;
 }
 .jam-jammers { font-size: 12px; letter-spacing: 0.08em; color: #9fd8ff; }
+.jammer-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 5px; vertical-align: baseline;
+}
+
+/* ---------- jam room: immersive restyle (build 20) ---------- */
+/* dark glass hardware feel; --inst carries the selected instrument's color */
+#jam-panel {
+  --inst: #37e6ff;
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(55, 230, 255, 0.07), transparent 55%),
+    rgba(4, 8, 18, 0.96);
+  border-top: 1px solid var(--inst);
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.6), 0 -2px 24px -8px var(--inst);
+  transition: transform 0.25s ease, border-color 0.3s ease;
+}
+.jam-groove-row {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px;
+}
+#jam-beat-dots { display: flex; gap: 7px; flex: 1; }
+#jam-beat-dots span {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: rgba(140, 170, 255, 0.15);
+  border: 1px solid rgba(140, 170, 255, 0.25);
+  transition: background 0.08s ease, box-shadow 0.08s ease;
+}
+#jam-beat-dots span.on {
+  background: var(--inst);
+  border-color: var(--inst);
+  box-shadow: 0 0 12px var(--inst);
+}
+#jam-beat-dots span.on:first-child { transform: scale(1.25); }
+#jam-metro-toggle {
+  background: rgba(140, 170, 255, 0.06);
+  border: 1px solid rgba(140, 170, 255, 0.35); border-radius: 10px;
+  color: var(--ink-dim); font-family: inherit; font-size: 11px;
+  letter-spacing: 0.15em; text-transform: uppercase;
+  min-height: 44px; padding: 10px 14px;
+  cursor: pointer; touch-action: manipulation;
+}
+#jam-metro-toggle.sel {
+  color: #fff; border-color: var(--inst);
+  background: color-mix(in srgb, var(--inst) 18%, transparent);
+  box-shadow: 0 0 14px -4px var(--inst);
+}
+#jam-metro-vol { flex: 1; accent-color: var(--inst); }
+.jam-inst-tabs { display: flex; gap: 8px; }
+.jam-inst-tab {
+  flex: 1; min-height: 48px;
+  background: rgba(140, 170, 255, 0.05);
+  border: 1px solid rgba(140, 170, 255, 0.28); border-radius: 12px;
+  color: var(--ink-dim); font-family: inherit; font-size: 11px;
+  letter-spacing: 0.25em; text-transform: uppercase;
+  cursor: pointer; touch-action: manipulation;
+  transition: all 0.15s ease;
+}
+.jam-inst-tab.sel[data-inst="lead"]  { color: #fff; border-color: #37e6ff; background: rgba(55, 230, 255, 0.16);  box-shadow: 0 0 16px -4px #37e6ff; }
+.jam-inst-tab.sel[data-inst="bass"]  { color: #fff; border-color: #b388ff; background: rgba(179, 136, 255, 0.16); box-shadow: 0 0 16px -4px #b388ff; }
+.jam-inst-tab.sel[data-inst="drums"] { color: #fff; border-color: #ffc24d; background: rgba(255, 194, 77, 0.16);  box-shadow: 0 0 16px -4px #ffc24d; }
+.jam-inst-tab.sel[data-inst="pad"]   { color: #fff; border-color: #ff7ad9; background: rgba(255, 122, 217, 0.16); box-shadow: 0 0 16px -4px #ff7ad9; }
+.jam-inst-panel { margin-top: 10px; }
+#jam-bass-keys {
+  display: flex; height: 118px; margin-top: 10px;
+  border: 1px solid rgba(179, 136, 255, 0.35); border-radius: 10px;
+  overflow: hidden; background: #0d0a1e;
+}
+#jam-drums {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  margin-top: 2px;
+}
+.jam-drum {
+  min-height: 76px; border-radius: 14px;
+  background: radial-gradient(100% 100% at 50% 0%, rgba(255, 194, 77, 0.14), rgba(255, 194, 77, 0.03));
+  border: 1px solid rgba(255, 194, 77, 0.4);
+  color: #ffd88a; font-family: inherit; font-size: 12px;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  cursor: pointer; touch-action: manipulation;
+  transition: transform 0.06s ease, box-shadow 0.06s ease;
+}
+.jam-drum:active {
+  transform: scale(0.94);
+  box-shadow: 0 0 22px -2px rgba(255, 194, 77, 0.8);
+  background: radial-gradient(100% 100% at 50% 0%, rgba(255, 194, 77, 0.35), rgba(255, 194, 77, 0.08));
+}
+#jam-chords { display: flex; gap: 10px; margin-top: 2px; }
+.jam-chord {
+  flex: 1; min-height: 84px; border-radius: 14px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  background: radial-gradient(100% 100% at 50% 0%, rgba(255, 122, 217, 0.14), rgba(255, 122, 217, 0.03));
+  border: 1px solid rgba(255, 122, 217, 0.4);
+  color: #ffc7ea; font-family: inherit;
+  cursor: pointer; touch-action: manipulation;
+  transition: transform 0.06s ease, box-shadow 0.06s ease;
+}
+.jam-chord-num { font-size: 10px; letter-spacing: 0.3em; color: var(--ink-dim); }
+.jam-chord-name { font-size: 20px; letter-spacing: 0.1em; }
+.jam-chord:active {
+  transform: scale(0.94);
+  box-shadow: 0 0 22px -2px rgba(255, 122, 217, 0.8);
+  background: radial-gradient(100% 100% at 50% 0%, rgba(255, 122, 217, 0.35), rgba(255, 122, 217, 0.08));
+}
+/* the whole panel breathes on the beat: pads swell with the clock */
+#jam-panel.onbeat .jam-drum,
+#jam-panel.onbeat .jam-chord,
+#jam-panel.onbeat .jam-pad {
+  transform: scale(1.04);
+  filter: brightness(1.25);
+}
+#jam-panel.onbeat #jam-beat-dots span.on { transform: scale(1.35); }
 
 /* ---------- community wall paint mode (build 18) ---------- */
 #paint-btn {
@@ -784,3 +893,131 @@ html, body {
   margin-top: 8px; text-align: center;
   font-size: 11px; letter-spacing: 0.12em; color: var(--ink-faint);
 }
+
+/* ---------- jukebox: button + panel (build 21) ---------- */
+#juke-btn {
+  position: fixed; bottom: 288px; left: 50%; transform: translateX(-50%);
+  z-index: 48;
+  background: rgba(141, 255, 122, 0.10);
+  border: 1px solid rgba(141, 255, 122, 0.55); border-radius: 999px;
+  color: #d2ffc4; font-family: inherit; letter-spacing: 0.2em;
+  font-size: 11px; text-transform: uppercase;
+  padding: 14px 26px; min-height: 48px;
+  cursor: pointer; touch-action: manipulation;
+}
+#juke-btn:active { background: rgba(141, 255, 122, 0.25); }
+#juke-panel {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  max-height: 72vh; overflow-y: auto;
+  background: rgba(4, 12, 8, 0.96);
+  border-top: 1px solid rgba(141, 255, 122, 0.35);
+  border-radius: 16px 16px 0 0;
+  padding: 12px 16px 28px;
+  font-weight: 300;
+  touch-action: manipulation;
+  user-select: none; -webkit-user-select: none;
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.6);
+}
+.juke-head {
+  display: flex; justify-content: space-between; align-items: center;
+  letter-spacing: 0.35em; font-size: 12px; color: #d2ffc4;
+  margin-bottom: 8px;
+}
+#juke-close {
+  background: none; border: none; color: #bfe9b0;
+  font-size: 15px; cursor: pointer; padding: 8px 10px;
+  touch-action: manipulation; min-height: 44px; min-width: 44px;
+}
+.juke-dj-note {
+  text-align: center; font-size: 11px; letter-spacing: 0.15em;
+  color: #ffc24d; border: 1px solid rgba(255, 194, 77, 0.4);
+  border-radius: 8px; padding: 8px; margin-bottom: 10px;
+  background: rgba(255, 194, 77, 0.08);
+}
+.juke-now { margin-bottom: 6px; }
+.juke-now-title {
+  font-size: 15px; color: #f0ffe9; letter-spacing: 0.04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.juke-now-sub { font-size: 11px; color: var(--ink-dim); margin: 2px 0 8px; letter-spacing: 0.1em; }
+.juke-now-sub span + span { margin-left: 10px; }
+.juke-progress {
+  height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.10);
+  overflow: hidden; margin-bottom: 10px;
+}
+#juke-progress-fill {
+  height: 100%; width: 0%; border-radius: 2px;
+  background: linear-gradient(90deg, #8dff7a, #d2ffc4);
+  transition: width 1s linear;
+}
+#juke-progress-fill.pulse { animation: juke-pulse 1.6s ease-in-out infinite; width: 100%; }
+@keyframes juke-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.9; } }
+.juke-now-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.juke-now-row button {
+  background: rgba(141, 255, 122, 0.10); border: 1px solid rgba(141, 255, 122, 0.4);
+  border-radius: 8px; color: #d2ffc4; font-family: inherit;
+  font-size: 11px; letter-spacing: 0.1em; padding: 9px 12px; min-height: 40px;
+  cursor: pointer; touch-action: manipulation;
+}
+.juke-now-row button:disabled { opacity: 0.35; cursor: default; }
+.juke-now-row button:active:not(:disabled) { background: rgba(141, 255, 122, 0.25); }
+#juke-join.pulse {
+  animation: juke-join-pulse 1.2s ease-in-out infinite;
+  border-color: #8dff7a; font-weight: 600;
+}
+@keyframes juke-join-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(141, 255, 122, 0.5); }
+  50% { box-shadow: 0 0 18px 4px rgba(141, 255, 122, 0.5); }
+}
+.juke-countdown {
+  margin-top: 8px; font-size: 12px; letter-spacing: 0.1em; color: #ffe95c;
+}
+.juke-vol-row {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px;
+  font-size: 11px; letter-spacing: 0.2em; color: var(--ink-dim);
+}
+.juke-vol-row input[type="range"] { flex: 1; accent-color: #8dff7a; }
+.juke-sub {
+  letter-spacing: 0.35em; font-size: 10px; color: var(--ink-dim);
+  margin: 12px 0 6px;
+}
+.juke-queue { display: flex; flex-direction: column; gap: 6px; max-height: 22vh; overflow-y: auto; }
+.juke-empty { font-size: 12px; color: var(--ink-faint); letter-spacing: 0.08em; padding: 6px 0; }
+.juke-row {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(141, 255, 122, 0.18); border-radius: 8px;
+  padding: 8px 10px;
+}
+.juke-row-title {
+  flex: 1; font-size: 12px; color: #eef; letter-spacing: 0.04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.juke-row-meta { font-size: 10px; color: var(--ink-dim); letter-spacing: 0.08em; white-space: nowrap; }
+.juke-rm {
+  background: none; border: 1px solid rgba(255, 120, 120, 0.4); border-radius: 6px;
+  color: #ff9d9d; font-size: 11px; padding: 6px 9px; min-height: 36px;
+  cursor: pointer; touch-action: manipulation;
+}
+.juke-add-row { display: flex; gap: 8px; margin-top: 10px; }
+#juke-add-url {
+  flex: 1; background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(141, 255, 122, 0.3); border-radius: 8px;
+  color: #eef; font-family: inherit; font-size: 13px;
+  padding: 10px 12px; min-height: 44px; min-width: 0;
+}
+#juke-add-url::placeholder { color: var(--ink-faint); }
+#juke-add-btn {
+  background: rgba(141, 255, 122, 0.14); border: 1px solid rgba(141, 255, 122, 0.55);
+  border-radius: 8px; color: #d2ffc4; font-family: inherit;
+  font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+  padding: 10px 16px; min-height: 44px; cursor: pointer; touch-action: manipulation;
+  white-space: nowrap;
+}
+#juke-add-btn:active { background: rgba(141, 255, 122, 0.28); }
+.juke-hint {
+  margin-top: 10px; font-size: 11px; letter-spacing: 0.08em;
+  color: var(--ink-faint); text-align: center;
+}
+.juke-embed { margin-top: 10px; border-radius: 8px; overflow: hidden; }
+.juke-embed iframe { display: block; border: none; }
