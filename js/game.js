@@ -10,8 +10,26 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=24';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=24';
+import { LimboNet } from './net.js?v=25';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=25';
+
+/* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
+   retries, provider player internals) surface as unhandled AbortErrors —
+   "signal is aborted without reason" in Chrome. They're expected noise, not
+   bugs: every fetch we start is already caught at its own call site, so an
+   unhandled AbortError is by definition someone else's. Swallow it so it
+   never pollutes error telemetry; everything else still reports. */
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('unhandledrejection', (e) => {
+    try {
+      const r = e && e.reason;
+      const msg = r && typeof r.message === 'string' ? r.message : '';
+      if ((r && r.name === 'AbortError') || /aborted without reason/i.test(msg)) {
+        e.preventDefault();
+      }
+    } catch (_) {}
+  });
+}
 
 /* ---------------- configuration ---------------- */
 
@@ -1872,6 +1890,7 @@ function jamGrabLoop() {
   }
   const slot = jam.padRound;
   jam.pads[slot] = buf;
+  jam.lastGrabSlot = slot; // build 25 test seam
   jam.padRound = (jam.padRound + 1) % jam.pads.length;
   addSystemLine(`loop grabbed — pad ${slot + 1} is loaded`);
   renderJamPads();
@@ -2338,7 +2357,13 @@ const juke = {
   pausedForDj: false,
   djResumeTimer: null,
   joinWaiting: false, // autoplay blocked: pulsing "tap to join the music"
-  playerFactory: null, // test seam: {youtube(d, offset, hooks), soundcloud(d, offset, hooks)}
+  prewarmed: false,   // build 25: first user gesture warms the provider players
+  warmYt: null,       // {player, ready, queue} persistent invisible YT player
+  warmSc: null,       // {widget, ready, queue, armed, playingId} persistent invisible SC widget
+  watchT: null,       // build 25: hardened playback watchdog timer
+  playerErrored: false, // a provider error event fired for the current track
+  direct: null,       // build 25: direct-audio playback state
+  playerFactory: null, // test seam: {youtube(d, offset, hooks), soundcloud(d, offset, hooks), direct(d, offset, hooks)}
   extTimer: null, extCount: 0,
 };
 const JUKE_SKIP_VOTES = 2;      // votes needed to skip
@@ -2350,9 +2375,11 @@ const JUKE_CONTENTION_MS = 1500; // competing jukePlays: earliest startedAt wins
 /* Provider detection from a pasted URL (build 23: mobile share links,
    set/playlist URLs, and query-param-laden shares all resolve).
    Providers: youtube | youtube-playlist | soundcloud | soundcloud-set |
-              soundcloud-short | external | invalid.
+              soundcloud-short | direct-audio | external | invalid.
    The transient ones (youtube-playlist, soundcloud-set, soundcloud-short)
-   are expanded/resolved at queue time into plain youtube/soundcloud items. */
+   are expanded/resolved at queue time into plain youtube/soundcloud items.
+   direct-audio (build 25): .mp3/.ogg/.wav/.m4a links play through the game's
+   own WebAudio chain — sampler, FX and volume all work on them. */
 function jukeDetectProvider(raw) {
   let u;
   try { u = new URL(String(raw || '').trim()); }
@@ -2391,6 +2418,14 @@ function jukeDetectProvider(raw) {
     if (parts.length >= 2) return { provider: 'soundcloud' };
     return { provider: 'external' }; // profile page, likes, stream…
   }
+  // Build 25: direct audio links ride the game's own WebAudio chain —
+  // extension sniff here; extensionless audio URLs get a content-type
+  // sniff at queue time (jukeSniffAudioContentType).
+  try {
+    if (/\.(mp3|ogg|oga|wav|m4a|aac|opus|flac)$/i.test(u.pathname)) {
+      return { provider: 'direct-audio' };
+    }
+  } catch (e) {}
   return { provider: 'external' };
 }
 
@@ -2398,7 +2433,21 @@ function jukeDetectProvider(raw) {
 function jukeFallbackTitle(provider) {
   return provider === 'youtube' || provider === 'youtube-playlist' ? 'a youtube track'
     : provider === 'soundcloud' || provider === 'soundcloud-set' || provider === 'soundcloud-short' ? 'a soundcloud track'
+    : provider === 'direct-audio' ? 'an audio file'
     : 'a track';
+}
+
+/* Build 25: one HEAD request to sniff an extensionless URL's content-type.
+   Returns true only for audio/*. CORS-blocked or slow -> false (stays external). */
+async function jukeSniffAudioContentType(url) {
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 5000);
+    const r = await fetch(url, { method: 'HEAD', signal: ctl.signal, redirect: 'follow' });
+    clearTimeout(t);
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    return r.ok && (ct.startsWith('audio/') || ct === 'application/octet-stream');
+  } catch (e) { return false; }
 }
 
 /* Best-effort title for a link: noembed for youtube, oEmbed for soundcloud
@@ -2550,7 +2599,7 @@ function jukeResolveYTPlaylist(playlistId) {
   });
 }
 
-const JUKE_PROVIDERS = ['youtube', 'youtube-playlist', 'soundcloud', 'soundcloud-set', 'soundcloud-short', 'external'];
+const JUKE_PROVIDERS = ['youtube', 'youtube-playlist', 'soundcloud', 'soundcloud-set', 'soundcloud-short', 'direct-audio', 'external'];
 function jukeValidAdd(d) {
   if (!d || typeof d !== 'object') return false;
   if (typeof d.id !== 'string' || !d.id || d.id.length > 40) return false;
@@ -2607,6 +2656,22 @@ async function jukeAddTrack(rawUrl, titleHint) {
   // Sets / playlists: one queue item per track.
   if (det.provider === 'soundcloud-set' || det.provider === 'youtube-playlist') {
     return jukeAddPlaylist(url, det, resolvedTitle || titleHint);
+  }
+  // Build 25: direct-audio titles start as the file name — friendlier than
+  // "an audio file", and decoding can't give us a real title anyway.
+  if (det.provider === 'direct-audio' && !resolvedTitle) {
+    try {
+      const leaf = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || '');
+      const stem = leaf.replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[_+\-]+/g, ' ').trim();
+      if (stem) resolvedTitle = stem.slice(0, 120);
+    } catch (e) {}
+  }
+  // Extensionless audio URLs (signed links, redirects): sniff content-type
+  // once at queue time; a CORS-blocked HEAD just leaves it external.
+  if (det.provider === 'external' && !resolvedTitle) {
+    try {
+      if (await jukeSniffAudioContentType(url)) det = { provider: 'direct-audio' };
+    } catch (e) {}
   }
   const t = {
     id: jukeMakeId(), url, provider: det.provider,
@@ -2834,10 +2899,12 @@ function jukeOffsetFor(d, nowMs) {
 function jukeStartPlayback(d) {
   jukeStopPlayer();
   juke.joinWaiting = false;
+  juke.playerErrored = false;
   if (juke.pausedForDj) { renderJuke(); return; } // DJ live: hold, don't play
   const offset = jukeOffsetFor(d);
   if (d.provider === 'youtube') jukePlayYT(d, offset);
   else if (d.provider === 'soundcloud') jukePlaySC(d, offset);
+  else if (d.provider === 'direct-audio') jukePlayDirect(d, offset);
   else jukePlayExternal(d);
   jukeArmEndWatcher();
   jukeArmResync();
@@ -2884,27 +2951,45 @@ function jukeLoadSCApi(cb) {
   document.head.appendChild(s);
 }
 
-/* After play() is called, poll briefly: if the provider never reaches
-   playing state the browser blocked autoplay — surface the one-tap
-   "tap to join the music" pulse instead of silence. */
-function jukeWatchAutoplay(kind) {
-  let tries = 0;
-  const iv = setInterval(() => {
-    tries++;
-    let playing = false;
+/* ---------- hardened playback (build 25) ----------
+   After play() is called: poll ~6s for real PLAYING state. If the provider
+   never gets there, recover once (re-cue / reload), poll another ~6s, then:
+   - a provider ERROR event fired -> the honest toast + auto-advance path
+     (jukeOnTrackError, already triggered by the binding) — stop watching.
+   - still silent, no error -> the browser blocked autoplay: raise the
+     single "tap to join the music" pulse button; the user's tap unblocks it. */
+function jukeArmPlayWatchdog(kind, d, recover) {
+  clearTimeout(juke.watchT);
+  juke.watchT = null;
+  let tries = 0, phase = 0;
+  const isPlaying = () => {
     try {
-      if (!juke.player || juke.player.kind !== kind) { clearInterval(iv); return; }
-      if (kind === 'youtube') playing = juke.player.state() === 1;
-      else if (kind === 'soundcloud') playing = juke.player.playingFlag === true;
-    } catch (e) {}
-    if (playing || tries >= 4) {
-      clearInterval(iv);
-      if (!playing && juke.player && juke.player.kind === kind) {
-        juke.joinWaiting = true;
-        renderJuke();
-      }
+      if (!juke.player || juke.player.kind !== kind) return false;
+      if (kind === 'youtube') return juke.player.state() === 1;
+      if (kind === 'soundcloud') return juke.player.playingFlag === true;
+      if (kind === 'direct-audio') return juke.player.playing() === true;
+      return false;
+    } catch (e) { return false; }
+  };
+  const tick = () => {
+    juke.watchT = null;
+    if (!juke.now || juke.now.id !== d.id || juke.pausedForDj) return;
+    if (!juke.player || juke.player.kind !== kind) return;
+    if (juke.playerErrored) return; // error binding fired the honest path
+    if (isPlaying()) return;
+    tries++;
+    if (tries < 9) { juke.watchT = setTimeout(tick, 700); return; } // ~6s per phase
+    if (phase === 0) {
+      phase = 1; tries = 0;
+      try { if (recover) recover(); } catch (e) {}
+      juke.watchT = setTimeout(tick, 700);
+      return;
     }
-  }, 700);
+    // Recovered once, still silent, no provider error: autoplay is blocked.
+    juke.joinWaiting = true;
+    renderJuke();
+  };
+  juke.watchT = setTimeout(tick, 700);
 }
 
 /* One-tap join: the user's gesture unblocks provider autoplay. */
@@ -2919,6 +3004,79 @@ function jukeJoinTap() {
   renderJuke();
 }
 
+/* ---------- invisible players (build 25) ----------
+   The provider iframes are permanently invisible (1px, off-screen, no
+   pointer events — never display:none, which throttles some players).
+   After the game's first user gesture we build ONE persistent player per
+   provider; every track cues into it instead of rebuilding iframes, so
+   playback starts faster and more reliably. If warmup fails, the old
+   per-track path (jukePlayYTFresh / jukePlaySCFresh) still applies. */
+const JUKE_WARM_SC_URL = 'https://soundcloud.com/psylicious/dj-sarana-reflection'; // verified playable
+
+function jukePrewarm() {
+  if (juke.prewarmed) return;
+  juke.prewarmed = true;
+  jukeEnsureWarmYT(() => {});
+  jukeEnsureWarmSC(() => {});
+}
+
+function jukeEnsureWarmYT(cb) {
+  if (juke.warmYt && juke.warmYt.ready) { cb(juke.warmYt); return; }
+  juke.warmYt = juke.warmYt || { player: null, ready: false, queue: [] };
+  juke.warmYt.queue.push(cb);
+  if (juke.warmYt.player) return; // building already
+  jukeLoadYTApi((ok) => {
+    const w = juke.warmYt;
+    if (!w) return;
+    if (!ok || !window.YT) {
+      w.queue.splice(0).forEach((f) => { try { f(null); } catch (e) {} });
+      juke.warmYt = null;
+      return;
+    }
+    try {
+      const holder = document.getElementById('juke-yt-holder');
+      const el = document.createElement('div');
+      el.id = 'juke-yt-warm';
+      holder.appendChild(el);
+      const p = new window.YT.Player(el, {
+        width: '1', height: '1',
+        videoId: 'aqz-KE-bpKQ', // warmup cue only (Big Buck Bunny, reliably embeddable) — never plays
+        playerVars: { autoplay: 0, controls: 0, disablekb: 1, rel: 0 },
+        events: {
+          onReady: (ev) => {
+            w.ready = true;
+            try { ev.target.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+            w.queue.splice(0).forEach((f) => { try { f(w); } catch (e) {} });
+          },
+          onStateChange: (ev) => { jukeWarmYtState(ev); },
+          onError: () => { juke.playerErrored = true; jukeOnTrackError(); },
+        },
+      });
+      w.player = p;
+      // API wedged and onReady never fires: don't hang the queue forever.
+      setTimeout(() => {
+        if (w && !w.ready && w.queue.length) {
+          w.queue.splice(0).forEach((f) => { try { f(null); } catch (e) {} });
+        }
+      }, 20000);
+    } catch (e) {
+      juke.warmYt = null;
+    }
+  });
+}
+
+/* Persistent handler for the warm YT player: CUED (after cueVideoById)
+   means play; ENDED advances the room. Ignores anything that isn't the
+   warm player or the current track. */
+function jukeWarmYtState(ev) {
+  if (!juke.player || !juke.player.warm || juke.player.kind !== 'youtube') return;
+  if (!juke.now) return;
+  try {
+    if (ev.data === window.YT.PlayerState.CUED) ev.target.playVideo();
+    else if (ev.data === window.YT.PlayerState.ENDED) jukeOnPlayerEnded();
+  } catch (e) {}
+}
+
 function jukePlayYT(d, offset) {
   if (juke.playerFactory && juke.playerFactory.youtube) {
     const hooks = { onEnded: () => jukeOnPlayerEnded() };
@@ -2926,37 +3084,72 @@ function jukePlayYT(d, offset) {
     try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
     return;
   }
+  jukeEnsureWarmYT((w) => {
+    if (!juke.now || juke.now.id !== d.id) return; // stale track
+    if (w && w.ready) { jukeUseWarmYT(w, d, offset); return; }
+    jukePlayYTFresh(d, offset);
+  });
+}
+
+function jukeUseWarmYT(w, d, offset) {
+  const p = w.player;
+  juke.player = {
+    kind: 'youtube', warm: true,
+    play: () => { try { p.playVideo(); } catch (e) {} },
+    pause: () => { try { p.pauseVideo(); } catch (e) {} },
+    seekTo: (s) => { try { p.seekTo(s, true); } catch (e) {} },
+    pos: () => { try { return p.getCurrentTime(); } catch (e) { return null; } },
+    dur: () => { try { return p.getDuration(); } catch (e) { return null; } },
+    state: () => { try { return p.getPlayerState(); } catch (e) { return -1; } },
+    setVolume: (v) => { try { p.setVolume(v); } catch (e) {} },
+    destroy: () => { try { p.stopVideo(); } catch (e) {} }, // warm player lives on
+  };
+  try { p.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+  try {
+    p.cueVideoById(d.videoId, Math.max(0, offset));
+  } catch (e) { jukeOnTrackError(); return; }
+  jukeArmPlayWatchdog('youtube', d, () => {
+    // one recovery: re-cue at the room's current offset
+    if (!juke.now || juke.now.id !== d.id) return;
+    try { p.cueVideoById(d.videoId, Math.max(0, jukeOffsetFor(juke.now))); } catch (e) {}
+  });
+}
+
+/* Fallback when the warm player couldn't be built: the old per-track
+   player, still invisible. destroy() removes its own DOM only — the warm
+   player (if any) is never touched. */
+function jukePlayYTFresh(d, offset) {
   const holder = document.getElementById('juke-yt-holder');
-  if (!holder) return;
-  holder.style.display = '';
-  document.getElementById('juke-sc-holder').style.display = 'none';
-  holder.innerHTML = '';
+  if (!holder) { jukeOnTrackError(); return; }
   const div = document.createElement('div');
-  div.id = 'juke-yt-player';
+  div.id = 'juke-yt-fresh';
   holder.appendChild(div);
   jukeLoadYTApi((ok) => {
-    if (!ok || !juke.now || juke.now.id !== d.id) return;
+    if (!ok || !juke.now || juke.now.id !== d.id) { try { div.remove(); } catch (e) {} return; }
     try {
       const p = new window.YT.Player(div, {
-        width: '100%', height: '110',
+        width: '1', height: '1',
         videoId: d.videoId,
-        playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
+        playerVars: { autoplay: 0, controls: 0, disablekb: 1, rel: 0 },
         events: {
           onReady: (ev) => {
             const off = juke.now && juke.now.id === d.id ? jukeOffsetFor(juke.now) : 0;
             try { if (off > 1) ev.target.seekTo(off, true); } catch (e) {}
             try { ev.target.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
             try { ev.target.playVideo(); } catch (e) {}
-            jukeWatchAutoplay('youtube');
+            jukeArmPlayWatchdog('youtube', d, () => {
+              if (!juke.now || juke.now.id !== d.id) return;
+              try { ev.target.loadVideoById(d.videoId, Math.max(0, jukeOffsetFor(juke.now))); } catch (e) {}
+            });
           },
           onStateChange: (ev) => {
             if (ev.data === window.YT.PlayerState.ENDED) jukeOnPlayerEnded();
           },
-          onError: () => { jukeOnTrackError(); },
+          onError: () => { juke.playerErrored = true; jukeOnTrackError(); },
         },
       });
       juke.player = {
-        kind: 'youtube',
+        kind: 'youtube', fresh: true,
         play: () => p.playVideo(),
         pause: () => p.pauseVideo(),
         seekTo: (s) => p.seekTo(s, true),
@@ -2964,9 +3157,9 @@ function jukePlayYT(d, offset) {
         dur: () => { try { return p.getDuration(); } catch (e) { return null; } },
         state: () => { try { return p.getPlayerState(); } catch (e) { return -1; } },
         setVolume: (v) => { try { p.setVolume(v); } catch (e) {} },
-        destroy: () => { try { p.destroy(); } catch (e) {} },
+        destroy: () => { try { p.destroy(); } catch (e) {} try { div.remove(); } catch (e) {} },
       };
-    } catch (e) { /* player failed; watchdog still advances on duration */ }
+    } catch (e) { jukeOnTrackError(); }
   });
 }
 
@@ -2986,6 +3179,70 @@ function jukeOnTrackError() {
   }
 }
 
+function jukeEnsureWarmSC(cb) {
+  if (juke.warmSc && juke.warmSc.ready) { cb(juke.warmSc); return; }
+  juke.warmSc = juke.warmSc || { widget: null, ready: false, queue: [], armed: null, playingId: null, playingFlag: () => false };
+  juke.warmSc.queue.push(cb);
+  if (juke.warmSc.widget) return; // building already
+  jukeLoadSCApi((ok) => {
+    const w = juke.warmSc;
+    if (!w) return;
+    if (!ok || !window.SC || !window.SC.Widget) {
+      w.queue.splice(0).forEach((f) => { try { f(null); } catch (e) {} });
+      juke.warmSc = null;
+      return;
+    }
+    try {
+      const holder = document.getElementById('juke-sc-holder');
+      const iframe = document.createElement('iframe');
+      iframe.id = 'juke-sc-warm';
+      iframe.setAttribute('frameborder', '0');
+      iframe.setAttribute('allow', 'autoplay');
+      iframe.width = '1'; iframe.height = '1';
+      iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(JUKE_WARM_SC_URL) +
+        '&auto_play=false&visual=false&hide_related=true&show_comments=false&show_user=false';
+      holder.appendChild(iframe);
+      const wg = window.SC.Widget(iframe);
+      let playingFlag = false;
+      const armedId = () => (w.armed && w.armed.d ? w.armed.d.id : null);
+      wg.bind(window.SC.Widget.Events.PLAY, () => { playingFlag = true; });
+      wg.bind(window.SC.Widget.Events.PAUSE, () => { playingFlag = false; });
+      wg.bind(window.SC.Widget.Events.FINISH, () => {
+        playingFlag = false;
+        if (w.playingId && juke.now && juke.now.id === w.playingId) jukeOnPlayerEnded();
+      });
+      wg.bind(window.SC.Widget.Events.ERROR, () => {
+        playingFlag = false;
+        // Only the armed/playing track may fail the room; a warmup-track
+        // failure just means warmup is degraded, not fatal.
+        if ((w.playingId && juke.now && juke.now.id === w.playingId) || armedId()) {
+          juke.playerErrored = true;
+          jukeOnTrackError();
+        }
+      });
+      wg.bind(window.SC.Widget.Events.READY, () => {
+        if (!w.ready) {
+          w.ready = true;
+          w.lastUrl = JUKE_WARM_SC_URL; // the warmup iframe already holds this track
+          w.queue.splice(0).forEach((f) => { try { f(w); } catch (e) {} });
+          return;
+        }
+        // READY after a per-track load(): arm the track at the room offset.
+        jukeArmWarmSC(w, wg, w.armed);
+      });
+      w.widget = wg;
+      w.playingFlag = () => playingFlag;
+      setTimeout(() => {
+        if (w && !w.ready && w.queue.length) {
+          w.queue.splice(0).forEach((f) => { try { f(null); } catch (e) {} });
+        }
+      }, 25000);
+    } catch (e) {
+      juke.warmSc = null;
+    }
+  });
+}
+
 function jukePlaySC(d, offset) {
   if (juke.playerFactory && juke.playerFactory.soundcloud) {
     const hooks = { onEnded: () => jukeOnPlayerEnded() };
@@ -2993,23 +3250,97 @@ function jukePlaySC(d, offset) {
     try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
     return;
   }
+  jukeEnsureWarmSC((w) => {
+    if (!juke.now || juke.now.id !== d.id) return; // stale track
+    if (w && w.ready) { jukeUseWarmSC(w, d, offset); return; }
+    jukePlaySCFresh(d, offset);
+  });
+}
+
+function jukeUseWarmSC(w, d, offset) {
+  const wg = w.widget;
+  w.playingId = null;
+  let lastPos = null;
+  let lastDur = null;
+  juke.player = {
+    kind: 'soundcloud', warm: true,
+    get playingFlag() { return w.playingFlag(); },
+    play: () => { try { wg.play(); } catch (e) {} },
+    pause: () => { try { wg.pause(); } catch (e) {} },
+    seekTo: (s) => { try { wg.seekTo(Math.round(s * 1000)); } catch (e) {} },
+    pos: () => {
+      try { wg.getPosition((ms) => { lastPos = ms / 1000; }); } catch (e) {}
+      return lastPos;
+    },
+    dur: () => {
+      try { wg.getDuration((ms) => { lastDur = ms / 1000; }); } catch (e) {}
+      return lastDur;
+    },
+    setVolume: (v) => { try { wg.setVolume(v); } catch (e) {} },
+    destroy: () => { try { wg.pause(); } catch (e) {} w.armed = null; w.playingId = null; },
+  };
+  try { wg.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+  const arm = { d, offset: jukeOffsetFor(d) };
+  jukeArmPlayWatchdog('soundcloud', d, () => {
+    // one recovery: reload the track; the READY handler re-arms it
+    if (!juke.now || juke.now.id !== d.id) return;
+    const a2 = { d, offset: jukeOffsetFor(juke.now) };
+    if (w.lastUrl === d.url) jukeArmWarmSC(w, wg, a2);
+    else {
+      w.armed = a2;
+      w.lastUrl = d.url;
+      try { wg.load(d.url, { auto_play: false, visual: false, hide_related: true, show_comments: false, show_user: false }); } catch (e) {}
+    }
+  });
+  try {
+    if (w.lastUrl === d.url) {
+      // The widget already holds this track (e.g. the warmup track itself):
+      // load() with the same URL is a no-op that never re-fires READY,
+      // so arm it directly instead of waiting on an event that won't come.
+      jukeArmWarmSC(w, wg, arm);
+    } else {
+      w.armed = arm;
+      w.lastUrl = d.url;
+      wg.load(d.url, { auto_play: false, visual: false, hide_related: true, show_comments: false, show_user: false });
+    }
+  } catch (e) { jukeOnTrackError(); return; }
+}
+
+/* Arm an already-loaded SC track at the room offset: seek, play, duration.
+   Shared by the READY-after-load path and the same-URL shortcut. */
+function jukeArmWarmSC(w, wg, a) {
+  if (!a || !juke.now || juke.now.id !== a.d.id) return;
+  w.armed = null;
+  w.playingId = a.d.id;
+  try { wg.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+  try { if (a.offset > 1) wg.seekTo(Math.round(a.offset * 1000)); } catch (e) {}
+  try { wg.play(); } catch (e) {}
+  try {
+    wg.getDuration((ms) => {
+      if (juke.now && juke.now.id === a.d.id && ms > 0) juke.now.durationMs = ms;
+    });
+  } catch (e) {}
+}
+
+/* Fallback when the warm widget couldn't be built: the old per-track
+   widget, still invisible. destroy() only unbinds — the transient iframe
+   is removed. */
+function jukePlaySCFresh(d, offset) {
   const holder = document.getElementById('juke-sc-holder');
-  if (!holder) return;
-  holder.style.display = '';
-  document.getElementById('juke-yt-holder').style.display = 'none';
-  holder.innerHTML = '';
+  if (!holder) { jukeOnTrackError(); return; }
   const iframe = document.createElement('iframe');
-  iframe.width = '100%'; iframe.height = '110';
+  iframe.id = 'juke-sc-fresh';
+  iframe.width = '1'; iframe.height = '1';
   iframe.setAttribute('frameborder', '0');
   iframe.setAttribute('allow', 'autoplay');
   iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(d.url) +
     '&auto_play=false&hide_related=true&show_comments=false&show_user=false&visual=false';
   holder.appendChild(iframe);
   jukeLoadSCApi((ok) => {
-    if (!juke.now || juke.now.id !== d.id) return; // stale track
+    if (!juke.now || juke.now.id !== d.id) { try { iframe.remove(); } catch (e) {} return; }
     if (!ok) {
-      // api.js itself wouldn't load — say so instead of sitting silent.
       jukeHint('soundcloud isn\u2019t loading — check your connection');
+      juke.playerErrored = true;
       jukeOnTrackError();
       return;
     }
@@ -3019,24 +3350,27 @@ function jukePlaySC(d, offset) {
       w.bind(window.SC.Widget.Events.PLAY, () => { playingFlag = true; });
       w.bind(window.SC.Widget.Events.PAUSE, () => { playingFlag = false; });
       w.bind(window.SC.Widget.Events.FINISH, () => { playingFlag = false; jukeOnPlayerEnded(); });
-      w.bind(window.SC.Widget.Events.ERROR, () => { playingFlag = false; jukeOnTrackError(); });
+      w.bind(window.SC.Widget.Events.ERROR, () => { playingFlag = false; juke.playerErrored = true; jukeOnTrackError(); });
       w.bind(window.SC.Widget.Events.READY, () => {
         const off = juke.now && juke.now.id === d.id ? jukeOffsetFor(juke.now) : 0;
         try { w.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
         try { if (off > 1) w.seekTo(Math.round(off * 1000)); } catch (e) {}
         try { w.play(); } catch (e) {}
-        // Enrich the local duration so the progress bar + end detection work.
         try {
           w.getDuration((ms) => {
             if (juke.now && juke.now.id === d.id && ms > 0) juke.now.durationMs = ms;
           });
         } catch (e) {}
-        jukeWatchAutoplay('soundcloud');
+        jukeArmPlayWatchdog('soundcloud', d, () => {
+          if (!juke.now || juke.now.id !== d.id) return;
+          try { if (off > 1) w.seekTo(Math.round(jukeOffsetFor(juke.now) * 1000)); } catch (e) {}
+          try { w.play(); } catch (e) {}
+        });
       });
       let lastPos = null;
       let lastDur = null;
       juke.player = {
-        kind: 'soundcloud',
+        kind: 'soundcloud', fresh: true,
         get playingFlag() { return playingFlag; }, // live read for the autoplay watchdog
         play: () => w.play(),
         pause: () => w.pause(),
@@ -3050,18 +3384,274 @@ function jukePlaySC(d, offset) {
           return lastDur;
         },
         setVolume: (v) => { try { w.setVolume(v); } catch (e) {} },
-        destroy: () => { try { w.unbind(window.SC.Widget.Events.FINISH); } catch (e) {} },
+        destroy: () => { try { w.unbind(window.SC.Widget.Events.FINISH); } catch (e) {} try { iframe.remove(); } catch (e) {} },
       };
     } catch (e) { jukeOnTrackError(); }
   });
+}
+
+/* ---------- direct audio: mp3/etc through the game's own chain (build 25) --
+   A pasted .mp3/.ogg/.wav/.m4a URL plays through WebAudio into the jam bus
+   (reverb + delay sends, limiter, master) — so the sampler's "grab loop"
+   captures it natively, the volume slider drives it, and aura-ducking rules
+   apply like any other game audio.
+   Path A: fetch + decodeAudioData (needs CORS on the host).
+   No-CORS fallback: plain <audio> playback — audible, but outside the chain
+   (the room is told plainly). captureStream() is NOT an option for
+   cross-origin media: Chromium throws SecurityError ("Cannot capture from
+   element with cross-origin data") — verified live, so no capture path is
+   attempted. */
+
+function jukeDirectDest() {
+  const ch = jamEnsureChain();
+  if (ch && ch.bus) return ch.bus;
+  return (typeof audio !== 'undefined' && audio.master) || null;
+}
+
+function jukeDirectTeardownNodes(st) {
+  st.gen = (st.gen || 0) + 1; // invalidates any pending onended
+  if (st.src) { try { st.src.onended = null; st.src.stop(); } catch (e) {} try { st.src.disconnect(); } catch (e) {} st.src = null; }
+  if (st.mss) { try { st.mss.disconnect(); } catch (e) {} st.mss = null; }
+  if (st.gain) { try { st.gain.disconnect(); } catch (e) {} st.gain = null; }
+  if (st.an) { try { st.an.disconnect(); } catch (e) {} st.an = null; }
+  st.startCtx = null;
+}
+
+function jukeDirectDestroy(st) {
+  jukeDirectTeardownNodes(st);
+  if (st.el) { try { st.el.pause(); } catch (e) {} try { st.el.removeAttribute('src'); st.el.load(); } catch (e) {} }
+  st.playing = false;
+  st.paused = true;
+  if (juke.direct === st) juke.direct = null;
+}
+
+function jukeStopDirect() {
+  if (juke.direct) { try { jukeDirectDestroy(juke.direct); } catch (e) {} juke.direct = null; }
+}
+
+function jukePlayDirect(d, offset) {
+  if (juke.playerFactory && juke.playerFactory.direct) {
+    const hooks = { onEnded: () => jukeOnPlayerEnded(), onError: () => jukeOnTrackError() };
+    juke.player = juke.playerFactory.direct(d, offset, hooks);
+    try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
+    return;
+  }
+  if (!audio.ctx) { jukeOnTrackError(); return; }
+  const st = { mode: 'loading', d, offset, vol: juke.volume, gen: 0, captureOk: false };
+  juke.direct = st;
+  juke.player = {
+    kind: 'direct-audio',
+    play: () => jukeDirectPlay(st),
+    pause: () => jukeDirectPause(st),
+    seekTo: (s) => jukeDirectSeek(st, s),
+    pos: () => jukeDirectPos(st),
+    dur: () => jukeDirectDur(st),
+    playing: () => !!st.playing,
+    setVolume: (v) => {
+      st.vol = v / 100;
+      if (st.gain && audio.ctx) {
+        try { st.gain.gain.setTargetAtTime(st.vol, audio.ctx.currentTime, 0.05); } catch (e) {}
+      }
+    },
+    destroy: () => jukeDirectDestroy(st),
+  };
+  jukeDirectLoad(st);
+  jukeArmPlayWatchdog('direct-audio', d, () => {
+    // one recovery: rebuild from the cached buffer / re-seek the element
+    if (!juke.now || juke.now.id !== d.id || juke.direct !== st) return;
+    if (st.mode === 'webaudio' && st.buffer) jukeDirectStartBuffer(st, jukeDirectPos(st) || 0);
+    else if (st.el) { try { st.el.play(); } catch (e) {} }
+  });
+}
+
+async function jukeDirectLoad(st) {
+  const d = st.d;
+  const alive = () => juke.now && juke.now.id === d.id && juke.direct === st;
+  // Path A: fetch + decode (needs CORS on the host).
+  try {
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 20000);
+    const r = await fetch(d.url, { signal: ctl.signal, redirect: 'follow' });
+    clearTimeout(to);
+    if (!alive()) return;
+    if (!r.ok) throw new Error('http ' + r.status);
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    if (ct && !(ct.startsWith('audio/') || ct === 'application/octet-stream' || ct.startsWith('video/'))) {
+      throw new Error('not audio: ' + ct);
+    }
+    const ab = await r.arrayBuffer();
+    if (!alive()) return;
+    const buf = await audio.ctx.decodeAudioData(ab);
+    if (!alive()) return;
+    st.buffer = buf;
+    st.mode = 'webaudio';
+    // The buffer rides the game's own WebAudio chain (jam bus) — the
+    // sampler's "grab loop" captures it natively, no tab capture needed.
+    st.captureOk = true;
+    if (juke.now && juke.now.id === d.id && !juke.now.durationMs) {
+      juke.now.durationMs = Math.round(buf.duration * 1000);
+    }
+    jukeDirectStartBuffer(st, Math.max(0, jukeOffsetFor(d)));
+    return;
+  } catch (e) { /* CORS / decode / http failure -> plain <audio> element */ }
+  if (!alive()) return;
+  jukeDirectLoadElement(st);
+}
+
+/* Start (or restart) the buffer source at an offset. The generation token
+   keeps pause()/seekTo() from tripping the natural-end handler. */
+function jukeDirectStartBuffer(st, offsetSec) {
+  const ctx = audio.ctx;
+  const dest = jukeDirectDest();
+  if (!ctx || !dest || !st.buffer) { jukeOnTrackError(); return; }
+  jukeDirectTeardownNodes(st);
+  const dur = st.buffer.duration;
+  let off = Math.max(0, offsetSec || 0);
+  if (off >= dur) off = Math.max(0, dur - 1); // late joiner: catch the tail
+  const gain = ctx.createGain();
+  gain.gain.value = st.vol != null ? st.vol : juke.volume;
+  const an = ctx.createAnalyser(); // test seam + future visuals; doesn't touch the signal
+  an.fftSize = 1024;
+  gain.connect(an);
+  gain.connect(dest);
+  const src = ctx.createBufferSource();
+  src.buffer = st.buffer;
+  src.connect(gain);
+  st.gain = gain; st.an = an; st.src = src;
+  st.startCtx = ctx.currentTime + 0.05;
+  st.startOff = off;
+  st.playing = true; st.paused = false;
+  const gen = st.gen;
+  src.onended = () => {
+    if (st.gen !== gen || st.paused) return;
+    if (juke.now && juke.now.id === st.d.id) { st.playing = false; jukeOnPlayerEnded(); }
+  };
+  try { src.start(st.startCtx, off); } catch (e) { jukeOnTrackError(); }
+}
+
+function jukeDirectPlay(st) {
+  if (!st || juke.direct !== st) return;
+  if (st.mode === 'webaudio' && st.buffer) {
+    if (st.paused) jukeDirectStartBuffer(st, st.pauseOff || 0);
+  } else if (st.el) {
+    try { st.el.play().catch(() => {}); } catch (e) {}
+    st.playing = true; st.paused = false;
+  }
+}
+
+function jukeDirectPause(st) {
+  if (!st || juke.direct !== st) return;
+  st.gen = (st.gen || 0) + 1;
+  if (st.mode === 'webaudio' && st.src) {
+    st.pauseOff = jukeDirectPos(st);
+    try { st.src.stop(); } catch (e) {}
+    st.src = null;
+  } else if (st.el) {
+    try { st.el.pause(); } catch (e) {}
+  }
+  st.playing = false; st.paused = true;
+}
+
+function jukeDirectSeek(st, s) {
+  if (!st || juke.direct !== st) return;
+  if (st.mode === 'webaudio' && st.buffer) {
+    const wasPaused = st.paused;
+    jukeDirectStartBuffer(st, Math.max(0, s));
+    if (wasPaused) jukeDirectPause(st);
+  } else if (st.el) {
+    try { st.el.currentTime = Math.max(0, s); } catch (e) {}
+  }
+}
+
+function jukeDirectPos(st) {
+  if (!st) return null;
+  if (st.mode === 'webaudio' && st.buffer && audio.ctx) {
+    if (st.paused) return st.pauseOff || 0;
+    if (st.startCtx == null) return 0;
+    return Math.max(0, (st.startOff || 0) + (audio.ctx.currentTime - st.startCtx));
+  }
+  if (st.el) { try { return st.el.currentTime || 0; } catch (e) { return null; } }
+  return null;
+}
+
+function jukeDirectDur(st) {
+  if (!st) return null;
+  if (st.mode === 'webaudio' && st.buffer) return st.buffer.duration;
+  if (st.el) { try { const dd = st.el.duration; return Number.isFinite(dd) ? dd : null; } catch (e) { return null; } }
+  return null;
+}
+
+/* No-CORS host: fetch/decode is impossible AND captureStream() throws
+   SecurityError on cross-origin media without CORS ("Cannot capture from
+   element with cross-origin data" — verified live in Chromium), so there is
+   no page-API path into the chain. The element just plays: audible and
+   synced, but outside the game audio — the room is told plainly. */
+function jukeDirectLoadElement(st) {
+  const d = st.d;
+  const alive = () => juke.now && juke.now.id === d.id && juke.direct === st;
+  try {
+    const ctx = audio.ctx;
+    const dest = jukeDirectDest();
+    if (!ctx || !dest) { jukeOnTrackError(); return; }
+    jukeDirectTeardownNodes(st);
+    let el = document.getElementById('juke-direct-el');
+    if (!el) {
+      el = document.createElement('audio');
+      el.id = 'juke-direct-el';
+      el.preload = 'auto';
+      el.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
+      document.body.appendChild(el);
+    }
+    try { el.pause(); } catch (e) {}
+    el.onloadedmetadata = null; el.onended = null; el.onerror = null;
+    st.el = el; st.mode = 'element';
+    const off = Math.max(0, jukeOffsetFor(d));
+    el.onloadedmetadata = () => {
+      if (!alive()) return;
+      const dur = el.duration;
+      if (Number.isFinite(dur) && dur > 0 && juke.now && juke.now.id === d.id && !juke.now.durationMs) {
+        juke.now.durationMs = Math.round(dur * 1000);
+      }
+      try { el.currentTime = Math.min(off, Math.max(0, (Number.isFinite(dur) ? dur : off + 1) - 1)); } catch (e) {}
+      // No capture path exists for cross-origin media without CORS
+      // (captureStream throws SecurityError), so the element plays
+      // standalone — audible and synced, but the sampler can't grab it.
+      st.captureOk = false;
+      st.mode = 'plain';
+      jukeHint('that host blocks audio capture — it\u2019ll play, but the sampler can\u2019t grab it');
+      el.onended = () => { if (alive() && !st.paused) { st.playing = false; jukeOnPlayerEnded(); } };
+      try {
+        const pr = el.play();
+        if (pr && pr.catch) pr.catch(() => { /* autoplay watchdog raises tap-to-join */ });
+        st.playing = true; st.paused = false;
+      } catch (e) { /* watchdog handles it */ }
+    };
+    el.onerror = () => { if (alive()) { juke.playerErrored = true; jukeOnTrackError(); } };
+    el.src = d.url;
+    try { el.load(); } catch (e) {}
+  } catch (e) { jukeOnTrackError(); }
+}
+
+/* Test seam: time-domain RMS of whatever the direct path is feeding the
+   chain right now (null when nothing is routed). */
+function jukeDirectRms() {
+  const st = juke.direct;
+  if (!st || !st.an) return null;
+  try {
+    const b = new Float32Array(st.an.fftSize);
+    st.an.getFloatTimeDomainData(b);
+    let s = 0;
+    for (let i = 0; i < b.length; i++) s += b[i] * b[i];
+    return Math.sqrt(s / b.length);
+  } catch (e) { return null; }
 }
 
 /* External links (spotify, bandcamp, anything else): no embed exists, so
    the room counts down together and everyone presses play in their own
    app. Manual skip ends it — no auto-advance without a duration. */
 function jukePlayExternal(d) {
-  document.getElementById('juke-yt-holder').style.display = 'none';
-  document.getElementById('juke-sc-holder').style.display = 'none';
+  // Holders are permanently invisible (build 25 CSS); stopping the player
+  // is all it takes.
   jukeStopPlayer();
   juke.player = {
     kind: 'external',
@@ -3168,13 +3758,19 @@ function jukeArmProgress() {
 
 function jukeStopPlayer() {
   clearTimeout(juke.extTimer);
+  clearTimeout(juke.watchT); juke.watchT = null;
   const cd = document.getElementById('juke-countdown');
   if (cd) { cd.style.display = 'none'; cd.textContent = ''; }
-  if (juke.player) { try { juke.player.destroy(); } catch (e) {} juke.player = null; }
-  const yh = document.getElementById('juke-yt-holder');
-  const sh = document.getElementById('juke-sc-holder');
-  if (yh) { yh.style.display = 'none'; yh.innerHTML = ''; }
-  if (sh) { sh.style.display = 'none'; sh.innerHTML = ''; }
+  if (juke.player) {
+    try { juke.player.destroy(); } catch (e) {}
+    // Warm provider players live on (their destroy() only stops playback);
+    // transient per-track players and direct-audio nodes tear down fully.
+    juke.player = null;
+  }
+  juke.playerErrored = false;
+  jukeStopDirect();
+  // Holders stay in the DOM, permanently invisible (build 25) — the warm
+  // players inside them must never be nuked here.
 }
 function jukeStopPlayback() {
   jukeStopPlayer();
@@ -3282,6 +3878,7 @@ function jukeProviderIcon(p) {
     : p === 'youtube-playlist' ? '▶ playlist'
     : p === 'soundcloud' ? '☁ sc'
     : p === 'soundcloud-set' || p === 'soundcloud-short' ? '☁ set'
+    : p === 'direct-audio' ? '⚡ direct'
     : '↗ ext';
 }
 
@@ -5041,6 +5638,9 @@ driftBtn.addEventListener('click', () => {
   try { localStorage.setItem('limbo_name', raw); } catch (e) { /* ignore */ }
   audio.init(active ? active.root : NEXUS_DEF.root);
   try { if (localStorage.getItem('limbo_muted')) setMuted(audio.toggleMute()); } catch (e) { /* ignore */ }
+  // Build 25: the tap is a user gesture — warm the jukebox provider players
+  // now so the first queued track starts fast.
+  try { jukePrewarm(); } catch (e) { /* jukebox is best-effort */ }
   overlayEl.classList.add('gone');
   started = true;
   hintTimer = setTimeout(() => hintEl.classList.add('gone'), 15000);
@@ -5427,6 +6027,22 @@ window.__limbo = {
     for (let k = 0; k < d.length; k++) sum += d[k] * d[k];
     return Math.sqrt(sum / d.length);
   },
+  // build 25: which pad the last grab landed in + ring-buffer signal level
+  jamLastGrabSlot: () => jam.lastGrabSlot,
+  jamTestRingRms: (sec) => {
+    const r = jam.rec;
+    if (!r) return null;
+    try {
+      const L = r.ring.length;
+      const n = Math.min(L, Math.floor((sec || 4) * r.ctx.sampleRate));
+      let s = 0;
+      for (let k = 0; k < n; k++) {
+        const idx = (((r.w - 1 - k) % L) + L) % L;
+        s += r.ring[idx] * r.ring[idx];
+      }
+      return Math.sqrt(s / n);
+    } catch (e) { return null; }
+  },
   // community wall (build 18; build 19: planeW/planeH report the
   // in-world size so tests can verify the 2x scale-up)
   wallState: () => {
@@ -5526,7 +6142,20 @@ window.__limbo = {
     try { o.dur = juke.player.dur(); } catch (e) { o.dur = null; }
     try { o.state = juke.player.state ? juke.player.state() : null; } catch (e) {}
     try { o.playingFlag = !!juke.player.playingFlag; } catch (e) {}
+    try { if (!o.playingFlag && typeof juke.player.playing === 'function') o.playingFlag = !!juke.player.playing(); } catch (e) {}
+    try { o.warm = !!juke.player.warm; } catch (e) {}
+    try { if (juke.direct) { o.directMode = juke.direct.mode; o.captureOk = !!juke.direct.captureOk; } } catch (e) {}
     return o;
   },
+  // build 25 test seams: invisible players + direct audio
+  jukePrewarm: () => jukePrewarm(),
+  jukeWarmState: () => ({
+    prewarmed: juke.prewarmed,
+    yt: !!(juke.warmYt && juke.warmYt.ready),
+    sc: !!(juke.warmSc && juke.warmSc.ready),
+  }),
+  jukeDirectRms: () => jukeDirectRms(),
+  // phone-first: WebAudio unlock state (must be 'running' after a gesture)
+  audioCtxState: () => { try { return audio.ctx ? audio.ctx.state : null; } catch (e) { return null; } },
   jukeSkipVotes: (id) => (juke.skips[id] ? [...juke.skips[id]] : []),
 };
