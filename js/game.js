@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=27';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=27';
+import { LimboNet } from './net.js?v=28';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=28';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -115,6 +115,8 @@ const jukeBtn         = document.getElementById('juke-btn');
 const jukePanel       = document.getElementById('juke-panel');
 const paintEraserBtn  = document.getElementById('paint-eraser');
 const paintUndoBtn    = document.getElementById('paint-undo');
+const paintBlendBtn   = document.getElementById('paint-blend');
+const paintSaveBtn    = document.getElementById('paint-save');
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -714,7 +716,7 @@ function livePresenceFor(name) {
   let best = null;
   for (const [pid, p] of net.lobbyPeers) {
     if (String(p.name).toLowerCase() === lc && (!best || p.lastSeen > best.lastSeen)) {
-      best = { peerId: pid, name: p.name, room: p.room, dj: p.dj || null, lastSeen: p.lastSeen };
+      best = { peerId: pid, name: p.name, room: p.room, lastSeen: p.lastSeen };
     }
   }
   return best;
@@ -748,8 +750,7 @@ function renderFriendsSection() {
     if (live) {
       const where = document.createElement('span');
       where.className = 'friend-realm';
-      // A live friend shows "is live" instead of the room name.
-      where.textContent = live.dj ? '\u{1F534} live' : realmDisplayName(live.room);
+      where.textContent = realmDisplayName(live.room);
       const join = document.createElement('button');
       join.className = 'friend-join';
       join.textContent = 'join';
@@ -773,143 +774,39 @@ function renderFriendsSection() {
   if (friendsLiveEl) friendsLiveEl.textContent = liveCount > 0 ? `— ${liveCount} drifting now` : '';
 }
 
-/* ---------------- sound room: DJ slot + listeners (build 12) ----------------
-   One DJ at a time. The DJ shares desktop audio (Chrome tab share); the
-   room claims resolve through net's djClaim channel (earliest fresh claim
-   wins) and the audio rides Trystero's media API (addTrack/onPeerTrack).
-   Listeners hear the same room-wide mix. An analyser on either side feeds
-   the room's bass-reactive lights. */
+/* ---------------- sound room: shared jam + jukebox (build 12; broadcast relay retired build 28) ----------------
+   No DJ slot anymore: every jammer's notes broadcast live (jamNote) and the
+   jukebox stays in sync by wall clock, so a "go live" relay earned nothing
+   but confusion. A bus analyser feeds the room's bass-reactive lights. */
 
-const djLineEl = document.getElementById('dj-line');
-const liveBtn = document.getElementById('live-btn');
+let roomBassSmooth = 0; // 0..1, eased — drives the room pulse
+let roomAnalyser = null; // {comp, analyser, data} — FFT tap on the jam bus (build 28)
 
-const dj = {
-  active: false,      // WE are live (relaying our mix)
-  stream: null,       // our MediaStreamDestination stream (live side)
-  track: null,
-  dest: null,         // MediaStreamDestination hanging off the jam bus
-  source: null,       // 'live' while we're on air
-  sourceLabel: '',    // short HUD label, e.g. "live mix"
-  node: null,         // DJ-side analyser source node
-  analyser: null,
-  analyserData: null,
-  listenPeerId: null, // whose track we're hearing (listener side)
-  listenNode: null,
-  listenAnalyser: null,
-  listenAnalyserData: null,
-  listenAudioEl: null,
-};
-let djBassSmooth = 0; // 0..1, eased — drives the room pulse
-let djAudioRetryArmed = false;
-
-/* Small FFT on a stream; the room only cares about bass. Reuses the game's
-   AudioContext when the generative engine is running. */
-function makeAnalyserFor(stream) {
+/* Room analyser (build 28): a tiny FFT hanging off the jam master bus.
+   Feeds the bass-reactive lights and the auto-BPM detector. With
+   create=false it never builds the audio chain — safe for the render loop. */
+function roomAnalyserGet(create) {
+  const ch = create ? jamEnsureChain() : ((audio.ctx && jam.chain) || null);
+  if (!ch || !ch.comp || !audio.ctx) return null;
+  if (roomAnalyser && roomAnalyser.comp === ch.comp) return roomAnalyser;
   try {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    let ctx = null;
-    try { ctx = audio.ctx || null; } catch (e) {}
-    if (!ctx) {
-      if (!AC) return null;
-      ctx = new AC();
-    }
-    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
-    const node = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
+    const analyser = audio.ctx.createAnalyser();
     analyser.fftSize = 64; // 32 bins; bass lives in the first few
-    node.connect(analyser);
-    return { node, analyser, data: new Uint8Array(analyser.frequencyBinCount) };
-  } catch (e) {
-    return null;
-  }
+    ch.comp.connect(analyser);
+    roomAnalyser = { comp: ch.comp, analyser, data: new Uint8Array(analyser.frequencyBinCount) };
+  } catch (e) { roomAnalyser = null; }
+  return roomAnalyser;
 }
 
-function detachDjAnalyser() {
-  if (dj.node) { try { dj.node.disconnect(); } catch (e) {} dj.node = null; }
-  dj.analyser = null;
-  dj.analyserData = null;
-}
-
-/* Listener side: play the DJ's stream room-wide (not spatialized). */
-function attachDjListener(stream) {
-  detachDjListener();
-  const el = document.createElement('audio');
-  el.srcObject = stream;
-  el.autoplay = true;
-  el.playsInline = true;
-  try { el.muted = audio.muted; } catch (e) {}
-  dj.listenAudioEl = el;
-  const a = makeAnalyserFor(stream);
-  if (a) {
-    dj.listenNode = a.node;
-    dj.listenAnalyser = a.analyser;
-    dj.listenAnalyserData = a.data;
-  }
-  const tryPlay = () => el.play().catch(() => {
-    // Autoplay policy: wait for the next gesture, then try again.
-    if (djAudioRetryArmed) return;
-    djAudioRetryArmed = true;
-    const retry = () => {
-      djAudioRetryArmed = false;
-      window.removeEventListener('pointerdown', retry);
-      if (dj.listenAudioEl === el) tryPlay();
-    };
-    window.addEventListener('pointerdown', retry);
-  });
-  tryPlay();
-}
-
-function detachDjListener() {
-  if (dj.listenAudioEl) {
-    try { dj.listenAudioEl.pause(); } catch (e) {}
-    dj.listenAudioEl.srcObject = null;
-    dj.listenAudioEl = null;
-  }
-  if (dj.listenNode) { try { dj.listenNode.disconnect(); } catch (e) {} dj.listenNode = null; }
-  dj.listenAnalyser = null;
-  dj.listenAnalyserData = null;
-  dj.listenPeerId = null;
-}
-
-/* Earliest fresh claim wins — ours included when we're live. */
-function djWinner() {
-  let best = null;
-  if (net.myDjClaim) best = { name: myName, isSelf: true, t: net.myDjClaim.t, sourceLabel: dj.sourceLabel };
-  for (const [pid, c] of net.djClaims) {
-    if (!best || c.t < best.t) best = { name: c.name, isSelf: false, peerId: pid, t: c.t, sourceLabel: c.source };
-  }
-  return best;
-}
-
-function renderDjHud() {
+/* Sound-room chrome: show/hide the room's buttons when we drift between
+   rooms. (Build 28: the DJ HUD line and go-live button are gone.) */
+function renderRoomChrome() {
   const inRoom = !!(active && active.key === SOUND_ROOM_KEY);
   if (jamBtn) jamBtn.style.display = inRoom ? '' : 'none';
   if (paintBtn) paintBtn.style.display = inRoom ? '' : 'none';
   if (jukeBtn) jukeBtn.style.display = inRoom ? '' : 'none';
   if (!inRoom && paint.open) setPaintOpen(false); // paint mode can't leave the room
   if (!inRoom) jukeLeaveRoom(); // the jukebox only plays in the sound room
-  if (liveBtn) {
-    liveBtn.style.display = inRoom ? '' : 'none';
-    if (inRoom) {
-      liveBtn.innerHTML = dj.active ? '&#9632; stop' : '&#128308; go live';
-      liveBtn.classList.toggle('on-air', dj.active);
-    }
-  }
-  if (!djLineEl) return;
-  if (!inRoom) {
-    djLineEl.textContent = '';
-    djLineEl.style.display = 'none';
-    return;
-  }
-  const w = djWinner();
-  if (w) {
-    const n = net.peers.size + 1;
-    const src = w.sourceLabel ? ` \u00B7 ${w.sourceLabel}` : '';
-    djLineEl.textContent = `\u{1F534} ${w.name} is live \u00B7 ${n} listening${src}`;
-  } else {
-    djLineEl.textContent = 'nobody is live \u2014 go live and play for the room';
-  }
-  djLineEl.style.display = '';
 }
 
 /* Make sure the WebAudio engine is up and running. The drift tap calls
@@ -920,81 +817,6 @@ function audioEnsureRunning() {
     if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
   } catch (e) {}
   return !!(audio.ctx && audio.master);
-}
-
-/* ---------------- go live (build 27) ----------------
-   The decks are gone. "Go live" relays YOUR local mix to the room: the
-   jam master bus (instruments + mic, through reverb/delay/limiter) plus
-   any CORS-open jukebox track already riding the chain. A
-   MediaStreamDestination hangs off the post-limiter bus and its track
-   goes out over Trystero exactly like the old deck streams did, so the
-   listener side keeps working untouched. Synced provider jukebox tracks
-   (YouTube / SoundCloud) already play on every device anyway, so the
-   room hears everything. Local mute stays personal: the relay taps the
-   bus pre-master. */
-
-async function goLive() {
-  if (dj.active) return true;
-  if (!active || active.key !== SOUND_ROOM_KEY) return false;
-  try {
-    if (!audioEnsureRunning()) return false;
-    const ch = jamEnsureChain(); // the mix bus we relay
-    if (!ch || !ch.comp) return false;
-    const dest = audio.ctx.createMediaStreamDestination();
-    ch.comp.connect(dest); // post-limiter, pre-master
-    const stream = dest.stream;
-    const track = stream.getAudioTracks()[0] || null;
-    dj.dest = dest;
-    dj.stream = stream;
-    dj.track = track;
-    dj.source = 'live';
-    dj.sourceLabel = 'live mix';
-    dj.active = true;
-    const a = makeAnalyserFor(stream);
-    if (a) { dj.node = a.node; dj.analyser = a.analyser; dj.analyserData = a.data; }
-    if (net.enabled) {
-      if (track) net.djStart(track, stream);
-      net.setDjSource('live mix');
-      net.setDj(SOUND_ROOM_KEY); // friends see "is live" in the lobby heartbeat
-    }
-    jamOnBecomeDj(); // start the shared beat clock (broadcasts only when net is up)
-    addSystemLine('you\u2019re live \u2014 the room hears your mix');
-    renderDjHud();
-    renderFriendsSection();
-    return true;
-  } catch (e) {
-    addSystemLine('couldn\u2019t go live \u2014 ' + (e && e.message ? e.message : 'audio unavailable'));
-    return false;
-  }
-}
-
-function stopLive(yielded = false, byName = '') {
-  if (!dj.active) return;
-  dj.active = false;
-  jamStopClock(); // the grid dies with the set — a new live set starts a fresh one
-  jamStopRecorder(); // the sampler's ring buffer dies with the relay
-  detachDjAnalyser();
-  // Unhook the relay tap; the jam bus itself keeps playing locally.
-  try {
-    const ch = jamEnsureChain();
-    if (ch && ch.comp && dj.dest) { try { ch.comp.disconnect(dj.dest); } catch (e2) {} }
-  } catch (e) {}
-  try { if (dj.track) dj.track.stop(); } catch (e) {}
-  dj.dest = null;
-  dj.source = null;
-  dj.sourceLabel = '';
-  dj.track = null;
-  dj.stream = null;
-  net.djStop(); // release the claim + pull the track
-  net.setDj(null);
-  if (yielded && byName) {
-    showUnlockToast([`${byName} went live`]);
-    addSystemLine(`${byName} went live`);
-  } else if (!yielded) {
-    addSystemLine('you went quiet');
-  }
-  renderDjHud();
-  renderFriendsSection();
 }
 
 /* ---------------- jam room (build 13) ----------------
@@ -1073,16 +895,18 @@ const jam = {
   bpm: 120,
   startWall: null, // Date.now() epoch of beat 0; null = clock stopped
   clockBy: null, // whose clock we're following
-  manual: false, // DJ overrode BPM this session (auto-detect paused)
+  clockMsgT: 0, // t of the last clock we accepted or broadcast (last-writer-wins)
+  clockLastRemote: 0, // when we last heard someone else's clock
+  manual: false, // manual tempo override (auto-detect paused)
   instrument: 'lead', // build 20: this player's instrument
   wave: 'sawtooth',
   cutoff: 1800,
   reso: 5,
   pads: [null, null, null, null], // AudioBuffers, local to this client
   padRound: 0, // next pad to fill on grab (round-robin)
-  rec: null, // ring-buffer recorder on the DJ stream
+  rec: null, // ring-buffer recorder on the jam bus
   jammers: new Map(), // name -> {t, inst} (30s window)
-  detector: null, // OnsetDetector, while we're the DJ
+  detector: null, // OnsetDetector for auto-BPM
   detStable: 0,
   detLast: null,
   chain: null, // build 20: jam master bus (bus -> sends -> comp -> master)
@@ -1473,6 +1297,7 @@ function jamRenderNoteBassSafe(midi, vel, audioTime) {
    `kind` selects the instrument; every broadcast carries inst so peers
    render your voice, not theirs. */
 function jamBroadcastNote(payload) {
+  if (active && active.key === SOUND_ROOM_KEY) jamEnsureClock();
   if (net.enabled && net.sendJamNote && active && active.key === SOUND_ROOM_KEY) {
     try {
       net.sendJamNote({ n: myName, inst: jam.instrument, ...payload });
@@ -1583,22 +1408,51 @@ function handleJamPad(d, peerId) {
    from a deposed DJ are ignored — the new DJ's grid takes over. */
 function handleJamClock(d, peerId) {
   if (!d || !Number.isFinite(Number(d.bpm)) || !Number.isFinite(Number(d.startWall))) return;
-  const w = djWinner();
-  if (!w || w.isSelf) return; // we never follow our own echo
-  if (w.peerId !== peerId) return; // not the DJ's clock
+  if (peerId && net.selfId && String(peerId) === String(net.selfId)) return; // never follow our own echo
+  const t = Number(d.t) || 0;
+  if (jam.startWall != null && t < (jam.clockMsgT || 0)) return; // stale: a newer grid already won
   jam.bpm = Math.max(60, Math.min(200, Number(d.bpm)));
   jam.startWall = Number(d.startWall);
-  jam.clockBy = String(d.by || w.name).slice(0, 16);
+  jam.clockBy = String(d.by || 'drifter').slice(0, 16);
+  jam.clockMsgT = t;
+  jam.clockLastRemote = Date.now();
   jamSyncDelayToBpm();
   renderJamTransport();
 }
 
+/* Clock leadership (build 28): with no DJ, the grid is whoever's is
+   freshest. We hold the clock when no one else's has been heard recently;
+   only the holder re-broadcasts, so the room converges instead of fighting. */
+function jamClockOurs() {
+  return Date.now() - (jam.clockLastRemote || 0) > 20000;
+}
+
 function jamBroadcastClock() {
-  if (!dj.active || !net.enabled || !net.sendJamClock) return;
+  if (!net.enabled || !net.sendJamClock) return;
   if (jam.startWall == null) return;
+  if (!jamClockOurs()) return; // someone fresher holds the grid
+  const t = Date.now();
+  jam.clockMsgT = t;
+  jam.clockBy = myName;
   try {
-    net.sendJamClock({ bpm: jam.bpm, startWall: jam.startWall, by: myName });
+    net.sendJamClock({ bpm: jam.bpm, startWall: jam.startWall, by: myName, t });
   } catch (e) { /* ignore */ }
+}
+
+/* The grid starts when the music starts: the first local note with no
+   clock running claims a fresh clock and tells the room. */
+function jamEnsureClock() {
+  if (jam.startWall != null) return;
+  jam.manual = false;
+  jam.detector = new OnsetDetector();
+  jam.detStable = 0;
+  jam.detLast = null;
+  jamTaps = [];
+  jam.startWall = Date.now();
+  jam.clockBy = myName;
+  jam.clockMsgT = jam.startWall;
+  jamBroadcastClock();
+  renderJamTransport();
 }
 
 /* Set the tempo. Phase-preserving: the grid doesn't jump — the current
@@ -1622,23 +1476,9 @@ function jamStopClock() {
   renderJamTransport();
 }
 
-/* We just went live: fresh grid, auto-detect armed for this session. */
-function jamOnBecomeDj() {
-  jam.manual = false;
-  jam.detector = new OnsetDetector();
-  jam.detStable = 0;
-  jam.detLast = null;
-  jamTaps = [];
-  jam.startWall = Date.now();
-  jam.clockBy = myName;
-  jamBroadcastClock();
-  renderJamTransport();
-}
-
 /* Tap tempo: 3+ taps set the BPM from the median interval. Any manual
-   tempo move pauses auto-detect for the rest of the DJ session. */
+   tempo move pauses auto-detect for the rest of the session. */
 function jamTapTempo() {
-  if (!dj.active) return;
   const now = Date.now();
   if (jamTaps.length && now - jamTaps[jamTaps.length - 1] > 2000) jamTaps = [];
   jamTaps.push(now);
@@ -1656,12 +1496,15 @@ function jamTapTempo() {
   }
 }
 
-/* Auto-BPM: once a second, feed the DJ stream's analyser to the onset
-   detector and adopt a stable new estimate. Runs only while WE are the
-   DJ and only until a manual override. */
+/* Auto-BPM: once a second, feed the room bus's analyser to the onset
+   detector and adopt a stable new estimate. Runs only while we hold the
+   clock, and only until a manual override. */
 function jamDetectTick() {
-  if (!dj.active || jam.manual) return;
-  const an = dj.analyser;
+  if (jam.manual) return;
+  if (!(active && active.key === SOUND_ROOM_KEY)) return;
+  if (!jamClockOurs()) return; // only the clock holder auto-detects
+  const ra = roomAnalyserGet(true);
+  const an = ra && ra.analyser;
   if (!an) return;
   if (!jam.detector) jam.detector = new OnsetDetector();
   const est = estimateBpm(jam.detector.process(an));
@@ -1682,10 +1525,15 @@ function jamDetectTick() {
   }
 }
 setInterval(jamDetectTick, 1000);
+/* Build 28: the shared grid re-broadcasts every 15s so late joiners land
+   on the beat (replaces the old DJ heartbeat). */
+setInterval(() => {
+  try { if (active && active.key === SOUND_ROOM_KEY) jamBroadcastClock(); } catch (e) {}
+}, 15000);
 
-/* ---------------- sampler: ring buffer on the DJ stream ----------------
-   A ScriptProcessorNode taps the DJ stream (ours when we're on the
-   decks, the remote one when we're listening) into a 12s mono ring
+/* ---------------- sampler: ring buffer on the jam bus ----------------
+   A ScriptProcessorNode taps the jam master bus (post-limiter: jam +
+   jukebox + mic, i.e. what the room hears) into a 12s mono ring
    buffer. "Grab loop" copies the last 2 bars into the next pad — aligned
    to the most recent 2-bar boundary when the beat clock is on, so the pad
    starts exactly on a bar line and loops cleanly (build 17; before that,
@@ -1700,25 +1548,29 @@ function jamStopRecorder() {
   jam.rec = null;
   if (!rec) return;
   try { rec.proc.onaudioprocess = null; } catch (e) {}
+  try { if (rec.bus && rec.tap) rec.bus.disconnect(rec.tap); } catch (e) {}
   try { rec.src.disconnect(); } catch (e) {}
   try { rec.proc.disconnect(); } catch (e) {}
   try { rec.sink.disconnect(); } catch (e) {}
-  try { if (rec.jamTap) rec.jamTap.disconnect(); } catch (e) {}
 }
 
 function jamEnsureRecorder() {
-  const stream =
-    dj.stream || (dj.listenAudioEl && dj.listenAudioEl.srcObject) || null;
-  if (!stream) return null;
-  if (jam.rec && jam.rec.stream === stream) return jam.rec;
+  const ch = jamEnsureChain();
+  if (!ch || !ch.comp) return null;
+  if (jam.rec && jam.rec.bus === ch.comp) return jam.rec;
   jamStopRecorder();
   try {
     const ctx = audio.ctx;
     if (!ctx || typeof ctx.createScriptProcessor !== 'function') return null;
-    const src = ctx.createMediaStreamSource(stream);
+    // Tap head straight on the post-limiter bus: the ring hears the whole
+    // local room mix (jam + jukebox + mic), exactly what the room hears.
+    const tap = ctx.createGain();
+    tap.gain.value = 1;
+    ch.comp.connect(tap);
+    const src = tap;
     const proc = ctx.createScriptProcessor(4096, 2, 1);
     const ringLen = Math.floor(ctx.sampleRate * 12);
-    const rec = { stream, ctx, src, proc, ring: new Float32Array(ringLen), w: 0, total: 0, sink: null };
+    const rec = { bus: ch.comp, tap, ctx, src, proc, ring: new Float32Array(ringLen), w: 0, total: 0, sink: null };
     const sink = ctx.createGain();
     sink.gain.value = 0; // ScriptProcessor needs a connected output to run
     rec.sink = sink;
@@ -1735,19 +1587,6 @@ function jamEnsureRecorder() {
     src.connect(proc);
     proc.connect(sink);
     sink.connect(ctx.destination);
-    /* Build 20: the sampler grabs the jam bus post-effects too — the ring
-       now hears the live mix + jam (reverb, delay, limiter), i.e. what the room
-       hears. The tap is parallel; the DJ's own path is untouched. */
-    const ch = jamEnsureChain();
-    if (ch && ch.comp) {
-      try {
-        const tap = ctx.createGain();
-        tap.gain.value = 1;
-        ch.comp.connect(tap);
-        tap.connect(proc);
-        rec.jamTap = tap;
-      } catch (e) { /* live-mix-only grab still works */ }
-    }
     jam.rec = rec;
     return rec;
   } catch (e) {
@@ -1758,7 +1597,7 @@ function jamEnsureRecorder() {
 function jamGrabLoop() {
   const rec = jamEnsureRecorder();
   if (!rec) {
-    showUnlockToast(['need someone live to sample \u{1F3A7}']);
+    showUnlockToast(['nothing to sample yet \u{1F3A7}']);
     renderJamSamplerHint();
     return false;
   }
@@ -2023,6 +1862,7 @@ function jamPlayPad(i, audioTime) {
 /* Tap a pad: quantized to the next bar (or immediately, no clock).
    The trigger is broadcast; every client plays its OWN local copy. */
 function jamTriggerPad(i) {
+  if (active && active.key === SOUND_ROOM_KEY) jamEnsureClock();
   if (!jam.pads[i]) {
     showUnlockToast(['pad empty — grab a loop first']);
     return false;
@@ -2116,8 +1956,11 @@ function wallNoteStroke() {
 }
 
 /* Raw polyline draw — no bookkeeping. Callers note the stroke once per
-   gesture/message. pts are normalized 0..1; size is wall pixels. */
-function wallDrawSeg(pts, color, sizePx) {
+   gesture/message. pts are normalized 0..1; size is wall pixels.
+   blend (build 28): smudge what's already on the canvas instead of laying
+   down a color — a real finger-paint, not a translucent overlay. */
+function wallDrawSeg(pts, color, sizePx, blend) {
+  if (blend) { wallDrawBlendSeg(pts, sizePx, wall.ctx); return; }
   const c = wall.ctx;
   if (!c || !pts || pts.length === 0) return;
   c.save();
@@ -2139,6 +1982,66 @@ function wallDrawSeg(pts, color, sizePx) {
   c.restore();
 }
 
+/* Build 28 (blend brush): sample a small box of the canvas and average it.
+   The smudge brush paints with what it picks up — a real finger-paint. */
+function wallSampleBox(ctx, x, y, half) {
+  const sx = Math.max(0, Math.min(WALL_W - 1, Math.round(x - half)));
+  const sy = Math.max(0, Math.min(WALL_H - 1, Math.round(y - half)));
+  const sw = Math.max(1, Math.min(WALL_W - sx, half * 2 + 1));
+  const sh = Math.max(1, Math.min(WALL_H - sy, half * 2 + 1));
+  let d = null;
+  try { d = ctx.getImageData(sx, sy, sw, sh).data; } catch (e) { return WALL_BG_RGB.slice(); }
+  let r = 0, g = 0, b = 0;
+  const n = d.length / 4;
+  for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+  return [r / n, g / n, b / n];
+}
+
+function wallStampSoft(ctx, x, y, r, rgb, alpha) {
+  const col = `rgba(${rgb[0] | 0},${rgb[1] | 0},${rgb[2] | 0},`;
+  const gr = ctx.createRadialGradient(x, y, 0, x, y, r);
+  gr.addColorStop(0, col + alpha + ')');
+  gr.addColorStop(0.65, col + (alpha * 0.55) + ')');
+  gr.addColorStop(1, col + '0)');
+  ctx.fillStyle = gr;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+/* The smudge: drags the paint that's already on the canvas. The brush
+   picks up the average color under each dab and mixes it into what it's
+   carrying, then stamps a soft dab of the mix. The same algorithm runs
+   for local, remote, and replayed strokes, so every client renders the
+   same smudge from the same stroke data. */
+function wallDrawBlendSeg(pts, sizePx, ctx) {
+  const c = ctx || wall.ctx;
+  if (!c || !pts || pts.length === 0) return;
+  const r = Math.max(3, sizePx / 2);
+  const k = 0.45, alpha = 0.55; // pickup rate, dab opacity
+  let pick = wallSampleBox(c, pts[0][0] * WALL_W, pts[0][1] * WALL_H, 3);
+  c.save();
+  let px = pts[0][0] * WALL_W, py = pts[0][1] * WALL_H;
+  wallStampSoft(c, px, py, r, pick, alpha);
+  for (let i = 1; i < pts.length; i++) {
+    const x = pts[i][0] * WALL_W, y = pts[i][1] * WALL_H;
+    const under = wallSampleBox(c, x, y, 3);
+    pick = [pick[0] + (under[0] - pick[0]) * k,
+            pick[1] + (under[1] - pick[1]) * k,
+            pick[2] + (under[2] - pick[2]) * k];
+    // soft dabs along the segment so fast drags don't dotted-line
+    const dx = x - px, dy = y - py;
+    const dist = Math.hypot(dx, dy);
+    const step = Math.max(2, r * 0.45);
+    const n = Math.max(1, Math.floor(dist / step));
+    for (let j = 1; j <= n; j++) {
+      wallStampSoft(c, px + (dx * j) / n, py + (dy * j) / n, r, pick, alpha);
+    }
+    px = x; py = y;
+  }
+  c.restore();
+}
+
 /* Build 26 (undo): the stroke log. Each entry is one full gesture:
    {id, points, color, size, eraser, byMe}. wallLogAppend either appends a
    chunk to an existing entry (same gesture id — e.g. the flush chunks of
@@ -2146,7 +2049,7 @@ function wallDrawSeg(pts, color, sizePx) {
    this only logs. Pixels are never dropped here — only undo depth. */
 function wallNextStrokeId() { return wall.selfId + '-' + (wall.strokeSeq++); }
 
-function wallLogAppend(id, points, color, size, byMe) {
+function wallLogAppend(id, points, color, size, byMe, blend) {
   let e = null;
   for (const x of wall.log) if (x.id === id) { e = x; break; }
   if (e) {
@@ -2156,7 +2059,7 @@ function wallLogAppend(id, points, color, size, byMe) {
   } else {
     e = {
       id, points: points.map((p) => [p[0], p[1]]),
-      color, size, eraser: color === WALL_BG, byMe: !!byMe,
+      color, size, eraser: color === WALL_BG, byMe: !!byMe, blend: !!blend,
     };
     wall.log.push(e);
     wallNoteStroke();
@@ -2181,9 +2084,9 @@ function wallRedraw() {
   c.fillRect(0, 0, WALL_W, WALL_H);
   c.restore();
   try { c.drawImage(wall.base, 0, 0, WALL_W, WALL_H); } catch (err) {}
-  for (const e of wall.log) wallDrawSeg(e.points, e.color, e.size);
+  for (const e of wall.log) wallDrawSeg(e.points, e.color, e.size, e.blend);
   if (typeof paint !== 'undefined' && paint.drawing && paint.gesture && paint.gesture.points.length) {
-    wallDrawSeg(paint.gesture.points, paint.gesture.color, paint.gesture.size);
+    wallDrawSeg(paint.gesture.points, paint.gesture.color, paint.gesture.size, paint.gesture.blend);
   }
   wallMarkDirty();
 }
@@ -2225,6 +2128,7 @@ function wallValidStroke(d) {
   if (d.id !== undefined && (typeof d.id !== 'string' || d.id.length === 0 || d.id.length > 64)) return false;
   if (typeof d.c !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(d.c)) return false;
   if (typeof d.s !== 'number' || !(d.s >= 1 && d.s <= 120)) return false;
+  if (d.b !== undefined && d.b !== 1) return false; // build 28: blend flag
   if (!Array.isArray(d.pts) || d.pts.length === 0 || d.pts.length > 64) return false;
   for (const p of d.pts) {
     if (!Array.isArray(p) || p.length !== 2) return false;
@@ -2241,8 +2145,8 @@ function handleWallStroke(d, peerId) {
   const id = (typeof d.id === 'string' && d.id)
     ? d.id
     : 'legacy-' + String(peerId || 'x').slice(0, 24) + '-' + (wall.strokeSeq++);
-  wallDrawSeg(d.pts, d.c, d.s);
-  wallLogAppend(id, d.pts, d.c, d.s, false);
+  wallDrawSeg(d.pts, d.c, d.s, d.b === 1);
+  wallLogAppend(id, d.pts, d.c, d.s, false, d.b === 1);
   if (paint.open) paintMirror(); // someone's painting while we paint
 }
 
@@ -2452,9 +2356,8 @@ function wallSample() {
    jukePlay. Watchdog: if a track has been over >8s with no new jukePlay,
    ANY peer may broadcast the advance — first jukePlay wins, ties broken
    by earliest startedAt (1.5s contention window).
-   While someone is live the jukebox auto-pauses; when they stop,
-   leaves, someone resumes the queue with a fresh startedAt (jittered,
-   first broadcast wins). */
+   (Build 28: the old "DJ live pauses the jukebox" rule died with the
+   broadcast relay — the jukebox just keeps playing.) */
 
 const juke = {
   open: false,
@@ -2470,8 +2373,6 @@ const juke = {
   scApiReady: false, scApiLoading: false, scApiQueue: [],
   resyncTimer: null, endTimer: null, progressTimer: null,
   overSince: 0,       // Date.now() when the current track was first seen over
-  pausedForDj: false,
-  djResumeTimer: null,
   joinWaiting: false, // autoplay blocked: pulsing "tap to join the music"
   prewarmed: false,   // build 25: first user gesture warms the provider players
   warmYt: null,       // {player, ready, queue} persistent invisible YT player
@@ -2807,8 +2708,8 @@ async function jukeAddTrack(rawUrl, titleHint) {
     try { net.sendJukeAdd(t); } catch (e) { /* best effort */ }
   }
   renderJuke();
-  // Room idle and no DJ: we queued it, we start it — inside the tap gesture.
-  if (!juke.now && !juke.pausedForDj && !djWinner()) jukeAdvance();
+  // Room idle: we queued it, we start it — inside the tap gesture.
+  if (!juke.now) jukeAdvance();
   if (!resolvedTitle) jukeEnrichTitle(t);
   return t;
 }
@@ -2861,7 +2762,7 @@ async function jukeAddPlaylist(url, det, titleHint) {
   }
   renderJuke();
   if (items.length) jukeHint(`queued ${items.length} track${items.length === 1 ? '' : 's'} — enjoy the set`);
-  if (!juke.now && !juke.pausedForDj && !djWinner()) jukeAdvance();
+  if (!juke.now) jukeAdvance();
   return items;
 }
 
@@ -3005,7 +2906,7 @@ async function jukeAddPhoneFile(file) {
   if (net.enabled && net.sendJukeAdd) { try { net.sendJukeAdd(item); } catch (e) {} }
   jukeHint(`\u{1F4F1} "${stem}" queued \u2014 the room pulls it from your phone when it plays`);
   renderJuke();
-  if (!juke.now && !juke.pausedForDj && !djWinner()) jukeAdvance(); // empty room: starts now
+  if (!juke.now) jukeAdvance(); // empty room: starts now
   return item;
 }
 
@@ -3160,7 +3061,6 @@ function handleJukeFileHave(d, peerId) {
    the broadcaster (queuer of the finished track, skipper, watchdog,
    DJ-leave resumer). */
 function jukeAdvance() {
-  if (juke.pausedForDj) return null;
   const next = juke.queue.shift() || null;
   if (!next) {
     const msg = { stopped: true, by: myName, startedAt: Date.now() };
@@ -3234,7 +3134,6 @@ function jukeStartPlayback(d) {
   jukeStopPlayer();
   juke.joinWaiting = false;
   juke.playerErrored = false;
-  if (juke.pausedForDj) { renderJuke(); return; } // DJ live: hold, don't play
   const offset = jukeOffsetFor(d);
   if (d.provider === 'youtube') jukePlayYT(d, offset);
   else if (d.provider === 'soundcloud') jukePlaySC(d, offset);
@@ -3308,7 +3207,7 @@ function jukeArmPlayWatchdog(kind, d, recover) {
   };
   const tick = () => {
     juke.watchT = null;
-    if (!juke.now || juke.now.id !== d.id || juke.pausedForDj) return;
+    if (!juke.now || juke.now.id !== d.id) return;
     if (!juke.player || juke.player.kind !== kind) return;
     if (juke.playerErrored) return; // error binding fired the honest path
     if (isPlaying()) return;
@@ -3503,13 +3402,13 @@ function jukePlayYTFresh(d, offset) {
    move the room on to the next track. */
 let jukeErrAdvancedFor = null;
 function jukeOnTrackError() {
-  if (!juke.now || juke.pausedForDj) return;
+  if (!juke.now) return;
   if (jukeErrAdvancedFor === juke.now.id) return; // already handling it
   jukeErrAdvancedFor = juke.now.id;
   jukeHint('couldn\u2019t load that link — is it public?');
   if (juke.now.addedBy === myName) {
     setTimeout(() => {
-      if (juke.now && jukeErrAdvancedFor === juke.now.id && !juke.pausedForDj) jukeAdvance();
+      if (juke.now && jukeErrAdvancedFor === juke.now.id) jukeAdvance();
     }, 2500);
   }
 }
@@ -4027,12 +3926,12 @@ function jukeTrackOver() {
 }
 
 function jukeOnPlayerEnded() {
-  if (!juke.now || juke.pausedForDj) return;
+  if (!juke.now) return;
   // The queuer advances; everyone else waits for the broadcast (watchdog
   // covers the queuer vanishing).
   if (juke.now.addedBy === myName) {
     setTimeout(() => {
-      if (juke.now && jukeTrackOver() && juke.now.addedBy === myName && !juke.pausedForDj) jukeAdvance();
+      if (juke.now && jukeTrackOver() && juke.now.addedBy === myName) jukeAdvance();
     }, 1200);
   }
 }
@@ -4040,7 +3939,7 @@ function jukeOnPlayerEnded() {
 function jukeArmEndWatcher() {
   clearInterval(juke.endTimer);
   juke.endTimer = setInterval(() => {
-    if (!juke.now || juke.pausedForDj) return;
+    if (!juke.now) return;
     if (!jukeTrackOver()) { juke.overSince = 0; return; }
     if (!juke.overSince) juke.overSince = Date.now();
     const overFor = Date.now() - juke.overSince;
@@ -4058,7 +3957,7 @@ function jukeArmEndWatcher() {
 
 /* Every 20s: if our player drifted >2.5s from the room's clock, snap it. */
 function jukeResyncTick() {
-  if (!juke.now || juke.pausedForDj) return false;
+  if (!juke.now) return false;
   if (!juke.player || juke.player.kind === 'external') return false;
   const expected = jukeOffsetFor(juke.now);
   let pos = null;
@@ -4118,36 +4017,6 @@ function jukeStopPlayback() {
 
 /* ---------- DJ interaction ---------- */
 
-/* While a DJ is live the jukebox auto-pauses. When the DJ leaves, the
-   queue resumes where it left off — someone re-broadcasts the current
-   track with a fresh startedAt (jittered; first broadcast wins). */
-function jukeDjChanged(live) {
-  if (live && !juke.pausedForDj) {
-    if (juke.now) {
-      juke.pausedForDj = true;
-      jukeStopPlayback();
-      renderJuke();
-    }
-  } else if (!live && juke.pausedForDj) {
-    juke.pausedForDj = false;
-    renderJuke();
-    // Resume: re-broadcast the held track with a fresh startedAt. Jitter
-    // so only one peer does it; first jukePlay wins.
-    clearTimeout(juke.djResumeTimer);
-    const seenAt = juke.lastPlaySeenAt;
-    juke.djResumeTimer = setTimeout(() => {
-      if (juke.lastPlaySeenAt !== seenAt) return; // someone else resumed
-      if (!juke.now || juke.pausedForDj) return;
-      if (active && active.key !== SOUND_ROOM_KEY) return;
-      const d = { ...juke.now, startedAt: Date.now(), by: myName };
-      if (net.enabled && net.sendJukePlay) {
-        try { net.sendJukePlay(d); } catch (e) {}
-      }
-      jukeAdoptPlay(d);
-    }, 1000 + Math.random() * 2000);
-  }
-}
-
 /* ---------- late-joiner state sync ---------- */
 
 function handleJukeStateReq(d, peerId) {
@@ -4181,8 +4050,6 @@ function jukeLeaveRoom() {
   jukeStopPlayback();
   juke.now = null;
   juke.queue = [];
-  juke.pausedForDj = false;
-  clearTimeout(juke.djResumeTimer);
   if (juke.open) setJukePanel(false);
   renderJuke();
 }
@@ -4225,9 +4092,7 @@ function renderJuke() {
   const skipBtn = document.getElementById('juke-skip');
   const openApp = document.getElementById('juke-open-app');
   const joinBtn = document.getElementById('juke-join');
-  const djNote = document.getElementById('juke-dj-note');
   const qEl = document.getElementById('juke-queue');
-  if (djNote) djNote.style.display = juke.pausedForDj ? '' : 'none';
   if (juke.now && !juke.now.stopped) {
     if (titleEl) titleEl.textContent = jukePhonePendingText() || juke.now.title || 'untitled';
     if (provEl) provEl.textContent = jukeProviderIcon(juke.now.provider);
@@ -4240,7 +4105,7 @@ function renderJuke() {
       openApp.onclick = () => { try { window.open(juke.now.url, '_blank', 'noopener'); } catch (e) {} };
     }
   } else {
-    if (titleEl) titleEl.textContent = juke.pausedForDj ? 'paused for the DJ' : 'nothing playing';
+    if (titleEl) titleEl.textContent = 'nothing playing';
     if (provEl) provEl.textContent = '';
     if (byEl) byEl.textContent = '';
     if (skipBtn) skipBtn.disabled = true;
@@ -4361,6 +4226,9 @@ const PAINT_COLORS = [
 const paint = {
   open: false,
   color: '#7ae0ff',
+  blend: false,      // build 28: blend brush — smudge the canvas, don't lay color
+  lastColor: '#7ae0ff',
+  lastSwatch: null,
   size: 16,
   drawing: false,
   pts: [],          // normalized [u,v] of the current stroke, not yet flushed
@@ -4380,6 +4248,10 @@ function paintBuildPalette() {
     b.setAttribute('aria-label', c);
     b.addEventListener('click', () => {
       paint.color = c;
+      paint.lastColor = c;
+      paint.lastSwatch = b;
+      paint.blend = false;
+      if (paintBlendBtn) paintBlendBtn.classList.remove('sel');
       paintPaletteEl.querySelectorAll('.paint-swatch').forEach((x) => x.classList.toggle('sel', x === b));
       if (paintEraserBtn) paintEraserBtn.classList.remove('sel');
       b.blur();
@@ -4408,7 +4280,26 @@ function paintUvFromEvent(e) {
   return [u, v];
 }
 
+/* After a blend dab lands on the wall canvas, copy the touched rect to the
+   overlay so the mirror stays pixel-exact without re-running the smudge. */
+function paintMirrorRect(a, b, sizePx) {
+  if (!paintCtx) return;
+  const r = Math.max(3, sizePx / 2) + 2;
+  const x0 = Math.min(a[0], b[0]) * WALL_W - r, y0 = Math.min(a[1], b[1]) * WALL_H - r;
+  const x1 = Math.max(a[0], b[0]) * WALL_W + r, y1 = Math.max(a[1], b[1]) * WALL_H + r;
+  const sx = Math.max(0, Math.floor(x0)), sy = Math.max(0, Math.floor(y0));
+  const sw = Math.min(WALL_W - sx, Math.ceil(x1) - sx), sh = Math.min(WALL_H - sy, Math.ceil(y1) - sy);
+  if (sw <= 0 || sh <= 0) return;
+  try { paintCtx.drawImage(wall.canvas, sx, sy, sw, sh, sx, sy, sw, sh); } catch (e) {}
+}
+
 function paintDrawLocalSeg(a, b) {
+  if (paint.blend) {
+    // smudge the wall canvas, then mirror the touched rect to the overlay
+    wallDrawBlendSeg([a, b], paint.size, wall.ctx);
+    paintMirrorRect(a, b, paint.size);
+    return;
+  }
   // wall canvas (uv space)
   wallDrawSeg([a, b], paint.color, paint.size);
   // overlay mirror (wall-pixel space; canvas is WALL_W x WALL_H)
@@ -4445,6 +4336,7 @@ function paintFlush() {
         n: myName,
         c: paint.color,
         s: paint.size,
+        b: paint.blend ? 1 : undefined, // build 28: peers render the same smudge
         pts: chunk.map((p) => [Math.round(p[0] * 1000) / 1000, Math.round(p[1] * 1000) / 1000]),
       });
     } catch (e) { /* best effort */ }
@@ -4458,7 +4350,7 @@ function paintEndStroke() {
   paintFlush(); // flush any remaining points into the gesture
   // One gesture = one undoable log entry (eraser included).
   if (paint.gesture && paint.gesture.points.length) {
-    wallLogAppend(paint.gesture.id, paint.gesture.points, paint.gesture.color, paint.gesture.size, true);
+    wallLogAppend(paint.gesture.id, paint.gesture.points, paint.gesture.color, paint.gesture.size, true, paint.gesture.blend);
   }
   paint.gesture = null;
   paint.pts.length = 0;
@@ -4484,17 +4376,22 @@ if (paintCanvas) {
     if (!uv) return;
     paint.drawing = true;
     paint.pts = [uv];
-    paint.gesture = { id: wallNextStrokeId(), points: [], color: paint.color, size: paint.size };
+    paint.gesture = { id: wallNextStrokeId(), points: [], color: paint.color, size: paint.size, blend: paint.blend };
     paint.lastFlush = Date.now();
     wall.lastLocalStroke = Date.now();
-    wallDrawSeg([uv], paint.color, paint.size); // dot for taps
-    if (paintCtx) {
-      paintCtx.save();
-      paintCtx.fillStyle = paint.color;
-      paintCtx.beginPath();
-      paintCtx.arc(uv[0] * WALL_W, uv[1] * WALL_H, paint.size / 2, 0, Math.PI * 2);
-      paintCtx.fill();
-      paintCtx.restore();
+    if (paint.blend) {
+      wallDrawBlendSeg([uv], paint.size, wall.ctx); // smudge dot for taps
+      paintMirrorRect(uv, uv, paint.size);
+    } else {
+      wallDrawSeg([uv], paint.color, paint.size); // dot for taps
+      if (paintCtx) {
+        paintCtx.save();
+        paintCtx.fillStyle = paint.color;
+        paintCtx.beginPath();
+        paintCtx.arc(uv[0] * WALL_W, uv[1] * WALL_H, paint.size / 2, 0, Math.PI * 2);
+        paintCtx.fill();
+        paintCtx.restore();
+      }
     }
     try { paintCanvas.setPointerCapture(e.pointerId); } catch (err) {}
   });
@@ -4527,10 +4424,47 @@ if (paintDoneBtn) paintDoneBtn.addEventListener('click', () => { setPaintOpen(fa
    leaves the wall is painting over it. */
 if (paintEraserBtn) paintEraserBtn.addEventListener('click', () => {
   paint.color = WALL_BG;
+  paint.blend = false;
+  if (paintBlendBtn) paintBlendBtn.classList.remove('sel');
   paintEraserBtn.classList.add('sel');
   if (paintPaletteEl) paintPaletteEl.querySelectorAll('.paint-swatch').forEach((x) => x.classList.remove('sel'));
   paintEraserBtn.blur();
 });
+/* Blend brush (build 28): smudges the paint already on the wall instead of
+   laying down a color. Toggles; picking a color or the eraser exits blend,
+   and exiting via the button restores the last picked color so the brush
+   is never stateless. */
+if (paintBlendBtn) paintBlendBtn.addEventListener('click', () => {
+  paint.blend = !paint.blend;
+  paintBlendBtn.classList.toggle('sel', paint.blend);
+  if (paint.blend) {
+    if (paintEraserBtn) paintEraserBtn.classList.remove('sel');
+    if (paintPaletteEl) paintPaletteEl.querySelectorAll('.paint-swatch').forEach((x) => x.classList.remove('sel'));
+  } else {
+    paint.color = paint.lastColor || PAINT_COLORS[0];
+    if (paintPaletteEl) {
+      const swatches = paintPaletteEl.querySelectorAll('.paint-swatch');
+      swatches.forEach((x) => x.classList.remove('sel'));
+      if (paint.lastSwatch && paintPaletteEl.contains(paint.lastSwatch)) paint.lastSwatch.classList.add('sel');
+      else if (swatches.length) swatches[0].classList.add('sel');
+    }
+  }
+  paintBlendBtn.blur();
+});
+/* Save wall (build 28): manual PNG backup of the whole mural. */
+function wallExportPng() {
+  try {
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    a.href = wall.canvas.toDataURL('image/png');
+    a.download = `limbo-wall-${stamp}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return true;
+  } catch (e) { return false; }
+}
+if (paintSaveBtn) paintSaveBtn.addEventListener('click', () => { wallExportPng(); paintSaveBtn.blur(); });
 /* Undo: pops MY most recent stroke (eraser strokes included) and tells
    the room, so peers drop it from their logs and replay too. */
 if (paintUndoBtn) paintUndoBtn.addEventListener('click', () => {
@@ -4633,17 +4567,16 @@ function renderJamTransport() {
   if (jamClockStatusEl) {
     jamClockStatusEl.textContent = !on
       ? 'clock stopped'
-      : dj.active
+      : jamClockOurs()
         ? `you're the clock · ${jam.manual ? 'manual' : 'auto-detect'}`
-        : `synced · ${jam.clockBy || 'dj'}`;
+        : `synced · ${jam.clockBy || 'drifter'}`;
   }
   if (jamClockDotEl) jamClockDotEl.classList.toggle('live', on);
-  // Only the DJ sets the tempo.
-  const canSet = dj.active;
+  // Anyone can set the tempo — the freshest move wins the room.
   for (const b of [jamTapEl, jamBpmDownEl, jamBpmUpEl]) {
     if (b) {
-      b.disabled = !canSet;
-      b.title = canSet ? '' : 'the DJ sets the tempo';
+      b.disabled = false;
+      b.title = '';
     }
   }
 }
@@ -4663,9 +4596,9 @@ function renderJamPads() {
 
 function renderJamSamplerHint() {
   if (!jamHintEl) return;
-  const live = !!(dj.stream || (dj.listenAudioEl && dj.listenAudioEl.srcObject));
+  const live = !!(audio.ctx && jam.chain);
   jamHintEl.textContent = !live
-    ? 'need someone live to sample \u{1F3A7}'
+    ? 'nothing to sample yet \u{1F3A7}'
     : jam.pads.every((p) => !p)
       ? 'grab a loop from the live mix, then tap a pad on the bar'
       : '';
@@ -4785,14 +4718,6 @@ const jamResoEl = document.getElementById('jam-reso');
 if (jamCutoffEl) jamCutoffEl.addEventListener('input', () => { jam.cutoff = Number(jamCutoffEl.value) || 1800; });
 if (jamResoEl) jamResoEl.addEventListener('input', () => { jam.reso = Number(jamResoEl.value) || 0; });
 
-
-if (liveBtn) {
-  liveBtn.addEventListener('click', () => {
-    if (dj.active) stopLive();
-    else goLive();
-    liveBtn.blur();
-  });
-}
 
 // Boot: dress the wisp in the saved look; net reads the equipped look
 // for every ~12Hz broadcast so peers see it too.
@@ -5322,7 +5247,7 @@ function finishBoot() {
   wisp.position.copy(active.spawn);
   yaw = active.spawnYaw;
   clearTrail();
-  renderDjHud(); // decks button starts hidden (we boot in the Nexus)
+  renderRoomChrome(); // sound-room buttons start hidden (we boot in the Nexus)
 
   loadingEl.classList.add('done');
   driftBtn.disabled = false;
@@ -5578,7 +5503,7 @@ function showTitleCard(name) {
 function goTo(key) {
   if (transitioning || !worlds[key]) return;
   // Leaving the sound room: stop the live relay + the mic automatically.
-  if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) { stopLive(); jamMicOff(); }
+  if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) { jamMicOff(); }
   transitioning = true;
   fadeEl.classList.add('on');
   setTimeout(() => {
@@ -5595,11 +5520,11 @@ function goTo(key) {
     clearTrail();
     realmNameEl.textContent = active.name;
     audio.setRoot(active.root);
-    // Build 22: the ambient aura ducks out in the sound room (jam, decks,
+    // Build 22: the ambient aura ducks out in the sound room (jam,
     // jukebox and metronome all ride the game master and are unaffected).
     audio.setAuraDucked(key === SOUND_ROOM_KEY);
     showTitleCard(active.name);
-    renderDjHud(); // show/hide the decks button + DJ line for this room
+    renderRoomChrome(); // show/hide the sound-room buttons for this room
     // Community wall (build 18): late joiner asks the room for the current
     // canvas. Delayed so the data channel has a moment to connect; peers
     // with ink answer once per reqId (see handleWallSyncReq).
@@ -5806,11 +5731,6 @@ function handlePeerLeave(id) {
     peerVisuals.delete(id);
   }
   peerPositions.delete(id);
-  // DJ slot: if we were listening to them, the music stops.
-  if (dj.listenPeerId === id) {
-    detachDjListener();
-    renderDjHud();
-  }
   updatePeerCount();
 }
 
@@ -5841,33 +5761,6 @@ net.onChatCb = (d, peerId) => {
 net.onQuietCb = () =>
   addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
 net.onPresenceCb = () => { if (settingsOpen) renderFriendsSection(); };
-// DJ slot (build 12): claims changed — re-resolve the slot, yield if beaten.
-net.onDjCb = () => {
-  const w = djWinner();
-  if (dj.active && w && !w.isSelf) {
-    stopLive(true, w.name); // their claim is earlier: yield gracefully
-    return;
-  }
-  if (!dj.active && !w) {
-    detachDjListener(); // decks empty: stop any audio
-    jamStopRecorder();
-    jamStopClock(); // no DJ, no clock
-  }
-  jukeDjChanged(!!w); // DJ live -> jukebox pauses; DJ gone -> queue resumes
-  renderDjHud();
-  if (settingsOpen) renderFriendsSection();
-};
-// Someone's audio track arrived — listen only if they're the current DJ.
-net.onRemoteTrackCb = (track, stream, peerId) => {
-  if (!active || active.key !== SOUND_ROOM_KEY) return;
-  const w = djWinner();
-  if (w && !w.isSelf && w.peerId !== peerId) return; // not the DJ's track
-  attachDjListener(stream); // starts with detachDjListener, so set the peer after
-  dj.listenPeerId = peerId;
-  addSystemLine(`${w ? w.name : 'a drifter'} is live \u{1F534}`);
-  renderDjHud();
-};
-
 // Jam room (build 13): clock/note/pad events -> local synthesis.
 net.onJamClockCb = handleJamClock;
 net.onJamNoteCb = handleJamNote;
@@ -5878,7 +5771,6 @@ net.onWallSyncReqCb = handleWallSyncReq;
 net.onWallSyncCb = handleWallSync;
 net.onWallHelloCb = handleWallHello; // build 26: last-writer-wins convergence
 net.onWallUndoCb = handleWallUndo; // build 26: peer undid a stroke
-net.onJamTickCb = () => jamBroadcastClock(); // 15s clock re-broadcast while we hold the decks
 // Jukebox (build 21): synced queue playback.
 net.onJukeAddCb = handleJukeAdd;
 net.onJukeRemoveCb = handleJukeRemove;
@@ -5909,7 +5801,6 @@ function setSettings(open) {
 function setMuted(muted) {
   muteEl.textContent = muted ? 'SOUND OFF' : 'SOUND ON';
   soundToggle.textContent = muted ? 'OFF' : 'ON';
-  if (dj.listenAudioEl) { try { dj.listenAudioEl.muted = muted; } catch (e) {} }
   try { localStorage.setItem('limbo_muted', muted ? '1' : ''); } catch (e) { /* ignore */ }
 }
 gearBtn.addEventListener('click', (e) => {
@@ -6131,12 +6022,12 @@ function loop() {
 
   active.update(dt, t);
 
-  // Sound room reactivity (build 12): bass energy from the DJ stream —
-  // ours when we're live, the remote one when we're listening.
+  // Sound room reactivity (build 12/28): bass energy from the jam bus.
   {
     let target = 0;
-    const an = dj.analyser || dj.listenAnalyser;
-    const data = dj.analyserData || dj.listenAnalyserData;
+    const ra = roomAnalyserGet(false);
+    const an = ra && ra.analyser;
+    const data = ra && ra.data;
     if (an && data) {
       try {
         an.getByteFrequencyData(data);
@@ -6145,8 +6036,8 @@ function loop() {
         target = n ? (s / n / 255) * 1.6 : 0;
       } catch (e) {}
     }
-    djBassSmooth += (Math.min(1, target) - djBassSmooth) * Math.min(1, dt * 6);
-    if (active.key === SOUND_ROOM_KEY && active.setBass) active.setBass(djBassSmooth);
+    roomBassSmooth += (Math.min(1, target) - roomBassSmooth) * Math.min(1, dt * 6);
+    if (active.key === SOUND_ROOM_KEY && active.setBass) active.setBass(roomBassSmooth);
   }
 
   // Community wall (build 18): push new strokes to the GPU texture.
@@ -6253,7 +6144,7 @@ window.__limbo = {
   notePresence: (id, d) => net._notePresence(id, d),
   sweepLobby: (now) => net._sweepLobby(now),
   joinLobby: () => net.joinLobby(),
-  // sound room + DJ slot (build 12)
+  // sound room (build 12)
   SOUND_DEF,
   worldKeys: () => Object.keys(worlds),
   nexusPortals: () => (worlds.nexus ? worlds.nexus.portals.map((p) => p.target) : []),
@@ -6263,28 +6154,6 @@ window.__limbo = {
     const s = worlds.soundroom && worlds.soundroom.scene;
     return !!(s && s.getObjectByName('gallery-' + key));
   },
-  goLive,
-  stopLive,
-  djSource: () => ({ kind: dj.source, label: dj.sourceLabel }),
-  djClaimPayload: () => net._djClaimPayload(),
-  setDjSource: (l) => net.setDjSource(l),
-  djState: () => ({
-    active: dj.active,
-    sourceKind: dj.source,
-    sourceLabel: dj.sourceLabel,
-    winner: djWinner(),
-    claims: [...net.djClaims.entries()].map(([id, c]) => ({ id, ...c })),
-    listening: !!dj.listenAudioEl,
-    listenPeerId: dj.listenPeerId,
-    bass: djBassSmooth,
-  }),
-  noteDjClaim: (id, d) => net._noteDjClaim(id, d),
-  sweepDj: (now) => net._sweepDjClaims(now),
-  djClaimPayload: () => net._djClaimPayload(),
-  setDj: (r) => net.setDj(r),
-  livePresenceFor,
-  renderDjHud,
-  remoteTrack: (track, stream, peerId) => net._onRemoteTrack(track, stream, peerId),
   // jam room (build 13)
   // build 27: mic in
   jamMicToggle: () => jamMicToggle(),
@@ -6334,7 +6203,6 @@ window.__limbo = {
   }),
   setAuraDucked: (d) => audio.setAuraDucked(d),
   jamTriggerPad: (i) => jamTriggerPad(i),
-  jamOnBecomeDj: () => jamOnBecomeDj(),
   jamStopClock: () => jamStopClock(),
   jamDetectTick: () => jamDetectTick(),
   jamEstimateBpm: (o) => estimateBpm(o),
@@ -6360,10 +6228,22 @@ window.__limbo = {
   jamSetMetro: (on, vol) => jamSetMetro(on, vol),
   jamMetro: () => ({ ...jam.metro }),
   jamPeerInst: (pid) => jamPeerInst.get(pid) || null,
-  // test helper: simulate holding the decks without real media capture
-  jamSimulateDj: (on) => { dj.active = !!on; renderDjHud(); renderJamTransport(); },
+  // test helper (build 28): simulate holding the clock without playing a note
+  jamSimulateDj: (on) => { if (on) jamEnsureClock(); else jamStopClock(); renderJamTransport(); },
   // test helpers (build 17): drive the sampler's ring buffer deterministically
-  jamInjectDjStream: (s) => { dj.stream = s || null; },
+  // test helper (build 28): inject a MediaStream into the jam bus so the
+  // sampler's ring hears a deterministic signal
+  jamInjectTestStream: (stream) => {
+    const ch = jamEnsureChain();
+    if (!ch || !ch.bus || !stream) return false;
+    try {
+      if (jam.testSrc) { try { jam.testSrc.disconnect(); } catch (e) {} jam.testSrc = null; }
+      const src = audio.ctx.createMediaStreamSource(stream);
+      src.connect(ch.bus);
+      jam.testSrc = src;
+      return true;
+    } catch (e) { return false; }
+  },
   jamTestRecInfo: () => (jam.rec ? {
     w: jam.rec.w, total: jam.rec.total, ringLen: jam.rec.ring.length,
     sr: jam.rec.ctx.sampleRate, lastGrab: jam.lastGrab || null,
@@ -6442,11 +6322,11 @@ window.__limbo = {
     const d = wall.ctx.getImageData(x | 0, y | 0, 1, 1).data;
     return [d[0], d[1], d[2], d[3]];
   },
-  wallStrokeLocal: (pts, color, size) => {
+  wallStrokeLocal: (pts, color, size, blend) => {
     // a full local gesture: drawn + logged as one undoable entry (byMe)
     const id = wallNextStrokeId();
-    wallDrawSeg(pts, color, size);
-    wallLogAppend(id, pts, color, size, true);
+    wallDrawSeg(pts, color, size, blend);
+    wallLogAppend(id, pts, color, size, true, blend);
     return wall.strokeCount;
   },
   wallSample: () => wallSample(),
@@ -6465,6 +6345,8 @@ window.__limbo = {
   wallOpen: (o) => setPaintOpen(o === undefined ? true : !!o),
   wallPaintVisible: () => !!(paintBtn && paintBtn.style.display !== 'none'),
   wallValid: (d) => wallValidStroke(d),
+  wallHandleStroke: (d, pid) => handleWallStroke(d, pid || 'test-peer'),
+  wallExportPng: () => wallExportPng(),
   wallLoopback: (d) => {
     const ok = wallValidStroke(d);
     if (net.sendWallStroke) { try { net.sendWallStroke(d); } catch (e) {} }
@@ -6488,17 +6370,15 @@ window.__limbo = {
   wallUndo: () => wallUndoMyLast(),
   wallHandleUndo: (d, pid) => handleWallUndo(d, pid || 'test-peer'),
   wallUndoSend: (id) => { try { return !!(net.sendWallUndo && net.sendWallUndo({ id })); } catch (e) { return false; } },
-  wallLog: () => wall.log.map((e) => ({ id: e.id, byMe: e.byMe, pts: e.points.length, eraser: e.eraser })),
+  wallLog: () => wall.log.map((e) => ({ id: e.id, byMe: e.byMe, pts: e.points.length, eraser: e.eraser, blend: !!e.blend })),
   wallTestSetCap: (n) => { wall.logCap = n; return wall.logCap; },
   wallTestSetLastLocal: (t) => { wall.lastLocalStroke = t; return wall.lastLocalStroke; },
   wallPendingSync: () => !!wall.pendingSync,
-  wallDjWinner: () => djWinner(),
   // jukebox (build 21)
   jukeState: () => ({
     open: juke.open,
     queue: juke.queue.map((t) => ({ ...t })),
     now: juke.now ? { ...juke.now } : null,
-    pausedForDj: juke.pausedForDj,
     joinWaiting: juke.joinWaiting,
     volume: juke.volume,
     hasPlayer: !!juke.player,
@@ -6525,15 +6405,6 @@ window.__limbo = {
   jukeTrackOver: () => jukeTrackOver(),
   jukeSetFactory: (f) => jukeSetFactory(f),
   jukeSetVolume: (v) => jukeSetVolume(v),
-  jukeDjChanged: (live) => jukeDjChanged(live),
-  jukeDjResumeNow: () => { // test helper: run the DJ-leave resume immediately
-    clearTimeout(juke.djResumeTimer);
-    if (!juke.now || juke.pausedForDj) return null;
-    const d = { ...juke.now, startedAt: Date.now(), by: myName };
-    if (net.enabled && net.sendJukePlay) { try { net.sendJukePlay(d); } catch (e) {} }
-    jukeAdoptPlay(d);
-    return d;
-  },
   jukeJoinTap: () => jukeJoinTap(),
   jukeResolveShortLink: (u) => jukeResolveShortLink(u),
   jukeRemoveGroup: (g) => jukeRemoveGroup(g),
@@ -6574,7 +6445,6 @@ window.__limbo = {
   jukeB64: { encode: (u8) => jukeB64encode(u8), decode: (s) => jukeB64decode(s) },
   jukePhoneProgressText: () => { const el = document.getElementById('juke-now-title'); return el ? el.textContent : null; },
   jukeTestPhoneFetch: (d) => jukeRequestPhoneFile(d),
-  djStreamOk: () => !!(dj.stream && dj.stream.getAudioTracks && dj.stream.getAudioTracks().length),
   // phone-first: WebAudio unlock state (must be 'running' after a gesture)
   audioCtxState: () => { try { return audio.ctx ? audio.ctx.state : null; } catch (e) { return null; } },
 };

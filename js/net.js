@@ -30,14 +30,11 @@ const LOBBY_ROOM = 'limbo-lobby';
 const PRESENCE_INTERVAL_MS = 15000; // heartbeat cadence
 const PRESENCE_EXPIRE_MS = 45000;   // silent this long -> considered gone
 const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
-/* Sound room (build 12): room key for the DJ/social space, and the DJ
-   claim protocol — one DJ at a time, earliest fresh claim wins. */
+/* Sound room (build 12): room key for the DJ/social space. */
 const SOUND_ROOM_KEY = 'limbo-realm-5';
-const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
-const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '27';
+const BUILD = '28';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -136,19 +133,10 @@ export class LimboNet {
     this.onPresenceCb = null; // () — lobby roster changed (heartbeat/expire)
     this.presenceName = 'drifter';
     this.presenceRoom = 'nexus';
-    this.presenceDj = null; // roomKey where we're DJing, or null — rides the heartbeat
     this._presenceTimer = null;
     this._sweepTimer = null;
-    // --- DJ slot (build 12) ---
-    this.sendDjClaim = null;
-    this.djClaims = new Map(); // peerId -> {name, t, lastSeen, source}
-    this.myDjClaim = null; // {t} while WE hold the decks
-    this.djMedia = null; // {track, stream} while we stream audio
-    this._djTimer = null;
-    this.onDjCb = null; // () — DJ claims changed (claim/release/expire/yield)
-    this.onRemoteTrackCb = null; // (track, stream, peerId) — someone's audio arrived
     // --- jam room (build 13) ---
-    this.sendJamClock = null; // (data) — {bpm, startWall, by}, DJ -> room
+    this.sendJamClock = null; // (data) — {bpm, startWall, by, t}, clock holder -> room
     this.sendJamNote = null; // (data) — {n, midi, vel, beat, inst, drum, chord, w, c, r}, any jammer -> room
     this.sendJamPad = null; // (data) — {n, pad, beat, lenBars}, any jammer -> room
     this.onJamClockCb = null; // (data, peerId)
@@ -170,7 +158,6 @@ export class LimboNet {
     this.onJukeFileHaveCb = null; // (data, peerId)
     this.onJukeStateReqCb = null; // (data, peerId)
     this.onJukeStateCb = null; // (data, peerId)
-    this.onJamTickCb = null; // () — fires on our 15s DJ heartbeat while we hold the decks
     this.fallbackTimer = null;
     this.quietTimer = null;
     this.quietFired = false;
@@ -432,18 +419,6 @@ export class LimboNet {
       chatAction.onMessage = (d, info) => {
         if (this.onChatCb) this.onChatCb(d, info && info.peerId);
       };
-      /* DJ slot (build 12): claim protocol on every room (cheap; only the
-         sound room ever uses it) + the media transport for the DJ's audio.
-         Trystero 0.25.4 media API, verified against the published types:
-           room.addTrack(track, stream, {target?}) -> Promise<void>[]
-           room.removeTrack(track)
-           room.onPeerTrack = (track, stream, peerId, metadata?) => void */
-      const djAction = room.makeAction('djClaim');
-      this.sendDjClaim = (data) => djAction.send(data);
-      djAction.onMessage = (d, info) =>
-        this._noteDjClaim(info && info.peerId, d);
-      room.onPeerTrack = (track, stream, peerId) =>
-        this._onRemoteTrack(track, stream, peerId);
       /* Jam room (build 13): clock/note/pad events. Fire-and-forget —
          every client synthesizes the sound locally, so these stay tiny.
          Created on every room like the DJ actions (cheap); only the
@@ -552,17 +527,9 @@ export class LimboNet {
         this.peers.set(id, true);
         this._hsTouch(String(id).slice(0, 8), 'joined');
         this._clearFallbackTimer(); // someone made it — signaling works
-        // Late joiner while we're DJing: send them the audio track too.
-        if (this.djMedia && this.roomKey === SOUND_ROOM_KEY && this.room === room) {
-          try {
-            const p = this.room.addTrack(this.djMedia.track, this.djMedia.stream, { target: String(id) });
-            if (p && typeof p.catch === 'function') p.catch(() => {});
-          } catch (e) { /* best effort */ }
-        }
       };
       room.onPeerLeave = (id) => {
         this.peers.delete(id);
-        if (this.djClaims.delete(String(id)) && this.onDjCb) this.onDjCb();
         if (this.onPeerLeaveCb) this.onPeerLeaveCb(id);
       };
     } catch (err) {
@@ -613,14 +580,6 @@ export class LimboNet {
         this._leaveLobby();
         this.joinLobby();
       }
-      // Keep the DJ stream on the working strategy too (claim time is
-      // preserved — we never stopped holding the decks).
-      if (this.djMedia && this.room && this.roomKey === SOUND_ROOM_KEY) {
-        try {
-          const p = this.room.addTrack(this.djMedia.track, this.djMedia.stream);
-          if (Array.isArray(p)) p.forEach((x) => x && x.catch && x.catch(() => {}));
-        } catch (e) { /* best effort */ }
-      }
       // no re-arm: single fallback, both sides converge identically
     }, FALLBACK_AFTER_MS);
   }
@@ -649,13 +608,6 @@ export class LimboNet {
       clearTimeout(this.quietTimer);
       this.quietTimer = null;
     }
-    // Release the decks BEFORE the room goes away so listeners clear us.
-    if (this.myDjClaim) this._sendDjRelease();
-    this._stopDjTimers();
-    this.myDjClaim = null;
-    this.djMedia = null;
-    this.sendDjClaim = null;
-    this.djClaims.clear();
     if (this.room) {
       try {
         this.room.leave();
@@ -699,7 +651,6 @@ export class LimboNet {
 
   _presencePayload() {
     const p = { n: this.presenceName, r: this.presenceRoom, t: Date.now() };
-    if (this.presenceDj) p.dj = this.presenceDj; // only when DJing — stays tiny
     return p;
   }
 
@@ -789,136 +740,6 @@ export class LimboNet {
     }
     this.sendPresence = null;
     this.lobbyPeers.clear();
-  }
-
-  /* ---------------- DJ slot (build 12) ----------------
-     One DJ at a time per sound-room room. Claims carry {n, t}; the earliest
-     fresh claim wins. Claims heartbeat every 15s while DJing and expire
-     after 45s of silence (tab closed, etc). Audio goes over Trystero's
-     media API (addTrack / onPeerTrack), not the data channel. */
-
-  /* What our heartbeat says about going live: roomKey where we're live,
-     or null. Re-broadcasts immediately. */
-  setDj(roomKey) {
-    this.presenceDj = roomKey ? String(roomKey).slice(0, 16) : null;
-    this._presenceTick();
-  }
-
-  _djClaimPayload() {
-    return {
-      n: this.name,
-      t: this.myDjClaim ? this.myDjClaim.t : Date.now(),
-      // short source label rides the claim so the HUD can say
-      // "is live · live mix".
-      s: this.djSourceLabel || '',
-    };
-  }
-
-  /* Label for our live source ("live mix"). Kept out of the 12Hz wisp
-     payload — it only rides the DJ claim (15s). */
-  setDjSource(label) {
-    this.djSourceLabel = label ? String(label).slice(0, 48) : '';
-  }
-
-  _noteDjClaim(peerId, d) {
-    try {
-      if (!peerId || String(peerId) === String(this.selfId)) return;
-      if (!d || typeof d !== 'object') return;
-      const id = String(peerId);
-      if (d.rel) {
-        // Explicit release: decks are open again.
-        if (this.djClaims.delete(id) && this.onDjCb) this.onDjCb();
-        return;
-      }
-      const t = Number(d.t);
-      if (!Number.isFinite(t)) return;
-      this.djClaims.set(id, {
-        name: this.cleanName(d.n),
-        t,
-        lastSeen: Date.now(),
-        source: typeof d.s === 'string' ? d.s.slice(0, 48) : '',
-      });
-      if (this.onDjCb) this.onDjCb();
-    } catch (e) { /* ignore */ }
-  }
-
-  /* Drop claims silent longer than DJ_CLAIM_EXPIRE_MS. `now` is injectable
-     so tests can time-travel instead of waiting 45s. */
-  _sweepDjClaims(now) {
-    const t = typeof now === 'number' ? now : Date.now();
-    let dropped = 0;
-    for (const [id, c] of this.djClaims) {
-      if (t - c.lastSeen > DJ_CLAIM_EXPIRE_MS) {
-        this.djClaims.delete(id);
-        dropped++;
-      }
-    }
-    if (dropped > 0 && this.onDjCb) this.onDjCb();
-  }
-
-  // Heartbeat tick while we hold the decks: re-claim + reap stale claims.
-  _djTick() {
-    if (!this.myDjClaim) return;
-    try {
-      if (this.sendDjClaim) this.sendDjClaim(this._djClaimPayload());
-    } catch (e) { /* ignore */ }
-    this._sweepDjClaims();
-    // Jam clock re-broadcast (build 13): keeps late joiners on the grid.
-    try {
-      if (this.onJamTickCb) this.onJamTickCb();
-    } catch (e) { /* ignore */ }
-  }
-
-  _stopDjTimers() {
-    if (this._djTimer) {
-      clearInterval(this._djTimer);
-      this._djTimer = null;
-    }
-  }
-
-  _sendDjRelease() {
-    try {
-      if (this.sendDjClaim) this.sendDjClaim({ n: this.name, t: Date.now(), rel: 1 });
-    } catch (e) { /* ignore */ }
-  }
-
-  /* Start DJing: claim the decks and push our audio track to every peer in
-     the room. Idempotent-ish: calling twice keeps the original claim time. */
-  djStart(track, stream) {
-    if (!this.enabled || !this.room || this.roomKey !== SOUND_ROOM_KEY) return false;
-    if (!this.myDjClaim) this.myDjClaim = { t: Date.now() };
-    this.djMedia = { track, stream };
-    try {
-      const p = this.room.addTrack(track, stream);
-      if (p && typeof p.catch === 'function') p.catch(() => {});
-      else if (Array.isArray(p)) p.forEach((x) => x && x.catch && x.catch(() => {}));
-    } catch (e) { /* track push failed; the claim still holds the slot */ }
-    this._stopDjTimers();
-    this._djTimer = setInterval(() => this._djTick(), DJ_CLAIM_INTERVAL_MS);
-    this._djTick(); // announce immediately
-    return true;
-  }
-
-  /* Stop DJing: release the claim, pull the track, clear timers. Safe to
-     call when not DJing. */
-  djStop() {
-    this._stopDjTimers();
-    if (this.myDjClaim) this._sendDjRelease();
-    this.myDjClaim = null;
-    this.djSourceLabel = '';
-    if (this.djMedia && this.room) {
-      try {
-        this.room.removeTrack(this.djMedia.track);
-      } catch (e) { /* ignore */ }
-    }
-    this.djMedia = null;
-  }
-
-  _onRemoteTrack(track, stream, peerId) {
-    if (!track) return;
-    try {
-      if (this.onRemoteTrackCb) this.onRemoteTrackCb(track, stream, peerId);
-    } catch (e) { /* ignore */ }
   }
 
   /* Broadcast our wisp position + name + equipped look (~12Hz from the
