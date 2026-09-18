@@ -34,6 +34,9 @@ music from the device first, then mic/line-in or tab share again — the
 decks never dead-end. Phones can DJ too: play music from the device or
 use the mic (tab share needs a desktop browser).
 Friends who are DJing show "on the decks" in the friends list.
+The generative ambient aura ducks out while you're in the sound room (it
+fades back in when you leave) — the room is for decks, jam, jukebox and
+wall, not the background pad.
 
 The sound room is also a **JAM ROOM**: four instruments on glowing tabs —
 **LEAD** (the pocket synth: one chromatic octave, waveform + filter
