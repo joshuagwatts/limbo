@@ -92,17 +92,39 @@
     <button id="jam-bpm-down" aria-label="slower">−</button>
     <button id="jam-bpm-up" aria-label="faster">+</button>
   </div>
-  <div class="jam-sub">SYNTH</div>
-  <div class="jam-synth-row">
-    <button class="jam-wave" data-wave="sawtooth">saw</button>
-    <button class="jam-wave" data-wave="square">square</button>
-    <button class="jam-wave" data-wave="mix">mix</button>
+  <div class="jam-groove-row">
+    <div id="jam-beat-dots" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+    <button id="jam-metro-toggle" aria-label="toggle metronome">metro</button>
+    <input id="jam-metro-vol" type="range" min="0" max="100" value="50" aria-label="metronome volume">
   </div>
-  <div class="jam-knobs">
-    <label>cutoff <input id="jam-cutoff" type="range" min="300" max="8000" value="1800"></label>
-    <label>reso <input id="jam-reso" type="range" min="0" max="12" step="0.5" value="5"></label>
+  <div class="jam-sub">INSTRUMENT</div>
+  <div class="jam-inst-tabs" id="jam-inst-tabs">
+    <button class="jam-inst-tab sel" data-inst="lead">lead</button>
+    <button class="jam-inst-tab" data-inst="bass">bass</button>
+    <button class="jam-inst-tab" data-inst="drums">drums</button>
+    <button class="jam-inst-tab" data-inst="pad">pad</button>
   </div>
-  <div id="jam-keys"></div>
+  <div id="jam-inst-lead" class="jam-inst-panel">
+    <div class="jam-synth-row">
+      <button class="jam-wave" data-wave="sawtooth">saw</button>
+      <button class="jam-wave" data-wave="square">square</button>
+      <button class="jam-wave" data-wave="mix">mix</button>
+    </div>
+    <div class="jam-knobs">
+      <label>cutoff <input id="jam-cutoff" type="range" min="300" max="8000" value="1800"></label>
+      <label>reso <input id="jam-reso" type="range" min="0" max="12" step="0.5" value="5"></label>
+    </div>
+    <div id="jam-keys"></div>
+  </div>
+  <div id="jam-inst-bass" class="jam-inst-panel" hidden>
+    <div id="jam-bass-keys"></div>
+  </div>
+  <div id="jam-inst-drums" class="jam-inst-panel" hidden>
+    <div id="jam-drums"></div>
+  </div>
+  <div id="jam-inst-pad" class="jam-inst-panel" hidden>
+    <div id="jam-chords"></div>
+  </div>
   <div class="jam-sub">SAMPLER</div>
   <div class="jam-sampler-row">
     <button id="jam-grab">grab loop</button>
@@ -167,6 +189,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=19"></script>
+<script type="module" src="js/game.js?v=20"></script>
 </body>
 </html>

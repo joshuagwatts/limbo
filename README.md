@@ -35,13 +35,25 @@ decks never dead-end. Phones can DJ too: play music from the device or
 use the mic (tab share needs a desktop browser).
 Friends who are DJing show "on the decks" in the friends list.
 
-The sound room is also a **JAM ROOM**: a pocket synth (one chromatic octave,
-waveform + filter controls), a 4-pad **sampler** that grabs loops from the
-DJ's stream snapped to the beat grid, and **auto-BPM detection** listening to the music. The DJ is
-the shared beat clock — note and pad events are tiny messages and every
-client synthesizes the sound locally on the grid, so the jam feels tight
-despite network latency. Tap tempo + BPM steppers let the DJ override the
-tempo; the friends list shows who's jamming.
+The sound room is also a **JAM ROOM**: four instruments on glowing tabs —
+**LEAD** (the pocket synth: one chromatic octave, waveform + filter
+controls), **BASS** (sub synth, one octave down, punchy), **DRUMS** (a fully
+synthesized kit: kick, snare, clap, closed/open hats, shaker), and **PAD**
+(four chord pads: i–VI–III–VII in A minor, wide detuned saws with a slow
+bloom). Every player picks an instrument; the pick rides every note event
+so each client renders the *sender's* voice, and each player's wisp glow
+takes their instrument's color. A **personal metronome** (accented on beat
+1, volume slider, local-only — nobody else hears it) keeps you on the grid.
+The jam master bus runs every instrument through a generated-impulse
+convolution reverb and a tempo-synced dotted-eighth delay into a safety
+limiter, so the room gets bigger as more players join without ever
+clipping. The 4-pad **sampler** grabs loops from the DJ's stream snapped to
+the beat grid — post-effects, so grabs capture what the room hears — and
+**auto-BPM detection** listens to the music. The DJ is the shared beat
+clock — note and pad events are tiny messages and every client synthesizes
+the sound locally on the grid, so the jam feels tight despite network
+latency. Beat dots pulse with the clock, pads swell on the beat, and the
+friends list shows who's jamming (with their instrument color).
 
 The sound room also has a **COMMUNITY WALL**: a monumental 32×16 shared paint
 canvas on the north wall (the old gallery piece there was removed to make
