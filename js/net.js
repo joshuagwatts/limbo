@@ -37,7 +37,7 @@ const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
 const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '25';
+const BUILD = '26';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -466,9 +466,18 @@ export class LimboNet {
       const wallStrokeAction = room.makeAction('wallStroke');
       const wallSyncReqAction = room.makeAction('wallSyncReq');
       const wallSyncAction = room.makeAction('wallSync');
+      /* Build 26: wallHello {ts} — a newcomer announces its wall's version
+         time; peers whose wall is NEWER answer with the wallSync JPEG flow.
+         Last-writer-wins convergence, serverless. */
+      const wallHelloAction = room.makeAction('wallHello');
+      /* Build 26 (undo): wallUndo {id} — a peer undid one of their strokes;
+         every client drops that stroke id from its log and replays. */
+      const wallUndoAction = room.makeAction('wallUndo');
       this.sendWallStroke = (data) => wallStrokeAction.send(data);
       this.sendWallSyncReq = (data) => wallSyncReqAction.send(data);
       this.sendWallSync = (data) => wallSyncAction.send(data);
+      this.sendWallHello = (data) => wallHelloAction.send(data);
+      this.sendWallUndo = (data) => wallUndoAction.send(data);
       wallStrokeAction.onMessage = (d, info) => {
         if (this.onWallStrokeCb) this.onWallStrokeCb(d, info && info.peerId);
       };
@@ -477,6 +486,12 @@ export class LimboNet {
       };
       wallSyncAction.onMessage = (d, info) => {
         if (this.onWallSyncCb) this.onWallSyncCb(d, info && info.peerId);
+      };
+      wallHelloAction.onMessage = (d, info) => {
+        if (this.onWallHelloCb) this.onWallHelloCb(d, info && info.peerId);
+      };
+      wallUndoAction.onMessage = (d, info) => {
+        if (this.onWallUndoCb) this.onWallUndoCb(d, info && info.peerId);
       };
       /* Jukebox (build 21): synchronized queue playback in the sound room.
          Everyone queues track links; every client plays the same track at

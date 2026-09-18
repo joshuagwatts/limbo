@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=25';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=25';
+import { LimboNet } from './net.js?v=26';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=26';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -114,6 +114,7 @@ const paintDoneBtn    = document.getElementById('paint-done');
 const jukeBtn         = document.getElementById('juke-btn');
 const jukePanel       = document.getElementById('juke-panel');
 const paintEraserBtn  = document.getElementById('paint-eraser');
+const paintUndoBtn    = document.getElementById('paint-undo');
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -2136,11 +2137,16 @@ function jamTriggerPad(i) {
   return true;
 }
 
-/* ---------------- community wall (build 18) ----------------
+/* ---------------- community wall (build 18; persistence: build 26) ----------------
    A shared 1024x512 paint canvas. One per client (not per room) so the
    art survives realm hops; a THREE.CanvasTexture shows it on a monumental
    wall plane inside the sound room. Strokes sync over Trystero; the room's
-   lights drink the wall's colors (hues + paint energy, never content). */
+   lights drink the wall's colors (hues + paint energy, never content).
+   Build 26: the wall remembers. A downscaled JPEG + timestamp is saved to
+   localStorage after strokes land (debounced) and on pagehide; on boot the
+   snapshot is redrawn before first render. When drifters meet in the sound
+   room they exchange wallHello {ts} and only the NEWER wall answers with
+   the wallSync JPEG — last-writer-wins, no server. */
 const WALL_W = 1024, WALL_H = 512;
 const WALL_BG = '#0b0b13';
 const WALL_BG_RGB = [11, 11, 19];
@@ -2151,6 +2157,19 @@ const wall = {
   strokeTimes: [],     // Date.now() of recent strokes (5s activity window)
   texDirty: false,
   answeredReq: new Set(), // wallSyncReq ids we've already answered
+  ts: 0,               // build 26: version time of my wall (last stroke/apply/restore)
+  snapTimer: null,     // build 26: debounce timer for the localStorage snapshot
+  snapKey: 'limbo-wall-v1', // build 26: localStorage key — never renamed, so the mural survives game updates
+  // build 26 (undo): every stroke gets an id (per-session peer prefix +
+  // counter). The wall is a flattened base canvas plus an undoable stroke
+  // log; undo clears the canvas and replays base + remaining log.
+  selfId: Math.random().toString(36).slice(2, 10),
+  strokeSeq: 0,
+  log: [],             // [{id, points, color, size, eraser, byMe}] — undoable strokes
+  base: null, baseCtx: null, // flattened non-undoable mural underneath the log
+  logCap: 500,         // over this, bake the log into the base (pixels kept, history dropped)
+  lastLocalStroke: 0,  // Date.now() of my last local paint input — anti-stomp guard
+  pendingSync: null,   // wallSync JPEG stashed while I was painting; applied once quiet
 };
 wall.canvas = document.createElement('canvas');
 wall.canvas.width = WALL_W;
@@ -2158,6 +2177,15 @@ wall.canvas.height = WALL_H;
 wall.ctx = wall.canvas.getContext('2d', { willReadFrequently: true });
 wall.ctx.fillStyle = WALL_BG;
 wall.ctx.fillRect(0, 0, WALL_W, WALL_H);
+/* Build 26 (undo): the flattened base under the undoable log. Starts blank
+   like the wall itself; wallRestoreSnapshot / wallApplySnapshot adopt a
+   mural into it. */
+wall.base = document.createElement('canvas');
+wall.base.width = WALL_W;
+wall.base.height = WALL_H;
+wall.baseCtx = wall.base.getContext('2d');
+wall.baseCtx.fillStyle = WALL_BG;
+wall.baseCtx.fillRect(0, 0, WALL_W, WALL_H);
 wall.tex = new THREE.CanvasTexture(wall.canvas);
 wall.tex.colorSpace = THREE.SRGBColorSpace;
 
@@ -2168,11 +2196,19 @@ function wallPruneTimes() {
   while (wall.strokeTimes.length && now - wall.strokeTimes[0] > 5000) wall.strokeTimes.shift();
 }
 
+/* The wall got newer paint: bump the version time and schedule the
+   localStorage snapshot. Lightweight — called per stroke chunk/flush. */
+function wallTouch() {
+  wall.ts = Date.now(); // build 26: my wall just got newer
+  wallScheduleSnapshot();
+}
+
 function wallNoteStroke() {
   wall.strokeCount++;
   wall.strokeTimes.push(Date.now());
   wallPruneTimes();
   wallMarkDirty();
+  wallTouch();
 }
 
 /* Raw polyline draw — no bookkeeping. Callers note the stroke once per
@@ -2199,14 +2235,90 @@ function wallDrawSeg(pts, color, sizePx) {
   c.restore();
 }
 
-function wallDrawPolyline(pts, color, sizePx) {
-  wallDrawSeg(pts, color, sizePx);
-  wallNoteStroke();
+/* Build 26 (undo): the stroke log. Each entry is one full gesture:
+   {id, points, color, size, eraser, byMe}. wallLogAppend either appends a
+   chunk to an existing entry (same gesture id — e.g. the flush chunks of
+   one remote stroke) or starts a new entry. Drawing is done by the caller;
+   this only logs. Pixels are never dropped here — only undo depth. */
+function wallNextStrokeId() { return wall.selfId + '-' + (wall.strokeSeq++); }
+
+function wallLogAppend(id, points, color, size, byMe) {
+  let e = null;
+  for (const x of wall.log) if (x.id === id) { e = x; break; }
+  if (e) {
+    for (const p of points) e.points.push(p);
+    wallMarkDirty();
+    wallTouch();
+  } else {
+    e = {
+      id, points: points.map((p) => [p[0], p[1]]),
+      color, size, eraser: color === WALL_BG, byMe: !!byMe,
+    };
+    wall.log.push(e);
+    wallNoteStroke();
+    if (wall.log.length > wall.logCap) wallBakeBase();
+  }
+  return e;
 }
 
-/* Strict shape check for incoming strokes — small messages only. */
+/* Over the cap: bake the whole current canvas (base + log) into the base
+   and drop undo history. The mural's pixels are kept — only undo depth. */
+function wallBakeBase() {
+  try { wall.baseCtx.drawImage(wall.canvas, 0, 0, WALL_W, WALL_H); } catch (err) {}
+  wall.log.length = 0;
+}
+
+/* Rebuild the wall canvas from scratch: background, flattened base, then
+   every logged stroke in order, then my in-progress gesture if any. */
+function wallRedraw() {
+  const c = wall.ctx;
+  c.save();
+  c.fillStyle = WALL_BG;
+  c.fillRect(0, 0, WALL_W, WALL_H);
+  c.restore();
+  try { c.drawImage(wall.base, 0, 0, WALL_W, WALL_H); } catch (err) {}
+  for (const e of wall.log) wallDrawSeg(e.points, e.color, e.size);
+  if (typeof paint !== 'undefined' && paint.drawing && paint.gesture && paint.gesture.points.length) {
+    wallDrawSeg(paint.gesture.points, paint.gesture.color, paint.gesture.size);
+  }
+  wallMarkDirty();
+}
+
+/* Undo: pop MY most recent logged stroke, replay the rest, persist the
+   undone state now, and tell the room so peers drop it from their logs
+   and replay too. Eraser strokes undo like any other. */
+function wallUndoMyLast() {
+  for (let i = wall.log.length - 1; i >= 0; i--) {
+    if (wall.log[i].byMe) {
+      const gone = wall.log.splice(i, 1)[0];
+      wallRedraw();
+      wallTouch();
+      wallSaveSnapshot(); // the undone state is the truth now — persist it, don't wait for debounce
+      if (typeof paintMirror === 'function' && typeof paint !== 'undefined' && paint.open) paintMirror();
+      if (net.enabled && net.sendWallUndo && active && active.key === SOUND_ROOM_KEY) {
+        try { net.sendWallUndo({ id: gone.id }); } catch (err) { /* best effort */ }
+      }
+      return gone.id;
+    }
+  }
+  return null;
+}
+
+function handleWallUndo(d, peerId) {
+  if (!d || typeof d.id !== 'string' || !d.id) return;
+  const i = wall.log.findIndex((e) => e.id === d.id);
+  if (i < 0) return; // unknown id — nothing to do
+  wall.log.splice(i, 1);
+  wallRedraw();
+  wallTouch();
+  if (typeof paintMirror === 'function' && typeof paint !== 'undefined' && paint.open) paintMirror();
+}
+
+/* Strict shape check for incoming strokes — small messages only.
+   id is optional (older builds don't send one) but must be sane when present. */
 function wallValidStroke(d) {
   if (!d || typeof d !== 'object') return false;
+  if (d.id !== undefined && (typeof d.id !== 'string' || d.id.length === 0 || d.id.length > 64)) return false;
   if (typeof d.c !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(d.c)) return false;
   if (typeof d.s !== 'number' || !(d.s >= 1 && d.s <= 120)) return false;
   if (!Array.isArray(d.pts) || d.pts.length === 0 || d.pts.length > 64) return false;
@@ -2220,7 +2332,13 @@ function wallValidStroke(d) {
 
 function handleWallStroke(d, peerId) {
   if (!wallValidStroke(d)) return;
-  wallDrawPolyline(d.pts, d.c, d.s);
+  // Group flush chunks into one log entry by gesture id; id-less senders
+  // (older builds) get one entry per chunk.
+  const id = (typeof d.id === 'string' && d.id)
+    ? d.id
+    : 'legacy-' + String(peerId || 'x').slice(0, 24) + '-' + (wall.strokeSeq++);
+  wallDrawSeg(d.pts, d.c, d.s);
+  wallLogAppend(id, d.pts, d.c, d.s, false);
   if (paint.open) paintMirror(); // someone's painting while we paint
 }
 
@@ -2235,13 +2353,22 @@ function wallSnapshot() {
   } catch (e) { return null; }
 }
 
-function wallApplySnapshot(dataUrl) {
+/* Apply a mural JPEG to the wall.
+   - 'replace' (boot restore): the snapshot becomes the flattened base and
+     undo history starts fresh — the log does not survive a reload.
+   - 'merge' (live wallSync): the peer's mural becomes the base but my
+     undoable strokes stay on top. Their mural is newer than my wall, and
+     any of my strokes they already knew are pixel-identical when replayed,
+     so the room converges instead of clobbering. */
+function wallApplySnapshot(dataUrl, mode) {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
-      wall.ctx.drawImage(img, 0, 0, WALL_W, WALL_H);
+      wall.baseCtx.drawImage(img, 0, 0, WALL_W, WALL_H);
+      if (mode !== 'merge') wall.log.length = 0;
+      wallRedraw();
       wall.strokeCount = Math.max(wall.strokeCount, 1); // it has ink now
-      wallMarkDirty();
+      wall.ts = Date.now(); // build 26: a newly arrived mural is the newest thing I've seen
       resolve(true);
     };
     img.onerror = () => resolve(false);
@@ -2249,10 +2376,58 @@ function wallApplySnapshot(dataUrl) {
   });
 }
 
+/* Build 26: the wall remembers. After strokes land (debounced ~2s) and on
+   pagehide / tab-hidden, a downscaled JPEG + timestamp is saved to
+   localStorage. On boot the snapshot is redrawn before first render. The
+   key is never renamed, so the mural survives game updates on the same
+   origin. Any storage failure (private mode, quota) is silent — the wall
+   just doesn't persist, never a crash, never a toast. */
+function wallScheduleSnapshot() {
+  try {
+    clearTimeout(wall.snapTimer);
+    wall.snapTimer = setTimeout(wallSaveSnapshot, 2000);
+  } catch (e) { /* timers can't fail; belt and braces */ }
+}
+function wallSaveSnapshot() {
+  // Quiet point (~2s after the last stroke): if a wallSync arrived while I
+  // was painting, apply it now as a merge — my strokes stay on top.
+  if (wall.pendingSync && Date.now() - wall.lastLocalStroke >= 1500) {
+    const u = wall.pendingSync;
+    wall.pendingSync = null;
+    wallApplySnapshot(u, 'merge');
+  }
+  if (wall.strokeCount <= 0) return; // never touched: don't clobber an older snapshot with blank
+  try {
+    const img = wallSnapshot();
+    if (!img) return;
+    wall.ts = Date.now();
+    localStorage.setItem(wall.snapKey, JSON.stringify({ dataUrl: img, ts: wall.ts }));
+  } catch (e) { /* persistence is best-effort */ }
+}
+function wallRestoreSnapshot() {
+  let raw = null;
+  try { raw = localStorage.getItem(wall.snapKey); } catch (e) { return Promise.resolve(false); }
+  if (!raw) return Promise.resolve(false);
+  let snap = null;
+  try { snap = JSON.parse(raw); } catch (e) { return Promise.resolve(false); }
+  if (!snap || typeof snap.dataUrl !== 'string' || !snap.dataUrl.startsWith('data:image/')) {
+    return Promise.resolve(false);
+  }
+  return wallApplySnapshot(snap.dataUrl).then((ok) => {
+    if (ok && typeof snap.ts === 'number' && snap.ts > wall.ts) wall.ts = snap.ts;
+    return ok;
+  });
+}
+
 function handleWallSyncReq(d, peerId) {
   if (!d || typeof d.reqId !== 'string' || !d.reqId) return;
   if (wall.answeredReq.has(d.reqId)) return; // answer each request once
   if (wall.strokeCount <= 0) return;         // blank wall: nothing to share
+  // Build 26: only answer when my wall is NEWER than the requester's
+  // (they send their wall.ts along). Peers on older builds send no ts —
+  // treat as 0, i.e. the pre-26 behavior.
+  const theirTs = (typeof d.ts === 'number' && d.ts >= 0) ? d.ts : 0;
+  if (!(wall.ts > theirTs)) return;
   wall.answeredReq.add(d.reqId);
   if (wall.answeredReq.size > 40) {
     const oldest = wall.answeredReq.values().next().value;
@@ -2267,12 +2442,50 @@ function handleWallSyncReq(d, peerId) {
 
 function handleWallSync(d, peerId) {
   if (!d || typeof d.img !== 'string' || !d.img.startsWith('data:image/')) return;
-  wallApplySnapshot(d.img);
+  // Never stomp a wall that's actively being painted: if my own brush
+  // landed in the last ~3s, stash the mural and merge it once I'm quiet
+  // (drained by wallSaveSnapshot at the debounce quiet point). Otherwise
+  // merge now — their mural becomes the base, my strokes stay on top.
+  if (Date.now() - wall.lastLocalStroke < 3000) {
+    wall.pendingSync = d.img; // latest wins
+    return;
+  }
+  wall.pendingSync = null;
+  wallApplySnapshot(d.img, 'merge');
+}
+
+/* Build 26: last-writer-wins convergence. A newcomer announces its wall's
+   version time; any peer whose wall is NEWER answers with the existing
+   wallSync JPEG flow so the newcomer converges to the latest mural.
+   Strokes stay the live truth while painting — the snapshot is the backstop. */
+function wallValidHello(d) {
+  return d && typeof d === 'object' &&
+    typeof d.ts === 'number' && d.ts >= 0 && d.ts < Date.now() + 60000;
+}
+function handleWallHello(d, peerId) {
+  if (!wallValidHello(d)) return;
+  if (!(wall.ts > d.ts)) return;    // only the newer wall speaks
+  if (wall.strokeCount <= 0) return; // blank wall: nothing to share
+  if (!net.enabled || !net.sendWallSync) return;
+  try {
+    const img = wallSnapshot();
+    if (img) net.sendWallSync({ reqId: 'hello-' + Date.now().toString(36), img });
+  } catch (e) { /* best effort */ }
 }
 
 /* NOTE: there is deliberately no wall-clear action. The only way paint
    leaves the wall is the eraser tool in paint mode (bg-colored strokes
    over the same wallStroke path) — otherwise the wall persists. */
+
+/* Build 26: redraw the last snapshot before first render, and keep it
+   fresh on pagehide / tab-hidden. */
+wallRestoreSnapshot();
+try {
+  window.addEventListener('pagehide', wallSaveSnapshot);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') wallSaveSnapshot();
+  });
+} catch (e) { /* best effort */ }
 
 /* 8x8 downsample: average color + ink coverage + recent-stroke activity.
    Colors and paint energy only — no content recognition. */
@@ -4018,7 +4231,8 @@ const paint = {
   color: '#7ae0ff',
   size: 16,
   drawing: false,
-  pts: [],          // normalized [u,v] of the current stroke
+  pts: [],          // normalized [u,v] of the current stroke, not yet flushed
+  gesture: null,    // build 26 (undo): the full in-progress gesture {id, points, color, size}
   lastFlush: 0,
   mirrorQueued: false,
 };
@@ -4083,10 +4297,19 @@ function paintDrawLocalSeg(a, b) {
 function paintFlush() {
   if (!paint.pts.length) return;
   const chunk = paint.pts.splice(0, 60); // cap message size
-  wallNoteStroke(); // one gesture's worth of bookkeeping per flush
+  if (chunk.length === 0) return;
+  // Anchor: if the splice emptied the buffer, leave the chunk's last point
+  // behind so the next pointermove has a prev point to draw from. (Without
+  // this, paint.pts[-1] is undefined and paintDrawLocalSeg crashes.)
+  if (paint.pts.length === 0) paint.pts.push(chunk[chunk.length - 1]);
+  if (paint.gesture) for (const p of chunk) paint.gesture.points.push(p);
+  wall.lastLocalStroke = Date.now();
+  wallMarkDirty();
+  wallTouch(); // my wall just got newer; snapshot scheduled (bookkeeping per gesture, below)
   if (net.enabled && net.sendWallStroke && active && active.key === SOUND_ROOM_KEY) {
     try {
       net.sendWallStroke({
+        id: paint.gesture ? paint.gesture.id : undefined, // groups this gesture's chunks for peers
         n: myName,
         c: paint.color,
         s: paint.size,
@@ -4100,7 +4323,12 @@ function paintFlush() {
 function paintEndStroke() {
   if (!paint.drawing) return;
   paint.drawing = false;
-  paintFlush();
+  paintFlush(); // flush any remaining points into the gesture
+  // One gesture = one undoable log entry (eraser included).
+  if (paint.gesture && paint.gesture.points.length) {
+    wallLogAppend(paint.gesture.id, paint.gesture.points, paint.gesture.color, paint.gesture.size, true);
+  }
+  paint.gesture = null;
   paint.pts.length = 0;
 }
 
@@ -4124,7 +4352,9 @@ if (paintCanvas) {
     if (!uv) return;
     paint.drawing = true;
     paint.pts = [uv];
+    paint.gesture = { id: wallNextStrokeId(), points: [], color: paint.color, size: paint.size };
     paint.lastFlush = Date.now();
+    wall.lastLocalStroke = Date.now();
     wallDrawSeg([uv], paint.color, paint.size); // dot for taps
     if (paintCtx) {
       paintCtx.save();
@@ -4168,6 +4398,12 @@ if (paintEraserBtn) paintEraserBtn.addEventListener('click', () => {
   paintEraserBtn.classList.add('sel');
   if (paintPaletteEl) paintPaletteEl.querySelectorAll('.paint-swatch').forEach((x) => x.classList.remove('sel'));
   paintEraserBtn.blur();
+});
+/* Undo: pops MY most recent stroke (eraser strokes included) and tells
+   the room, so peers drop it from their logs and replay too. */
+if (paintUndoBtn) paintUndoBtn.addEventListener('click', () => {
+  wallUndoMyLast();
+  paintUndoBtn.blur();
 });
 if (paintBtn) {
   paintBtn.addEventListener('click', () => {
@@ -5237,8 +5473,13 @@ function goTo(key) {
     if (key === SOUND_ROOM_KEY && net.enabled && net.sendWallSyncReq) {
       const reqId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
       setTimeout(() => {
-        if (active && active.key === SOUND_ROOM_KEY && net.sendWallSyncReq) {
-          try { net.sendWallSyncReq({ reqId }); } catch (e) { /* best effort */ }
+        if (active && active.key === SOUND_ROOM_KEY) {
+          // Build 26: announce my wall's version time; only peers with a
+          // NEWER wall answer (wallHello + the ts-gated wallSyncReq below).
+          if (net.sendWallHello) { try { net.sendWallHello({ ts: wall.ts }); } catch (e) {} }
+          if (net.sendWallSyncReq) {
+            try { net.sendWallSyncReq({ reqId, ts: wall.ts }); } catch (e) { /* best effort */ }
+          }
         }
         // Jukebox (build 21): same late-joiner pattern — ask the room for
         // the current queue + now-playing so we land in sync mid-track.
@@ -5502,6 +5743,8 @@ net.onJamPadCb = handleJamPad;
 net.onWallStrokeCb = handleWallStroke;
 net.onWallSyncReqCb = handleWallSyncReq;
 net.onWallSyncCb = handleWallSync;
+net.onWallHelloCb = handleWallHello; // build 26: last-writer-wins convergence
+net.onWallUndoCb = handleWallUndo; // build 26: peer undid a stroke
 net.onJamTickCb = () => jamBroadcastClock(); // 15s clock re-broadcast while we hold the decks
 // Jukebox (build 21): synced queue playback.
 net.onJukeAddCb = handleJukeAdd;
@@ -6062,7 +6305,13 @@ window.__limbo = {
     const d = wall.ctx.getImageData(x | 0, y | 0, 1, 1).data;
     return [d[0], d[1], d[2], d[3]];
   },
-  wallStrokeLocal: (pts, color, size) => { wallDrawPolyline(pts, color, size); return wall.strokeCount; },
+  wallStrokeLocal: (pts, color, size) => {
+    // a full local gesture: drawn + logged as one undoable entry (byMe)
+    const id = wallNextStrokeId();
+    wallDrawSeg(pts, color, size);
+    wallLogAppend(id, pts, color, size, true);
+    return wall.strokeCount;
+  },
   wallSample: () => wallSample(),
   wallAmbColor: () => {
     const a = worlds.soundroom && worlds.soundroom.anim;
@@ -6087,9 +6336,25 @@ window.__limbo = {
   },
   wallSnapshot: () => wallSnapshot(),
   wallApplySnapshot: (u) => wallApplySnapshot(u),
-  wallSendSyncReq: (id) => { try { return !!(net.sendWallSyncReq && net.sendWallSyncReq({ reqId: id })); } catch (e) { return false; } },
+  wallHandleSync: (d, pid) => handleWallSync(d, pid || 'test-peer'),
+  wallSendSyncReq: (id) => { try { return !!(net.sendWallSyncReq && net.sendWallSyncReq({ reqId: id, ts: wall.ts })); } catch (e) { return false; } },
   wallHandleSyncReq: (d, pid) => handleWallSyncReq(d, pid || 'test-peer'),
   wallAnswered: () => [...wall.answeredReq],
+  // community wall persistence (build 26)
+  wallTs: () => wall.ts,
+  wallTestSetTs: (t) => { wall.ts = t; return wall.ts; },
+  wallSaveSnapshotNow: () => wallSaveSnapshot(),
+  wallRestoreSnapshot: () => wallRestoreSnapshot(),
+  wallHandleHello: (d, pid) => handleWallHello(d, pid || 'test-peer'),
+  wallHelloSend: (ts) => { try { return !!(net.sendWallHello && net.sendWallHello({ ts })); } catch (e) { return false; } },
+  // community wall undo (build 26)
+  wallUndo: () => wallUndoMyLast(),
+  wallHandleUndo: (d, pid) => handleWallUndo(d, pid || 'test-peer'),
+  wallUndoSend: (id) => { try { return !!(net.sendWallUndo && net.sendWallUndo({ id })); } catch (e) { return false; } },
+  wallLog: () => wall.log.map((e) => ({ id: e.id, byMe: e.byMe, pts: e.points.length, eraser: e.eraser })),
+  wallTestSetCap: (n) => { wall.logCap = n; return wall.logCap; },
+  wallTestSetLastLocal: (t) => { wall.lastLocalStroke = t; return wall.lastLocalStroke; },
+  wallPendingSync: () => !!wall.pendingSync,
   wallDjWinner: () => djWinner(),
   // jukebox (build 21)
   jukeState: () => ({
