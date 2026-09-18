@@ -30,7 +30,8 @@ with the four realm artworks hanging as a gallery. One drifter at a time
 can **take the decks** (tab audio over WebRTC in a desktop browser) while
 everyone in the room hears the mix; the room's lights pulse with the bass.
 When tab audio fails (Brave blocks it, for one), a chooser offers mic/line-in
-or playing an audio file instead — the decks never dead-end.
+or playing an audio file instead — the decks never dead-end. Phones can DJ
+too: mic or an audio file (tab share needs a desktop browser).
 Friends who are DJing show "on the decks" in the friends list.
 
 The sound room is also a **JAM ROOM**: a pocket synth (one chromatic octave,
