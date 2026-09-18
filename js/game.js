@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=15';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=15';
+import { LimboNet } from './net.js?v=16';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=16';
 
 /* ---------------- configuration ---------------- */
 
