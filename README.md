@@ -43,8 +43,9 @@ client synthesizes the sound locally on the grid, so the jam feels tight
 despite network latency. Tap tempo + BPM steppers let the DJ override the
 tempo; the friends list shows who's jamming.
 
-The sound room also has a **COMMUNITY WALL**: a monumental shared paint
-canvas on the north wall. Hit **🎨 paint** to go fullscreen and draw —
+The sound room also has a **COMMUNITY WALL**: a monumental 32×16 shared paint
+canvas on the north wall (the old gallery piece there was removed to make
+room). Hit **🎨 paint** to go fullscreen and draw —
 strokes appear live for everyone in the room, and late joiners get the
 current canvas synced automatically. The room drinks the wall's colors:
 ambient light tints toward the painting's average hue (never near-black)
