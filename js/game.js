@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=16';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=16';
+import { LimboNet } from './net.js?v=17';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=17';
 
 /* ---------------- configuration ---------------- */
 
@@ -1490,10 +1490,14 @@ setInterval(jamDetectTick, 1000);
 /* ---------------- sampler: ring buffer on the DJ stream ----------------
    A ScriptProcessorNode taps the DJ stream (ours when we're on the
    decks, the remote one when we're listening) into a 12s mono ring
-   buffer. "Grab loop" copies the last 2 bars (or 4s with no clock) into
-   the next pad. ScriptProcessor is deprecated but universally supported;
-   an AudioWorklet ring would be the upgrade path — capture latency is
-   irrelevant here since we only ever read the buffer on demand. */
+   buffer. "Grab loop" copies the last 2 bars into the next pad — aligned
+   to the most recent 2-bar boundary when the beat clock is on, so the pad
+   starts exactly on a bar line and loops cleanly (build 17; before that,
+   grabs ended at wall-clock "now" and always started mid-beat). With no
+   clock the grab is 4s of free time, unchanged. ScriptProcessor is
+   deprecated but universally supported; an AudioWorklet ring would be the
+   upgrade path — capture latency is irrelevant here since we only ever
+   read the buffer on demand. */
 
 function jamStopRecorder() {
   const rec = jam.rec;
@@ -1517,7 +1521,7 @@ function jamEnsureRecorder() {
     const src = ctx.createMediaStreamSource(stream);
     const proc = ctx.createScriptProcessor(4096, 2, 1);
     const ringLen = Math.floor(ctx.sampleRate * 12);
-    const rec = { stream, ctx, src, proc, ring: new Float32Array(ringLen), w: 0, sink: null };
+    const rec = { stream, ctx, src, proc, ring: new Float32Array(ringLen), w: 0, total: 0, sink: null };
     const sink = ctx.createGain();
     sink.gain.value = 0; // ScriptProcessor needs a connected output to run
     rec.sink = sink;
@@ -1528,6 +1532,7 @@ function jamEnsureRecorder() {
       for (let i = 0; i < c0.length; i++) {
         rec.ring[rec.w] = c1 ? (c0[i] + c1[i]) * 0.5 : c0[i];
         rec.w = (rec.w + 1) % ringLen;
+        rec.total++;
       }
     };
     src.connect(proc);
@@ -1547,16 +1552,36 @@ function jamGrabLoop() {
     renderJamSamplerHint();
     return false;
   }
-  const clockOn = jamBeatNow() != null;
-  const lenSec = clockOn ? (8 * 60) / jam.bpm : 4; // 2 bars, or 4s free-time
+  const beatNow = jamBeatNow();
+  const clockOn = beatNow != null;
+  const bpm = jam.bpm;
+  const lenSec = clockOn ? (8 * 60) / bpm : 4; // 2 bars, or 4s free-time
   const ctx = rec.ctx;
-  const n = Math.max(1, Math.min(Math.floor(lenSec * ctx.sampleRate), rec.ring.length));
+  const L = rec.ring.length;
+  const n = Math.max(1, Math.min(Math.floor(lenSec * ctx.sampleRate), L));
+  // Tight grabs (build 17): "now" is almost never on a bar line, so ending
+  // the grab at wall-clock time starts every loop mid-beat. Instead, end at
+  // the most recent 2-bar boundary: phase the beat clock into samples and
+  // step back from the write cursor. Falls back to the old unaligned grab
+  // when the clock is off, the bpm is unusable, or the recorder hasn't
+  // captured enough history to reach the boundary yet.
+  let endIdx = rec.w;
+  let aligned = false;
+  if (clockOn && Number.isFinite(bpm) && bpm > 0) {
+    const samplesPerBeat = ctx.sampleRate * 60 / bpm;
+    const phaseSamples = Math.round((beatNow % 8) * samplesPerBeat); // 8 beats = 2 bars, 4/4
+    if (phaseSamples >= 0 && rec.total >= n + phaseSamples) {
+      endIdx = (((rec.w - phaseSamples) % L) + L) % L;
+      aligned = true;
+    }
+  }
+  jam.lastGrab = { aligned, endIdx, n, w: rec.w, total: rec.total, bpm: clockOn ? bpm : null };
   const buf = ctx.createBuffer(1, n, ctx.sampleRate);
   const out = buf.getChannelData(0);
-  let r = (((rec.w - n) % rec.ring.length) + rec.ring.length) % rec.ring.length;
+  let r = (((endIdx - n) % L) + L) % L;
   for (let i = 0; i < n; i++) {
     out[i] = rec.ring[r];
-    r = (r + 1) % rec.ring.length;
+    r = (r + 1) % L;
   }
   const slot = jam.padRound;
   jam.pads[slot] = buf;
@@ -3183,4 +3208,32 @@ window.__limbo = {
   jamAudioTimeForBeat: (b) => jamAudioTimeForBeat(b),
   // test helper: simulate holding the decks without real media capture
   jamSimulateDj: (on) => { dj.active = !!on; renderDjHud(); renderJamTransport(); },
+  // test helpers (build 17): drive the sampler's ring buffer deterministically
+  jamInjectDjStream: (s) => { dj.stream = s || null; },
+  jamTestRecInfo: () => (jam.rec ? {
+    w: jam.rec.w, total: jam.rec.total, ringLen: jam.rec.ring.length,
+    sr: jam.rec.ctx.sampleRate, lastGrab: jam.lastGrab || null,
+  } : null),
+  jamTestRecFreeze: (w, total) => {
+    const r = jam.rec;
+    if (!r) return false;
+    r.proc.onaudioprocess = null; // stop the writer; the test owns the ring now
+    r.w = w; r.total = total;
+    return true;
+  },
+  jamTestRingSet: (i, v) => {
+    const r = jam.rec;
+    if (!r) return false;
+    r.ring[(((i % r.ring.length) + r.ring.length) % r.ring.length)] = v;
+    return true;
+  },
+  jamTestRingAt: (i) => {
+    const r = jam.rec;
+    return r ? r.ring[(((i % r.ring.length) + r.ring.length) % r.ring.length)] : null;
+  },
+  jamTestRingFill: (v) => { if (jam.rec) jam.rec.ring.fill(v); return !!jam.rec; },
+  jamTestPadHead: (i, n) => {
+    const b = jam.pads[i];
+    return b ? Array.from(b.getChannelData(0).slice(0, n || 256)) : null;
+  },
 };
