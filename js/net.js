@@ -44,6 +44,22 @@
  * second delivery of each logical broadcast (same cid+action+payload).
  * Targeted sends (file chunks) resolve the cid to a single connection and
  * go out once, on one room.
+ *
+ * HANDSHAKE WATCHDOG (build 31) — the real two-phone build-30 test got
+ * stuck on "connecting…" forever: discovery worked (peer announced via
+ * signaling) but the WebRTC data channel never opened, and Trystero fired
+ * neither onPeerJoin nor onJoinError, so nothing ever retried. If the pill
+ * sits in "connecting…" with zero fully-joined peers for longer than
+ * WATCHDOG_MS, we treat it as a failure: flip to "couldn't connect ·
+ * retrying…" and take the same leave+rejoin ICE-retry path (backoff
+ * preserved). Never sit silent.
+ *
+ * ?debug=net (build 31) — when the URL carries ?debug=net, a small
+ * toggleable monospace panel renders timestamped net events (module
+ * load, rooms joined, peer announced per strategy, ICE state changes,
+ * local candidate types incl. whether TURN produced relay candidates,
+ * join errors, retry countdowns, watchdog triggers) so a phone test
+ * produces a diagnosis instead of a shrug. Zero UI change otherwise.
  */
 
 const APP_ID = 'limbo_by_holowatts';
@@ -60,7 +76,7 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '30';
+const BUILD = '31';
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
@@ -71,6 +87,10 @@ const DEDUP_WINDOW_MS = 8000;
    immediate re-announce) with this backoff ladder, while we have no peers. */
 const ICE_RETRY_BASE_MS = 10000;
 const ICE_RETRY_MAX_MS = 60000;
+/* Handshake watchdog (build 31): "connecting…" (peer announced /
+   handshaking) with zero fully-joined peers for longer than this is
+   treated as a failed handshake and forced down the ICE-retry path. */
+const WATCHDOG_MS = 20000;
 
 const STRATEGIES = [
   // Pinned to 0.25.4: unpinned esm.sh URLs resolve "latest", which could
@@ -243,6 +263,16 @@ export class LimboNet {
     // --- phone-visible status pill (build 30; touch devices only) ---
     this._pill = null;
     this._pillTimer = null;
+    // --- handshake watchdog (build 31) ---
+    this._connectingSince = 0; // Date.now() when pill first showed "connecting…"
+    // --- ?debug=net on-screen log (build 31) ---
+    this._netLogBuf = []; // ring buffer of timestamped lines (kept always; cheap)
+    this._netLogOn =
+      typeof location !== 'undefined' &&
+      /[?&]debug=net(?:[&#]|$)/.test(location.search || '');
+    this._netLogEl = null;
+    this._netLogBody = null;
+    this._pcSeen = new Map(); // connKey -> {ice, gathering, typesLogged}
     this._installWsTap();
   }
 
@@ -365,6 +395,7 @@ export class LimboNet {
       }
       rec.lastSeenMs = now;
       this.hsPeers.set(key, rec);
+      this._netLog(`nostr ${dir}/${topicKind}/${peerId}${isSelf ? ' (self echo)' : ''}`);
     }
   }
 
@@ -406,6 +437,7 @@ export class LimboNet {
     rec.lastSeenMs = now;
     if (typeof isInitiator === 'boolean') rec.initiator = isInitiator;
     this.hsPeers.set(key, rec);
+    this._netLog(`handshake start via ${STRATEGIES[si].name} with ${id} (initiator=${isInitiator})`);
     this._updatePill();
     return rec;
   }
@@ -420,6 +452,7 @@ export class LimboNet {
       strategy: STRATEGIES[si] ? STRATEGIES[si].name : '?',
       at: new Date().toLocaleTimeString(),
     };
+    this._netLog(`joinError via ${this.lastJoinError.strategy}: ${this.lastJoinError.error}`);
     this._scheduleIceRetry();
     this._updatePill();
   }
@@ -437,6 +470,7 @@ export class LimboNet {
     );
     this._iceRetryN++;
     this._iceRetryAt = Date.now() + delay;
+    this._netLog(`ICE retry scheduled in ${delay}ms (attempt ${this._iceRetryN})`);
     this._iceRetryTimer = setTimeout(() => {
       this._iceRetryTimer = null;
       if (this.peerCount() > 0 || !this.roomKey) return;
@@ -454,7 +488,64 @@ export class LimboNet {
     this._iceRetryAt = 0;
   }
 
+  /* Build 31 — handshake watchdog. Called on the 2s tick. If the pill is
+     in "connecting…" (a peer was announced / handshaking, i.e. discovery
+     worked) with zero fully-joined peers for longer than WATCHDOG_MS,
+     the data channel is never going to open — Trystero fired neither
+     onPeerJoin nor onJoinError, which is exactly the stuck state the
+     build-30 two-phone test hit. Treat it as a failure: flip the pill to
+     "couldn't connect · retrying…" and take the same leave+rejoin
+     ICE-retry path (backoff preserved). Re-arms automatically, so it can
+     never sit silent again. */
+  _checkWatchdog() {
+    if (!this.enabled || !this.roomKey) {
+      this._connectingSince = 0;
+      return;
+    }
+    if (this.peerCount() > 0) {
+      this._connectingSince = 0;
+      return;
+    }
+    const now = Date.now();
+    let connecting = false;
+    for (const [, r] of this.hsPeers) {
+      if (
+        now - (r.lastSeenMs || 0) < 30000 &&
+        (r.stage === 'discovered' ||
+          r.stage === 'signaling' ||
+          r.stage === 'handshaking')
+      ) {
+        connecting = true;
+        break;
+      }
+    }
+    if (!connecting) {
+      this._connectingSince = 0;
+      return;
+    }
+    if (!this._connectingSince) {
+      this._connectingSince = now;
+      return;
+    }
+    if (now - this._connectingSince < WATCHDOG_MS) return;
+    // Fire.
+    this._connectingSince = 0;
+    this._netLog(
+      `WATCHDOG: "connecting…" ${Math.round(WATCHDOG_MS / 1000)}s+ with 0 joined peers — forcing retry`
+    );
+    this.lastJoinError = {
+      error:
+        'watchdog: peer announced but data channel never opened (stalled handshake)',
+      peerId: '?',
+      strategy: 'watchdog',
+      at: new Date().toLocaleTimeString(),
+    };
+    this._scheduleIceRetry();
+    this._updatePill();
+  }
+
   _rejoinAll() {
+    this._netLog('rejoining all strategy rooms (fresh RTCPeerConnections + re-announce)');
     for (const e of this.rooms) {
       try {
         e.room.leave();
@@ -490,6 +581,7 @@ export class LimboNet {
       this.rtcConfig = { iceServers: buildIceServers(this.turnCreds) };
     } catch (err) {
       this.enabled = false; // crypto unavailable: single-player
+      this._netLog('boot: crypto unavailable — single-player');
       this._ensurePill();
       this._updatePill();
       return this.enabled;
@@ -505,6 +597,10 @@ export class LimboNet {
     this.selfIds = loaded.map((m) => (m ? m.selfId : null));
     this.selfId = this.selfIds.find((id) => id) || null;
     this.enabled = loaded.some(Boolean);
+    STRATEGIES.forEach((s, si) =>
+      this._netLog(`strategy ${s.name}: module ${this.mods[si] ? 'loaded' : 'FAILED to load'}`)
+    );
+    this._netLog(`boot: enabled=${this.enabled} clientId=${String(this.clientId).slice(0, 8)}`);
     this._ensurePill();
     this._updatePill();
     return this.enabled;
@@ -576,8 +672,10 @@ export class LimboNet {
           this.roomKey
         );
       } catch (e) {
+        this._netLog(`joinRoom threw on ${name}: ${(e && e.message) || e}`);
         continue;
       }
+      this._netLog(`room joined on ${name} (key=${this.roomKey})`);
       const entry = { si, name, mod, room, selfId: this.selfIds[si], A: {} };
       this._wireRoom(entry);
       this.rooms.push(entry);
@@ -621,6 +719,7 @@ export class LimboNet {
     // Someone made it — signaling works. Reset the ICE retry ladder.
     this._iceRetryN = 0;
     this._clearIceRetry();
+    this._netLog(`peer JOINED via ${STRATEGIES[si].name} — data channel open (${connKey})`);
     this._updatePill();
   }
 
@@ -643,6 +742,7 @@ export class LimboNet {
         break;
       }
     }
+    this._netLog(`peer left (${connKey})`);
     this._updatePill();
   }
 
@@ -1001,23 +1101,44 @@ export class LimboNet {
      pointer-events:none so it never eats game touches. */
 
   _ensurePill() {
-    if (this._pill || typeof document === 'undefined') return;
+    if (typeof document === 'undefined') return;
     try {
+      // The 2s tick drives the watchdog + pc-state polling on EVERY
+      // platform (build 31); the visible pill itself stays touch-only.
+      if (!this._pillTimer)
+        this._pillTimer = setInterval(() => this._tick(), 2000);
       const touch =
         (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ||
         'ontouchstart' in window;
-      if (!touch) return;
+      if (!touch || this._pill) {
+        this._updatePill();
+        return;
+      }
       const el = document.createElement('div');
       el.id = 'net-pill';
       el.setAttribute('aria-live', 'polite');
       document.body.appendChild(el);
       this._pill = el;
       this._updatePill();
-      if (!this._pillTimer)
-        this._pillTimer = setInterval(() => this._updatePill(), 2000);
     } catch (e) {
       /* pill is optional */
     }
+  }
+
+  /* Periodic tick: watchdog first (the actual fix), then diagnostics,
+     then the pill label. Diagnostics must never break networking. */
+  _tick() {
+    try {
+      this._checkWatchdog();
+    } catch (e) {
+      /* never break networking */
+    }
+    try {
+      this._pollPcStates();
+    } catch (e) {
+      /* diagnostics only */
+    }
+    this._updatePill();
   }
 
   _netState() {
@@ -1046,6 +1167,135 @@ export class LimboNet {
       if (this._pill.dataset.cls !== s.cls) this._pill.dataset.cls = s.cls;
     } catch (e) {
       /* never break networking for a label */
+    }
+  }
+
+  /* ---------------- ?debug=net on-screen log (build 31) ----------------
+     When the URL carries ?debug=net, timestamped net events render in a
+     small toggleable monospace panel (tap the header to collapse) so a
+     phone test produces a diagnosis instead of a shrug. Without the param
+     there is zero UI change — the ring buffer is still kept (cheap) for
+     the keyboard debug HUD. */
+
+  _netLog(msg) {
+    try {
+      const t = new Date();
+      const line =
+        `${t.toLocaleTimeString('en-GB')}.${String(t.getMilliseconds()).padStart(3, '0')} ${msg}`;
+      // Ensure the panel BEFORE pushing, so the buffer replay inside
+      // _ensureNetLogPanel can't duplicate the line we're about to add.
+      if (this._netLogOn) this._ensureNetLogPanel();
+      this._netLogBuf.push(line);
+      if (this._netLogBuf.length > 200) this._netLogBuf.shift();
+      if (!this._netLogOn) return;
+      const body = this._netLogBody;
+      if (body) {
+        const div = document.createElement('div');
+        div.textContent = line;
+        body.appendChild(div);
+        while (body.children.length > 200) body.removeChild(body.firstChild);
+        body.scrollTop = body.scrollHeight;
+      }
+    } catch (e) {
+      /* diagnostics must never break networking */
+    }
+  }
+
+  _ensureNetLogPanel() {
+    if (this._netLogEl || typeof document === 'undefined') return;
+    try {
+      const wrap = document.createElement('div');
+      wrap.id = 'net-log';
+      const head = document.createElement('div');
+      head.id = 'net-log-head';
+      const body = document.createElement('div');
+      body.id = 'net-log-body';
+      const setLabel = (open) => {
+        head.textContent = open ? 'NET LOG · tap to collapse' : 'NET LOG · tap to expand';
+      };
+      setLabel(true);
+      head.addEventListener('click', () => {
+        const isOpen = body.style.display !== 'none';
+        body.style.display = isOpen ? 'none' : '';
+        setLabel(!isOpen);
+      });
+      wrap.appendChild(head);
+      wrap.appendChild(body);
+      document.body.appendChild(wrap);
+      this._netLogEl = wrap;
+      this._netLogBody = body;
+      for (const line of this._netLogBuf) {
+        const div = document.createElement('div');
+        div.textContent = line;
+        body.appendChild(div);
+      }
+      body.scrollTop = body.scrollHeight;
+    } catch (e) {
+      /* panel is optional */
+    }
+  }
+
+  /* Poll raw RTCPeerConnections for ICE state transitions + local
+     candidate types. Only runs with ?debug=net (the pill doesn't show
+     this). The candidate-type line is the money: 'relay' present means
+     TURN allocation worked; host+srflx only means TURN is dead and two
+     symmetric-NAT phones can never connect. */
+  _pollPcStates() {
+    if (!this._netLogOn) return;
+    let pcs = {};
+    try {
+      pcs = this.getPeerConnections();
+    } catch (e) {
+      return;
+    }
+    for (const [key, pc] of Object.entries(pcs)) {
+      let prev = this._pcSeen.get(key);
+      if (!prev) {
+        prev = { ice: null, gathering: null, typesLogged: false };
+        this._pcSeen.set(key, prev);
+      }
+      let ice = null;
+      let gathering = null;
+      try {
+        ice = pc.iceConnectionState || '?';
+        gathering = pc.iceGatheringState || '?';
+      } catch (e) {
+        /* ignore */
+      }
+      if (prev.ice === null) {
+        this._netLog(`pc ${key}: new (ice=${ice}, gathering=${gathering})`);
+      } else if (ice !== prev.ice) {
+        this._netLog(`pc ${key}: ice ${prev.ice} → ${ice}`);
+      }
+      if (prev.gathering !== 'complete' && gathering === 'complete' && !prev.typesLogged) {
+        prev.typesLogged = true;
+        this._logCandidateTypes(key, pc);
+      }
+      prev.ice = ice;
+      prev.gathering = gathering;
+    }
+    for (const k of [...this._pcSeen.keys()]) {
+      if (!Object.prototype.hasOwnProperty.call(pcs, k)) {
+        this._pcSeen.delete(k);
+        this._netLog(`pc ${k}: gone`);
+      }
+    }
+  }
+
+  async _logCandidateTypes(key, pc) {
+    try {
+      const stats = await pc.getStats();
+      const types = new Set();
+      stats.forEach((s) => {
+        if (s.type === 'local-candidate' && s.candidateType) types.add(s.candidateType);
+      });
+      const arr = [...types].sort();
+      const verdict = arr.includes('relay')
+        ? '← TURN alive (relay candidate)'
+        : '← NO relay candidate (TURN dead?)';
+      this._netLog(`pc ${key}: local candidates [${arr.join(', ') || 'none'}] ${verdict}`);
+    } catch (e) {
+      this._netLog(`pc ${key}: getStats failed`);
     }
   }
 
