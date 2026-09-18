@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=13';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=13';
+import { LimboNet } from './net.js?v=14';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=14';
 
 /* ---------------- configuration ---------------- */
 
@@ -759,6 +759,9 @@ const dj = {
   active: false,      // WE hold the decks
   stream: null,       // our captured desktop audio (DJ side)
   track: null,
+  source: null,       // 'tab' | 'mic' | 'file' — build 14 fallback chain
+  sourceLabel: '',    // short HUD label, e.g. "tab audio", "audio file: x.mp3"
+  sourceCleanup: null, // () => void — tears down whatever acquired the source
   node: null,         // DJ-side analyser source node
   analyser: null,
   analyserData: null,
@@ -843,9 +846,9 @@ function detachDjListener() {
 /* Earliest fresh claim wins — ours included when we hold the decks. */
 function djWinner() {
   let best = null;
-  if (net.myDjClaim) best = { name: myName, isSelf: true, t: net.myDjClaim.t };
+  if (net.myDjClaim) best = { name: myName, isSelf: true, t: net.myDjClaim.t, sourceLabel: dj.sourceLabel };
   for (const [pid, c] of net.djClaims) {
-    if (!best || c.t < best.t) best = { name: c.name, isSelf: false, peerId: pid, t: c.t };
+    if (!best || c.t < best.t) best = { name: c.name, isSelf: false, peerId: pid, t: c.t, sourceLabel: c.source };
   }
   return best;
 }
@@ -866,56 +869,298 @@ function renderDjHud() {
   const w = djWinner();
   if (w) {
     const n = net.peers.size + 1;
-    djLineEl.textContent = `\u{1F3A7} ${w.name} is on the decks \u00B7 ${n} listening`;
+    const src = w.sourceLabel ? ` \u00B7 ${w.sourceLabel}` : '';
+    djLineEl.textContent = `\u{1F3A7} ${w.name} is on the decks \u00B7 ${n} listening${src}`;
   } else {
     djLineEl.textContent = 'the decks are open';
   }
   djLineEl.style.display = '';
 }
 
+/* ---------------- DJ source fallback chain (build 14) ----------------
+   Brave and some Chromium builds silently fail tab-audio capture, so
+   "take the decks" can no longer dead-end. acquireDjSource() returns
+   {stream, track, kind, label, cleanup} from the first working option:
+
+     a. tab share — getDisplayMedia({video, audio}); video tracks are
+        stopped at once (only requested for the picker UI on some
+        browsers); requires an audio track.
+     b. chooser — mic/line-in (getUserMedia with all processing off;
+        DJs can select a virtual-audio-cable / loopback device as the
+        mic in OS sound settings for true system audio) or an audio
+        file (HTMLAudioElement loop + captureStream — works in every
+        desktop browser, zero permissions).
+
+   Everything downstream (net.djStart, the analyser, the sampler's ring
+   buffer) only ever sees a MediaStream + audio track, so any source
+   just works. */
+
+function isUserDismissal(e) {
+  const n = (e && e.name) || '';
+  return n === 'NotAllowedError' || n === 'AbortError';
+}
+
+async function tryTabShare() {
+  const disp = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  try { (disp.getVideoTracks ? disp.getVideoTracks() : []).forEach((v) => { try { v.stop(); } catch (e) {} }); } catch (e) {}
+  const auds = disp.getAudioTracks ? disp.getAudioTracks() : [];
+  const track = auds[0];
+  if (!track) {
+    // No audio came through — Brave does exactly this. Stop everything
+    // so the indicator light doesn't linger, and let the caller fall
+    // through to the chooser.
+    try { (disp.getTracks ? disp.getTracks() : []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {}
+    return null;
+  }
+  return {
+    stream: disp,
+    track,
+    kind: 'tab',
+    label: 'tab audio',
+    cleanup: () => { try { track.stop(); } catch (e) {} },
+  };
+}
+
+async function djMicSource() {
+  const gum = navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+  if (!gum) throw new Error('no mic');
+  const s = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+  });
+  const track = s.getAudioTracks ? s.getAudioTracks()[0] : null;
+  if (!track) {
+    try { (s.getTracks ? s.getTracks() : []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {}
+    throw new Error('no mic track');
+  }
+  return {
+    stream: s,
+    track,
+    kind: 'mic',
+    label: 'mic/line-in',
+    cleanup: () => { try { (s.getTracks ? s.getTracks() : []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {} },
+  };
+}
+
+function djFileSource(file) {
+  return new Promise((resolve, reject) => {
+    let url = null;
+    let el = null;
+    try {
+      url = URL.createObjectURL(file);
+      el = new Audio();
+      el.loop = true;
+      el.src = url;
+    } catch (e) { reject(e); return; }
+    const done = (err) => {
+      if (err) {
+        try { el.pause(); } catch (e) {}
+        if (url) try { URL.revokeObjectURL(url); } catch (e) {}
+        reject(err);
+        return;
+      }
+      let stream = null;
+      try { stream = el.captureStream ? el.captureStream() : null; } catch (e) { stream = null; }
+      const track = stream && stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+      if (!track) {
+        try { el.pause(); } catch (e) {}
+        try { URL.revokeObjectURL(url); } catch (e) {}
+        reject(new Error('no audio track'));
+        return;
+      }
+      const name = (file && file.name) || 'track';
+      resolve({
+        stream,
+        track,
+        kind: 'file',
+        label: 'audio file: ' + name,
+        cleanup: () => {
+          try { el.pause(); } catch (e) {}
+          try { track.stop(); } catch (e) {}
+          try { URL.revokeObjectURL(url); } catch (e) {}
+        },
+      });
+    };
+    try {
+      const p = el.play();
+      if (p && typeof p.then === 'function') p.then(() => done(null), (e) => done(e));
+      else done(null);
+    } catch (e) { done(e); }
+  });
+}
+
+/* Brave detection — navigator.brave.isBrave() is a promise and may not
+   exist at all; the UA string is the backup. Never throws, times out. */
+function braveLikely() {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(!!v); } };
+    setTimeout(() => fin(false), 1500);
+    try {
+      const b = navigator.brave;
+      if (b && typeof b.isBrave === 'function') {
+        b.isBrave().then((v) => fin(v), () => fin(false));
+        return;
+      }
+    } catch (e) {}
+    try { fin(/Brave/i.test(navigator.userAgent || '')); } catch (e) { fin(false); }
+  });
+}
+
+const djChooserEl = document.getElementById('dj-chooser');
+const djSrcHintEl = document.getElementById('dj-src-hint');
+const djSrcNoteEl = document.getElementById('dj-src-note');
+let djChooserResolve = null;
+let djChooserReject = null;
+
+function djChooserOpen() {
+  return !!(djChooserEl && djChooserEl.style.display !== 'none');
+}
+
+function setChooserNote(t) {
+  if (djSrcNoteEl) djSrcNoteEl.textContent = t || '';
+}
+
+function closeDjChooser(val) {
+  const r = djChooserResolve;
+  djChooserResolve = null; djChooserReject = null;
+  if (djChooserEl) djChooserEl.style.display = 'none';
+  if (r) r(val);
+}
+
+function failDjChooser(err) {
+  const rj = djChooserReject;
+  djChooserResolve = null; djChooserReject = null;
+  if (djChooserEl) djChooserEl.style.display = 'none';
+  if (rj) rj(err);
+}
+
+/* The chooser: shown when tab share yields no audio or errors (other than
+   the user dismissing the picker). Cancellable — "never mind" resolves
+   null and the decks stay open. */
+function djChooserFlow({ allowTab = true } = {}) {
+  return new Promise((resolve, reject) => {
+    if (djChooserResolve) { resolve(null); return; } // one chooser at a time
+    const tabBtn = document.getElementById('dj-src-tab');
+    if (tabBtn) tabBtn.style.display = allowTab ? '' : 'none';
+    if (djSrcHintEl) { djSrcHintEl.style.display = 'none'; djSrcHintEl.textContent = ''; }
+    setChooserNote('');
+    if (djChooserEl) djChooserEl.style.display = '';
+    djChooserResolve = resolve;
+    djChooserReject = reject;
+    // Brave nudge fills in async once detection lands.
+    braveLikely().then((b) => {
+      if (b && djChooserOpen() && djSrcHintEl) {
+        djSrcHintEl.textContent = 'Brave sometimes blocks tab audio \u2014 try Shields down for this site, or use a file.';
+        djSrcHintEl.style.display = '';
+      }
+    });
+  });
+}
+
+function wireDjChooser() {
+  const tabBtn = document.getElementById('dj-src-tab');
+  const micBtn = document.getElementById('dj-src-mic');
+  const fileBtn = document.getElementById('dj-src-file');
+  const cancelBtn = document.getElementById('dj-src-cancel');
+  const fileInput = document.getElementById('dj-file-input');
+  if (tabBtn) tabBtn.addEventListener('click', async () => {
+    setChooserNote('pick a tab with sound playing\u2026');
+    try {
+      const src = await tryTabShare();
+      if (src) closeDjChooser(src);
+      else setChooserNote('still no audio \u2014 try another option');
+    } catch (e) {
+      if (isUserDismissal(e)) failDjChooser({ dismissed: true });
+      else setChooserNote('tab share failed \u2014 try another option');
+    }
+  });
+  if (micBtn) micBtn.addEventListener('click', async () => {
+    setChooserNote('requesting mic\u2026');
+    try {
+      closeDjChooser(await djMicSource());
+    } catch (e) {
+      setChooserNote(isUserDismissal(e)
+        ? 'mic was blocked \u2014 try another option'
+        : 'mic failed \u2014 try another option');
+    }
+    micBtn.blur();
+  });
+  if (fileBtn) fileBtn.addEventListener('click', () => {
+    if (fileInput) fileInput.click();
+    fileBtn.blur();
+  });
+  if (fileInput) fileInput.addEventListener('change', async () => {
+    const f = fileInput.files && fileInput.files[0];
+    fileInput.value = '';
+    if (!f) return; // user cancelled the file picker — stay in the chooser
+    setChooserNote('loading file\u2026');
+    try {
+      closeDjChooser(await djFileSource(f));
+    } catch (e) {
+      setChooserNote('couldn\u2019t use that file \u2014 try another');
+    }
+  });
+  if (cancelBtn) cancelBtn.addEventListener('click', () => {
+    closeDjChooser(null);
+    cancelBtn.blur();
+  });
+}
+
+/* One entry point for taking the decks. Fast path: tab share just works
+   and no chooser ever appears. Throws {dismissed:true} only when the user
+   cancels the system share picker (quiet — the decks stay open). */
+async function acquireDjSource({ allowTab = true } = {}) {
+  if (allowTab) {
+    try {
+      const src = await tryTabShare();
+      if (src) return src;
+    } catch (e) {
+      if (isUserDismissal(e)) throw { dismissed: true };
+      // any other error → fall through to the chooser
+    }
+  }
+  return djChooserFlow({ allowTab });
+}
+
 async function takeDecks() {
   if (dj.active) return true;
   if (!active || active.key !== SOUND_ROOM_KEY) return false;
   const coarse = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
-  const gdm = navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia;
-  if (!gdm) {
-    const note = coarse
-      ? 'the decks need desktop Chrome \u2014 phones are for listening \u{1F3A7}'
-      : 'this browser can\u2019t share tab audio \u2014 the decks stay open';
+  const gdm = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  if (!gdm && coarse) {
+    // Phones really can't capture audio — keep the hard block, new copy.
+    const note = 'the decks need a desktop browser \u2014 phones are for listening \u{1F3A7}';
     showUnlockToast([note]);
     addSystemLine(note);
     return false;
   }
-  let disp;
+  let src = null;
   try {
-    // Video is requested for the picker UI on some browsers; stopped at once.
-    disp = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    src = await acquireDjSource({ allowTab: gdm });
   } catch (e) {
-    addSystemLine('the decks stay open \u2014 screen share was dismissed');
+    // User cancelled the system share picker — decks stay open, quiet.
+    if (e && e.dismissed) addSystemLine('the decks stay open \u2014 screen share was dismissed');
     return false;
   }
-  try {
-    const vids = disp.getVideoTracks ? disp.getVideoTracks() : [];
-    vids.forEach((v) => { try { v.stop(); } catch (e) {} });
-  } catch (e) {}
-  const auds = disp.getAudioTracks ? disp.getAudioTracks() : [];
-  const track = auds[0];
-  if (!track) {
-    addSystemLine('no audio came through \u2014 share a tab with sound playing');
-    return false;
-  }
-  dj.stream = disp;
+  if (!src) return false; // "never mind" from the chooser
+  const { stream, track, kind, label, cleanup } = src;
+  dj.stream = stream;
   dj.track = track;
+  dj.source = kind;
+  dj.sourceLabel = label;
+  dj.sourceCleanup = cleanup;
   dj.active = true;
-  const a = makeAnalyserFor(disp);
+  const a = makeAnalyserFor(stream);
   if (a) { dj.node = a.node; dj.analyser = a.analyser; dj.analyserData = a.data; }
-  track.onended = () => stopDecks(); // user stopped sharing from the browser UI
+  if (track) track.onended = () => stopDecks(); // user stopped sharing from the browser UI
   if (net.enabled) {
-    net.djStart(track, disp);
+    // Claim label stays short; the full filename is local-only.
+    net.setDjSource(kind === 'file' ? 'audio file' : label);
+    net.djStart(track, stream);
     net.setDj(SOUND_ROOM_KEY); // friends see "on the decks" in the lobby heartbeat
   }
   jamOnBecomeDj(); // start the shared beat clock (broadcasts only when net is up)
-  addSystemLine('you\u2019re on the decks \u2014 share a tab with music playing');
+  addSystemLine(`you\u2019re on the decks \u2014 ${label}`);
   renderDjHud();
   renderFriendsSection();
   return true;
@@ -927,7 +1172,11 @@ function stopDecks(yielded = false, byName = '') {
   jamStopClock(); // the grid dies with the DJ — a new DJ starts a fresh one
   jamStopRecorder(); // the sampler's ring buffer dies with the stream
   detachDjAnalyser();
-  try { if (dj.track) dj.track.stop(); } catch (e) {}
+  // Whatever acquired the source (share, mic, file) tears it down.
+  try { if (dj.sourceCleanup) dj.sourceCleanup(); } catch (e) {}
+  dj.sourceCleanup = null;
+  dj.source = null;
+  dj.sourceLabel = '';
   dj.track = null;
   dj.stream = null;
   net.djStop(); // release the claim + pull the track
@@ -1475,6 +1724,7 @@ if (decksBtn) {
     decksBtn.blur();
   });
 }
+wireDjChooser(); // build 14: source fallback chooser for the decks
 
 // Boot: dress the wisp in the saved look; net reads the equipped look
 // for every ~12Hz broadcast so peers see it too.
@@ -2853,8 +3103,17 @@ window.__limbo = {
   galleryFiles: () => (worlds.soundroom && worlds.soundroom.gallery ? worlds.soundroom.gallery.slice() : []),
   takeDecks,
   stopDecks,
+  // DJ source fallback chain (build 14)
+  acquireDjSource: (o) => acquireDjSource(o || {}),
+  djChooserOpen,
+  djSource: () => ({ kind: dj.source, label: dj.sourceLabel }),
+  djClaimPayload: () => net._djClaimPayload(),
+  setDjSource: (l) => net.setDjSource(l),
+  braveLikely: () => braveLikely(),
   djState: () => ({
     active: dj.active,
+    sourceKind: dj.source,
+    sourceLabel: dj.sourceLabel,
     winner: djWinner(),
     claims: [...net.djClaims.entries()].map(([id, c]) => ({ id, ...c })),
     listening: !!dj.listenAudioEl,

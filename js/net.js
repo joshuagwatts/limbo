@@ -37,7 +37,7 @@ const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
 const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '13';
+const BUILD = '14';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -141,7 +141,7 @@ export class LimboNet {
     this._sweepTimer = null;
     // --- DJ slot (build 12) ---
     this.sendDjClaim = null;
-    this.djClaims = new Map(); // peerId -> {name, t, lastSeen}
+    this.djClaims = new Map(); // peerId -> {name, t, lastSeen, source}
     this.myDjClaim = null; // {t} while WE hold the decks
     this.djMedia = null; // {track, stream} while we stream audio
     this._djTimer = null;
@@ -691,7 +691,20 @@ export class LimboNet {
   }
 
   _djClaimPayload() {
-    return { n: this.name, t: this.myDjClaim ? this.myDjClaim.t : Date.now() };
+    return {
+      n: this.name,
+      t: this.myDjClaim ? this.myDjClaim.t : Date.now(),
+      // build 14: short source label rides the claim so the HUD can say
+      // "on the decks · tab audio" / "· mic/line-in" / "· audio file".
+      s: this.djSourceLabel || '',
+    };
+  }
+
+  /* Build 14: label for our current DJ source ("tab audio", "mic/line-in",
+     "audio file: name.mp3"). Kept out of the 12Hz wisp payload — it only
+     rides the DJ claim (15s). */
+  setDjSource(label) {
+    this.djSourceLabel = label ? String(label).slice(0, 48) : '';
   }
 
   _noteDjClaim(peerId, d) {
@@ -710,6 +723,7 @@ export class LimboNet {
         name: this.cleanName(d.n),
         t,
         lastSeen: Date.now(),
+        source: typeof d.s === 'string' ? d.s.slice(0, 48) : '',
       });
       if (this.onDjCb) this.onDjCb();
     } catch (e) { /* ignore */ }
@@ -778,6 +792,7 @@ export class LimboNet {
     this._stopDjTimers();
     if (this.myDjClaim) this._sendDjRelease();
     this.myDjClaim = null;
+    this.djSourceLabel = '';
     if (this.djMedia && this.room) {
       try {
         this.room.removeTrack(this.djMedia.track);
