@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=22';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=22';
+import { LimboNet } from './net.js?v=23';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=23';
 
 /* ---------------- configuration ---------------- */
 
@@ -2144,40 +2144,74 @@ const JUKE_DRIFT_S = 2.5;      // seek if further off than this
 const JUKE_WATCHDOG_MS = 8000; // track over this long with no advance -> anyone may advance
 const JUKE_CONTENTION_MS = 1500; // competing jukePlays: earliest startedAt wins
 
-/* Provider detection from a pasted URL. */
+/* Provider detection from a pasted URL (build 23: mobile share links,
+   set/playlist URLs, and query-param-laden shares all resolve).
+   Providers: youtube | youtube-playlist | soundcloud | soundcloud-set |
+              soundcloud-short | external | invalid.
+   The transient ones (youtube-playlist, soundcloud-set, soundcloud-short)
+   are expanded/resolved at queue time into plain youtube/soundcloud items. */
 function jukeDetectProvider(raw) {
   let u;
   try { u = new URL(String(raw || '').trim()); }
   catch (e) { return { provider: 'invalid' }; }
   if (!/^https?:$/.test(u.protocol)) return { provider: 'invalid' };
   const host = u.hostname.replace(/^(www\.|m\.|mobile\.)/, '').toLowerCase();
-  if (host === 'youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com') {
+  if (host === 'youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com' ||
+      host === 'music.youtube.com') {
+    const list = u.searchParams.get('list');
     let vid = null;
     if (host === 'youtu.be') vid = u.pathname.slice(1).split(/[?/#]/)[0];
     else if (u.pathname === '/watch') vid = u.searchParams.get('v');
     else if (u.pathname.startsWith('/shorts/')) vid = u.pathname.split('/')[2];
     else if (u.pathname.startsWith('/embed/')) vid = u.pathname.split('/')[2];
+    else if (u.pathname.startsWith('/live/')) vid = u.pathname.split('/')[2];
     vid = (vid || '').split(/[?/#]/)[0];
-    if (vid && /^[A-Za-z0-9_-]{6,20}$/.test(vid)) return { provider: 'youtube', videoId: vid };
-    return { provider: 'external' }; // some other youtube page (playlist, channel…)
+    if (!(vid && /^[A-Za-z0-9_-]{6,20}$/.test(vid))) vid = null;
+    // A playlist param means "queue every track", even when a video is attached.
+    if (list && /^[A-Za-z0-9_-]{8,48}$/.test(list)) {
+      return { provider: 'youtube-playlist', videoId: vid, playlistId: list };
+    }
+    if (vid) return { provider: 'youtube', videoId: vid };
+    return { provider: 'external' }; // some other youtube page (channel, bare /playlist…)
   }
   if (host === 'soundcloud.com' || host.endsWith('.soundcloud.com')) {
+    // Mobile "Share → Copy Link" gives on.soundcloud.com short links — resolve at queue time.
+    if (host === 'on.soundcloud.com') return { provider: 'soundcloud-short' };
     const parts = u.pathname.split('/').filter(Boolean);
-    if (parts.length >= 2 && !parts.includes('sets')) return { provider: 'soundcloud' };
-    return { provider: 'external' }; // profile / playlist page
+    // api.soundcloud.com URLs come from oEmbed resolution of short links.
+    if (host === 'api.soundcloud.com') {
+      if (parts[0] === 'playlists') return { provider: 'soundcloud-set' };
+      if (parts[0] === 'tracks') return { provider: 'soundcloud' };
+      return { provider: 'external' };
+    }
+    if (parts.includes('sets')) return { provider: 'soundcloud-set' };
+    if (parts.length >= 2) return { provider: 'soundcloud' };
+    return { provider: 'external' }; // profile page, likes, stream…
   }
   return { provider: 'external' };
 }
 
-/* Best-effort title for youtube links via noembed; 4s timeout, silent fallback. */
+/* Generic queue title per provider, shown until the real title resolves. */
+function jukeFallbackTitle(provider) {
+  return provider === 'youtube' || provider === 'youtube-playlist' ? 'a youtube track'
+    : provider === 'soundcloud' || provider === 'soundcloud-set' || provider === 'soundcloud-short' ? 'a soundcloud track'
+    : 'a track';
+}
+
+/* Best-effort title for a link: noembed for youtube, oEmbed for soundcloud
+   (both keyless); 4s timeout, silent fallback. */
 async function jukeFetchTitle(url, provider) {
-  const fb = provider === 'youtube' ? 'a youtube track'
-    : provider === 'soundcloud' ? 'a soundcloud track' : 'a track';
-  if (provider !== 'youtube') return fb;
+  const fb = jukeFallbackTitle(provider);
+  const endpoint = provider === 'youtube' || provider === 'youtube-playlist'
+    ? 'https://noembed.com/embed?url=' + encodeURIComponent(url)
+    : (provider === 'soundcloud' || provider === 'soundcloud-set' || provider === 'soundcloud-short')
+    ? 'https://soundcloud.com/oembed?url=' + encodeURIComponent(url) + '&format=json'
+    : null;
+  if (!endpoint) return fb;
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 4000);
-    const r = await fetch('https://noembed.com/embed?url=' + encodeURIComponent(url), { signal: ctl.signal });
+    const r = await fetch(endpoint, { signal: ctl.signal });
     clearTimeout(t);
     const jj = await r.json();
     if (jj && jj.title) return String(jj.title).slice(0, 120);
@@ -2185,11 +2219,140 @@ async function jukeFetchTitle(url, provider) {
   return fb;
 }
 
+/* Resolve a mobile short share link (on.soundcloud.com/xxx) to its canonical
+   URL via SoundCloud's own oEmbed (CORS-open, keyless): the returned iframe
+   html carries the canonical url= param, and we get the real title for free.
+   Returns { url, title } or null. */
+async function jukeResolveShortLink(url) {
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    const r = await fetch('https://soundcloud.com/oembed?url=' + encodeURIComponent(url) + '&format=json',
+      { signal: ctl.signal });
+    clearTimeout(t);
+    const jj = await r.json();
+    if (jj && jj.html) {
+      const m = String(jj.html).match(/src="([^"]*w\.soundcloud\.com\/player\/[^"]*)"/);
+      if (m) {
+        const src = m[1].replace(/&amp;/g, '&');
+        const canonical = new URL(src).searchParams.get('url');
+        if (canonical && /(^|\.)soundcloud\.com/.test(new URL(canonical).hostname)) {
+          return {
+            url: canonical,
+            title: jj.title ? String(jj.title).slice(0, 120) : null,
+          };
+        }
+      }
+    }
+  } catch (e) { /* offline / dead link -> null */ }
+  return null;
+}
+
+/* Resolve a SoundCloud set URL into its tracks via a hidden widget:
+   READY -> getSounds() needs no API key. Returns
+   [{url: permalink, title, durationMs, provider:'soundcloud'}] or null. */
+function jukeResolveSCSet(setUrl) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (tracks) => {
+      if (done) return; done = true;
+      clearTimeout(to);
+      try { document.getElementById('juke-set-resolver').remove(); } catch (e) {}
+      resolve(tracks);
+    };
+    const to = setTimeout(() => finish(null), 25000);
+    const div = document.createElement('div');
+    div.id = 'juke-set-resolver';
+    div.style.display = 'none';
+    document.body.appendChild(div);
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('frameborder', '0');
+    iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(setUrl) +
+      '&auto_play=false&visual=false&hide_related=true';
+    div.appendChild(iframe);
+    jukeLoadSCApi((ok) => {
+      if (!ok) { finish(null); return; }
+      try {
+        const w = window.SC.Widget(iframe);
+        w.bind(window.SC.Widget.Events.READY, () => {
+          try {
+            w.getSounds((sounds) => {
+              if (!sounds || !sounds.length) { finish(null); return; }
+              finish(sounds
+                .filter((s) => s && (s.permalink_url || s.uri))
+                .map((s) => ({
+                  url: s.permalink_url || setUrl,
+                  title: (s.title || 'untitled').toString().slice(0, 120),
+                  durationMs: s.duration || null,
+                  provider: 'soundcloud',
+                })));
+            });
+          } catch (e) { finish(null); }
+        });
+        w.bind(window.SC.Widget.Events.ERROR, () => finish(null));
+      } catch (e) { finish(null); }
+    });
+  });
+}
+
+/* Resolve a YouTube playlist ID into its videos via a transient hidden
+   player: cuePlaylist (keyless), wait for the CUED state, then getPlaylist()
+   IDs -> noembed titles.
+   Returns [{url, title, durationMs, provider:'youtube', videoId}] or null. */
+function jukeResolveYTPlaylist(playlistId) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (tracks) => {
+      if (done) return; done = true;
+      clearTimeout(to);
+      try { document.getElementById('juke-pl-resolver').remove(); } catch (e) {}
+      resolve(tracks);
+    };
+    const to = setTimeout(() => finish(null), 30000);
+    const div = document.createElement('div');
+    div.id = 'juke-pl-resolver';
+    div.style.cssText = 'position:absolute;left:-9999px;top:0;width:8px;height:8px;overflow:hidden;';
+    document.body.appendChild(div);
+    const el = document.createElement('div');
+    div.appendChild(el);
+    jukeLoadYTApi((ok) => {
+      if (!ok || !window.YT) { finish(null); return; }
+      try {
+        const p = new window.YT.Player(el, {
+          width: '8', height: '8',
+          playerVars: { autoplay: 0, controls: 0, disablekb: 1 },
+          events: {
+            onReady: (ev) => {
+              try { ev.target.cuePlaylist({ list: playlistId, index: 0 }); }
+              catch (e) { finish(null); }
+            },
+            onStateChange: async (ev) => {
+              if (!ev.target || ev.data !== window.YT.PlayerState.CUED) return;
+              let ids = null;
+              try { ids = ev.target.getPlaylist(); } catch (e) {}
+              try { ev.target.destroy(); } catch (e) {}
+              if (!ids || !ids.length) { finish(null); return; }
+              const tracks = await Promise.all(ids.slice(0, 50).map(async (vid) => {
+                const url = 'https://www.youtube.com/watch?v=' + vid;
+                const title = await jukeFetchTitle(url, 'youtube');
+                return { url, title, durationMs: null, provider: 'youtube', videoId: vid };
+              }));
+              finish(tracks);
+            },
+            onError: () => finish(null),
+          },
+        });
+      } catch (e) { finish(null); }
+    });
+  });
+}
+
+const JUKE_PROVIDERS = ['youtube', 'youtube-playlist', 'soundcloud', 'soundcloud-set', 'soundcloud-short', 'external'];
 function jukeValidAdd(d) {
   if (!d || typeof d !== 'object') return false;
   if (typeof d.id !== 'string' || !d.id || d.id.length > 40) return false;
   if (typeof d.url !== 'string' || !d.url || d.url.length > 500) return false;
-  if (!['youtube', 'soundcloud', 'external'].includes(d.provider)) return false;
+  if (!JUKE_PROVIDERS.includes(d.provider)) return false;
   if (typeof d.title !== 'string' || !d.title || d.title.length > 140) return false;
   if (typeof d.addedBy !== 'string' || !d.addedBy || d.addedBy.length > 16) return false;
   if (typeof d.addedAt !== 'number') return false;
@@ -2201,7 +2364,7 @@ function jukeValidPlay(d) {
   if (d.stopped) return typeof d.by === 'string';
   if (typeof d.id !== 'string' || !d.id) return false;
   if (typeof d.url !== 'string' || !d.url) return false;
-  if (!['youtube', 'soundcloud', 'external'].includes(d.provider)) return false;
+  if (!JUKE_PROVIDERS.includes(d.provider)) return false;
   if (typeof d.title !== 'string') return false;
   if (typeof d.startedAt !== 'number' || typeof d.by !== 'string') return false;
   if (typeof d.addedBy !== 'string') return false;
@@ -2215,20 +2378,36 @@ function jukeMakeId() {
   return Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
 }
 
-/* Queue a link. Runs the title fetch, adds locally, broadcasts, and if
-   the room is idle starts playback right away (inside the user's gesture,
-   so autoplay is allowed). titleHint skips the network fetch (tests). */
+/* Queue a link. The item goes in IMMEDIATELY (inside the user's tap gesture,
+   so playback starts with zero extra taps); the real title resolves
+   afterwards and pops in. Mobile short links are resolved to their canonical
+   URL first; set/playlist URLs expand into one item per track.
+   titleHint skips the network fetch (tests). */
 async function jukeAddTrack(rawUrl, titleHint) {
-  const det = jukeDetectProvider(rawUrl);
+  let det = jukeDetectProvider(rawUrl);
   if (det.provider === 'invalid') {
     jukeHint('that link doesn\u2019t look right — paste a full https url');
     return null;
   }
-  const url = String(rawUrl).trim();
-  const title = titleHint || await jukeFetchTitle(url, det.provider);
+  let url = String(rawUrl).trim();
+  let resolvedTitle = titleHint || null;
+  // Mobile "Share → Copy Link" (on.soundcloud.com/xxx): resolve to the
+  // canonical track/set URL via oEmbed (also yields the real title). If it
+  // won't resolve, hand the short URL to the widget anyway — SoundCloud
+  // usually resolves it server-side.
+  if (det.provider === 'soundcloud-short') {
+    jukeHint('resolving that soundcloud link…');
+    const r = await jukeResolveShortLink(url);
+    if (r) { url = r.url; det = jukeDetectProvider(url); if (r.title) resolvedTitle = r.title; }
+    else det = { provider: 'soundcloud' };
+  }
+  // Sets / playlists: one queue item per track.
+  if (det.provider === 'soundcloud-set' || det.provider === 'youtube-playlist') {
+    return jukeAddPlaylist(url, det, resolvedTitle || titleHint);
+  }
   const t = {
     id: jukeMakeId(), url, provider: det.provider,
-    videoId: det.videoId || null, title,
+    videoId: det.videoId || null, title: resolvedTitle || jukeFallbackTitle(det.provider),
     addedBy: myName, addedAt: Date.now(),
   };
   juke.queue.push(t);
@@ -2238,7 +2417,76 @@ async function jukeAddTrack(rawUrl, titleHint) {
   renderJuke();
   // Room idle and no DJ: we queued it, we start it — inside the tap gesture.
   if (!juke.now && !juke.pausedForDj && !djWinner()) jukeAdvance();
+  if (!resolvedTitle) jukeEnrichTitle(t);
   return t;
+}
+
+/* Fire-and-forget: upgrade a generic queue title to the real one, locally.
+   Every client does this for items it receives, so titles pop in everywhere. */
+async function jukeEnrichTitle(t) {
+  if (!t || t.title !== jukeFallbackTitle(t.provider)) return;
+  const title = await jukeFetchTitle(t.url, t.provider);
+  if (title === jukeFallbackTitle(t.provider)) return;
+  t.title = title;
+  if (juke.now && juke.now.id === t.id) juke.now.title = title;
+  renderJuke();
+}
+
+/* A set/playlist URL becomes one queue item per track, grouped so the panel
+   shows "playlist • N tracks" and one tap can pull the whole group. */
+async function jukeAddPlaylist(url, det, titleHint) {
+  jukeHint('pulling the track list…');
+  let tracks = null;
+  try {
+    tracks = det.provider === 'soundcloud-set'
+      ? await jukeResolveSCSet(url)
+      : await jukeResolveYTPlaylist(det.playlistId);
+  } catch (e) { tracks = null; }
+  if (!tracks || !tracks.length) {
+    jukeHint('couldn\u2019t load that playlist — is it public?');
+    return null;
+  }
+  const gid = 'pl-' + jukeMakeId();
+  const groupTitle = titleHint ||
+    (det.provider === 'soundcloud-set' ? 'soundcloud set' : 'youtube playlist');
+  const now = Date.now();
+  const items = [];
+  for (let i = 0; i < tracks.length; i++) {
+    const tr = tracks[i];
+    const t = {
+      id: jukeMakeId(), url: tr.url, provider: tr.provider,
+      videoId: tr.videoId || null, title: (tr.title || ('track ' + (i + 1))).toString().slice(0, 120),
+      durationMs: tr.durationMs || null,
+      addedBy: myName, addedAt: now + i, // preserve set order under the FIFO sort
+      group: gid, groupTitle, groupCount: tracks.length,
+    };
+    if (!jukeValidAdd(t)) continue;
+    items.push(t);
+    juke.queue.push(t);
+    if (net.enabled && net.sendJukeAdd) {
+      try { net.sendJukeAdd(t); } catch (e) { /* best effort */ }
+    }
+  }
+  renderJuke();
+  if (items.length) jukeHint(`queued ${items.length} track${items.length === 1 ? '' : 's'} — enjoy the set`);
+  if (!juke.now && !juke.pausedForDj && !djWinner()) jukeAdvance();
+  return items;
+}
+
+/* Pull a whole playlist group back out of the queue (remaining tracks). */
+function jukeRemoveGroup(gid) {
+  const mine = juke.queue.filter((t) => t.group === gid);
+  if (!mine.length) return false;
+  if (mine.some((t) => t.addedBy !== myName)) {
+    jukeHint('only the drifter who queued it can pull it');
+    return false;
+  }
+  juke.queue = juke.queue.filter((t) => t.group !== gid);
+  if (net.enabled && net.sendJukeRemove) {
+    for (const t of mine) { try { net.sendJukeRemove({ id: t.id, by: myName }); } catch (e) {} }
+  }
+  renderJuke();
+  return true;
 }
 
 function handleJukeAdd(d, peerId) {
@@ -2247,6 +2495,7 @@ function handleJukeAdd(d, peerId) {
   juke.queue.push(d);
   juke.queue.sort((a, b) => a.addedAt - b.addedAt); // FIFO by queue time
   renderJuke();
+  jukeEnrichTitle(d); // everyone resolves the real title locally
 }
 
 /* Remove your own queued track. If it's the one playing, that counts as a
@@ -2332,6 +2581,12 @@ function jukeAdvance() {
     addedBy: next.addedBy, startedAt: Date.now(),
     durationMs: 0, by: myName,
   };
+  // Playlist grouping survives the queue -> now-playing hop (and the broadcast).
+  if (next.group) {
+    play.group = next.group;
+    play.groupTitle = next.groupTitle;
+    play.groupCount = next.groupCount;
+  }
   if (net.enabled && net.sendJukePlay) {
     try { net.sendJukePlay(play); } catch (e) {}
   }
@@ -2494,6 +2749,7 @@ function jukePlayYT(d, offset) {
           onStateChange: (ev) => {
             if (ev.data === window.YT.PlayerState.ENDED) jukeOnPlayerEnded();
           },
+          onError: () => { jukeOnTrackError(); },
         },
       });
       juke.player = {
@@ -2509,6 +2765,22 @@ function jukePlayYT(d, offset) {
       };
     } catch (e) { /* player failed; watchdog still advances on duration */ }
   });
+}
+
+/* A track the provider refused to load (private, deleted, region-blocked):
+   tell the room plainly instead of sitting in silence, and let the queuer
+   move the room on to the next track. */
+let jukeErrAdvancedFor = null;
+function jukeOnTrackError() {
+  if (!juke.now || juke.pausedForDj) return;
+  if (jukeErrAdvancedFor === juke.now.id) return; // already handling it
+  jukeErrAdvancedFor = juke.now.id;
+  jukeHint('couldn\u2019t load that link — is it public?');
+  if (juke.now.addedBy === myName) {
+    setTimeout(() => {
+      if (juke.now && jukeErrAdvancedFor === juke.now.id && !juke.pausedForDj) jukeAdvance();
+    }, 2500);
+  }
 }
 
 function jukePlaySC(d, offset) {
@@ -2531,24 +2803,38 @@ function jukePlaySC(d, offset) {
     '&auto_play=false&hide_related=true&show_comments=false&show_user=false&visual=false';
   holder.appendChild(iframe);
   jukeLoadSCApi((ok) => {
-    if (!ok || !juke.now || juke.now.id !== d.id) return;
+    if (!juke.now || juke.now.id !== d.id) return; // stale track
+    if (!ok) {
+      // api.js itself wouldn't load — say so instead of sitting silent.
+      jukeHint('soundcloud isn\u2019t loading — check your connection');
+      jukeOnTrackError();
+      return;
+    }
     try {
       const w = window.SC.Widget(iframe);
       let playingFlag = false;
       w.bind(window.SC.Widget.Events.PLAY, () => { playingFlag = true; });
       w.bind(window.SC.Widget.Events.PAUSE, () => { playingFlag = false; });
       w.bind(window.SC.Widget.Events.FINISH, () => { playingFlag = false; jukeOnPlayerEnded(); });
+      w.bind(window.SC.Widget.Events.ERROR, () => { playingFlag = false; jukeOnTrackError(); });
       w.bind(window.SC.Widget.Events.READY, () => {
         const off = juke.now && juke.now.id === d.id ? jukeOffsetFor(juke.now) : 0;
         try { w.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
         try { if (off > 1) w.seekTo(Math.round(off * 1000)); } catch (e) {}
         try { w.play(); } catch (e) {}
+        // Enrich the local duration so the progress bar + end detection work.
+        try {
+          w.getDuration((ms) => {
+            if (juke.now && juke.now.id === d.id && ms > 0) juke.now.durationMs = ms;
+          });
+        } catch (e) {}
         jukeWatchAutoplay('soundcloud');
       });
       let lastPos = null;
+      let lastDur = null;
       juke.player = {
         kind: 'soundcloud',
-        playingFlag,
+        get playingFlag() { return playingFlag; }, // live read for the autoplay watchdog
         play: () => w.play(),
         pause: () => w.pause(),
         seekTo: (s) => w.seekTo(Math.round(s * 1000)),
@@ -2556,13 +2842,14 @@ function jukePlaySC(d, offset) {
           try { w.getPosition((ms) => { lastPos = ms / 1000; }); } catch (e) {}
           return lastPos;
         },
-        dur: () => null, // async via getDuration; end comes from FINISH
+        dur: () => {
+          try { w.getDuration((ms) => { lastDur = ms / 1000; }); } catch (e) {}
+          return lastDur;
+        },
         setVolume: (v) => { try { w.setVolume(v); } catch (e) {} },
         destroy: () => { try { w.unbind(window.SC.Widget.Events.FINISH); } catch (e) {} },
       };
-      // keep the autoplay watchdog's flag fresh
-      setInterval(() => { if (juke.player) juke.player.playingFlag = playingFlag; }, 500);
-    } catch (e) { /* widget failed; watchdog still advances on duration */ }
+    } catch (e) { jukeOnTrackError(); }
   });
 }
 
@@ -2788,7 +3075,11 @@ function jukeHint(msg) {
 }
 
 function jukeProviderIcon(p) {
-  return p === 'youtube' ? '▶ yt' : p === 'soundcloud' ? '☁ sc' : '↗ ext';
+  return p === 'youtube' ? '▶ yt'
+    : p === 'youtube-playlist' ? '▶ playlist'
+    : p === 'soundcloud' ? '☁ sc'
+    : p === 'soundcloud-set' || p === 'soundcloud-short' ? '☁ set'
+    : '↗ ext';
 }
 
 function renderJuke() {
@@ -2831,7 +3122,27 @@ function renderJuke() {
     if (!juke.queue.length) {
       qEl.innerHTML = '<div class="juke-empty">queue is empty — drop a link</div>';
     } else {
+      let lastGroup = null;
       juke.queue.forEach((t) => {
+        // Playlist grouping: one header per set, with a pull-the-whole-set ✕.
+        if (t.group && t.group !== lastGroup) {
+          const gh = document.createElement('div');
+          gh.className = 'juke-group-head';
+          const gl = document.createElement('span');
+          const n = juke.queue.filter((x) => x.group === t.group).length;
+          gl.textContent = `🎶 ${t.groupTitle || 'playlist'} • ${n} track${n === 1 ? '' : 's'} left`;
+          gh.appendChild(gl);
+          if (t.addedBy === myName) {
+            const grm = document.createElement('button');
+            grm.className = 'juke-rm';
+            grm.textContent = '✕';
+            grm.setAttribute('aria-label', 'remove playlist');
+            grm.addEventListener('click', () => jukeRemoveGroup(t.group));
+            gh.appendChild(grm);
+          }
+          qEl.appendChild(gh);
+        }
+        lastGroup = t.group || null;
         const row = document.createElement('div');
         row.className = 'juke-row';
         const nm = document.createElement('span');
@@ -4984,5 +5295,16 @@ window.__limbo = {
     return d;
   },
   jukeJoinTap: () => jukeJoinTap(),
+  jukeResolveShortLink: (u) => jukeResolveShortLink(u),
+  jukeRemoveGroup: (g) => jukeRemoveGroup(g),
+  jukePlayerInfo: () => { // test seam: live read of the real provider player
+    if (!juke.player) return null;
+    const o = { kind: juke.player.kind };
+    try { o.pos = juke.player.pos(); } catch (e) { o.pos = null; }
+    try { o.dur = juke.player.dur(); } catch (e) { o.dur = null; }
+    try { o.state = juke.player.state ? juke.player.state() : null; } catch (e) {}
+    try { o.playingFlag = !!juke.player.playingFlag; } catch (e) {}
+    return o;
+  },
   jukeSkipVotes: (id) => (juke.skips[id] ? [...juke.skips[id]] : []),
 };
