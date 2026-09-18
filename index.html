@@ -42,6 +42,22 @@
 <!-- take the decks — only visible inside the sound room -->
 <button id="decks-btn" style="display:none">take the decks</button>
 
+<!-- DJ source chooser (build 14): shown when tab share yields no audio,
+     so Brave users can fall back to mic/line-in or an audio file -->
+<div id="dj-chooser" style="display:none">
+  <div class="dj-chooser-box">
+    <div class="dj-chooser-title">NO TAB AUDIO CAME THROUGH</div>
+    <div class="dj-chooser-sub">pick another way to feed the decks</div>
+    <div id="dj-src-hint" style="display:none"></div>
+    <button id="dj-src-tab">try tab share again</button>
+    <button id="dj-src-mic">use microphone / line-in</button>
+    <button id="dj-src-file">play an audio file</button>
+    <button id="dj-src-cancel">never mind</button>
+    <div id="dj-src-note"></div>
+  </div>
+  <input type="file" id="dj-file-input" accept="audio/*" style="display:none">
+</div>
+
 <!-- jam room — only visible inside the sound room -->
 <button id="jam-btn" style="display:none">&#127925; jam</button>
 <div id="jam-panel">
@@ -128,6 +144,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=13"></script>
+<script type="module" src="js/game.js?v=14"></script>
 </body>
 </html>

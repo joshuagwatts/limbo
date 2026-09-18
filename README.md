@@ -27,8 +27,10 @@ realm a friend is drifting in and hop straight to them.
 
 The Nexus has a 5th portal — the **SOUND ROOM**, a social listening space
 with the four realm artworks hanging as a gallery. One drifter at a time
-can **take the decks** (desktop Chrome shares tab audio over WebRTC) while
+can **take the decks** (tab audio over WebRTC in a desktop browser) while
 everyone in the room hears the mix; the room's lights pulse with the bass.
+When tab audio fails (Brave blocks it, for one), a chooser offers mic/line-in
+or playing an audio file instead — the decks never dead-end.
 Friends who are DJing show "on the decks" in the friends list.
 
 The sound room is also a **JAM ROOM**: a pocket synth (one chromatic octave,
