@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>LIMBO — a portal universe</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/style.css?v=29">
 <script type="importmap">
 {
   "imports": {
@@ -89,12 +89,12 @@
     </div>
   </div>
   <div id="paint-wrap"><canvas id="paint-canvas"></canvas></div>
+  <div id="paint-palette" aria-label="colors"></div>
   <div class="paint-tools">
-    <div id="paint-palette"></div>
     <button id="paint-eraser" aria-label="eraser">&#9003; erase</button>
     <button id="paint-blend" aria-label="blend brush">&#127744; blend</button>
     <button id="paint-undo" aria-label="undo last stroke">&#8617; undo</button>
-    <div id="paint-sizes">
+    <div id="paint-sizes" aria-label="brush size">
       <button data-size="6">S</button>
       <button data-size="16" class="sel">M</button>
       <button data-size="34">L</button>
@@ -220,6 +220,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=28"></script>
+<script type="module" src="js/game.js?v=29"></script>
 </body>
 </html>

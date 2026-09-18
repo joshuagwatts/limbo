@@ -444,3 +444,25 @@ synth notes weren't shared until you tapped it, but they were always live
   whole mural as a timestamped PNG (`limbo-wall-<date>.png`) straight to
   the device — a manual backup on top of the existing localStorage
   persistence, which is untouched.
+
+## Build 29 — paint overlay redo (phone-first)
+
+Joshua's verdict on build 28's paint screen: "The paint ui is weird" —
+on his phone the canvas was a tiny strip, the palette ran down the left
+edge, buttons floated over the game world, and the room UI bled through
+behind the overlay (style.css had no cache-bust, so his phone was likely
+also showing stale CSS — fixed with `css/style.css?v=29`).
+
+- **Full-screen opaque paint surface.** `#paint-overlay` is now solid
+  `#05060d` — the 3D scene and room UI never show through. The canvas
+  fills all space between the header and the toolbars
+  (`object-fit: contain` letterboxes the 2:1 wall canvas without
+  distortion; pointer mapping already uses `getBoundingClientRect`, so
+  no game.js changes were needed).
+- **Palette is a horizontal scrollable row** of 44px swatches under the
+  canvas (moved out of the toolbar into its own `#paint-palette` row —
+  all element ids and the JS population logic are unchanged).
+- **One bottom toolbar:** erase, blend, undo, S/M/L — all ≥44px tall,
+  fits 390px wide without overlap or scroll.
+- The "it paints live for everyone in the sound room" hint stays,
+  small, at the bottom inside the overlay.
