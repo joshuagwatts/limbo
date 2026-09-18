@@ -283,35 +283,6 @@ html, body {
 @keyframes pulse-dot { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 #peer-count.settled { color: var(--ink-faint); }
 
-/* ---------- sound room: DJ line + decks button (build 12) ---------- */
-#dj-line {
-  position: absolute; top: 66px; right: 26px;
-  font-weight: 300; font-size: 11px;
-  letter-spacing: 0.28em;
-  color: #ffc24d;
-  text-shadow: 0 0 12px rgba(255, 194, 77, 0.55);
-}
-#live-btn {
-  position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%);
-  z-index: 40;
-  background: rgba(255, 90, 90, 0.12);
-  border: 1px solid rgba(255, 90, 90, 0.6); border-radius: 999px;
-  color: #ff9d9d; font-family: inherit; letter-spacing: 0.2em;
-  font-size: 11px; text-transform: uppercase;
-  padding: 14px 26px; min-height: 48px;
-  cursor: pointer; touch-action: manipulation;
-}
-#live-btn:active { background: rgba(255, 90, 90, 0.25); }
-#live-btn.on-air {
-  background: rgba(255, 90, 90, 0.3);
-  color: #fff;
-  animation: live-pulse 1.6s ease-in-out infinite;
-}
-@keyframes live-pulse {
-  0%, 100% { box-shadow: 0 0 0 rgba(255, 90, 90, 0.5); }
-  50% { box-shadow: 0 0 18px rgba(255, 90, 90, 0.7); }
-}
-
 /* ---------- settings ---------- */
 #gear-btn {
   position: fixed; top: 14px; left: 14px; z-index: 46;
@@ -1036,6 +1007,14 @@ html, body {
   padding: 0 16px; cursor: pointer; touch-action: manipulation;
 }
 #paint-eraser.sel { border-style: solid; border-color: #fff; background: rgba(255, 255, 255, 0.14); }
+#paint-blend {
+  flex-shrink: 0; height: 44px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.45);
+  color: #e8e8f2; font-family: inherit; font-size: 12px; letter-spacing: 0.08em;
+  padding: 0 16px; cursor: pointer; touch-action: manipulation;
+}
+#paint-blend.sel { border-style: solid; border-color: #fff; background: rgba(255, 255, 255, 0.14); }
 #paint-undo {
   flex-shrink: 0; height: 44px; border-radius: 999px;
   background: rgba(255, 255, 255, 0.05);
@@ -1091,12 +1070,6 @@ html, body {
   background: none; border: none; color: #bfe9b0;
   font-size: 15px; cursor: pointer; padding: 8px 10px;
   touch-action: manipulation; min-height: 44px; min-width: 44px;
-}
-.juke-dj-note {
-  text-align: center; font-size: 11px; letter-spacing: 0.15em;
-  color: #ffc24d; border: 1px solid rgba(255, 194, 77, 0.4);
-  border-radius: 8px; padding: 8px; margin-bottom: 10px;
-  background: rgba(255, 194, 77, 0.08);
 }
 .juke-now { margin-bottom: 6px; }
 .juke-now-title {
