@@ -194,3 +194,37 @@ Fly into a portal ring to travel. Fly into a glowing echo orb to collect it.
 - Third-person follow camera with dreamy inertia rather than full 6-DOF sim.
 - Touch controls are functional but basic; desktop is the primary target.
 - No VR mode, no persistence backend — those are phase 2+.
+
+## Jukebox (build 21) — synchronized playback, not audio relay
+
+The sound room has a jukebox: anyone can queue a track link, and everyone
+hears the same track at the same moment. The honest architecture: we do
+**not** relay Spotify/SoundCloud audio between users (DRM, ToS, no API for
+it). Instead every client plays the same track at the same wall-clock
+offset through an embedded player on their own device — same song, same
+moment, ~1s sync. Good enough for hanging out.
+
+- **Supported providers:** YouTube (embedded IFrame player, seek-synced) and
+  SoundCloud (embedded widget, seek-synced). Anything else (Spotify,
+  Bandcamp, …) gets the **external path**: the room counts down together
+  ("press play in your app in 5…") and everyone presses play manually, plus
+  an "open in my app ↗" button per track.
+- **Queue:** FIFO; anyone can queue, only the queuer can remove their track.
+  Skip takes 2 votes. Late joiners get the full queue + now-playing and land
+  mid-track via offset math. A 20s resync nudge re-seeks anyone who drifted
+  >2.5s.
+- **Advance duty:** whoever queued the finished track broadcasts the next
+  `jukePlay`. Watchdog: if a track has been over >8s with no advance, any
+  peer may advance — first broadcast wins (earliest `startedAt` wins ties).
+- **DJ interaction:** while a DJ is live on the decks the jukebox
+  auto-pauses ("DJ is live — jukebox paused"); when the DJ leaves, someone
+  resumes the queue with a fresh `startedAt`.
+- **Autoplay:** browsers block unmuted autoplay without a gesture. Queueing
+  or skipping (your tap) starts playback directly; on receiving a remote
+  play the client attempts it and, if blocked, pulses a "tap to join the
+  music" button.
+- **Limits:** no seeking UI (skip + re-add covers it), no Spotify direct
+  playback (needs Premium + an OAuth app — use the external path), no
+  persistence across sessions, iframe audio can't route through the game's
+  WebAudio chain so the volume slider drives each provider player's own
+  volume API.

@@ -64,6 +64,34 @@
 
 <!-- community wall paint mode — only visible inside the sound room (build 18) -->
 <button id="paint-btn" style="display:none">&#127912; paint</button>
+
+<!-- jukebox — synced queue playback, only visible inside the sound room (build 21) -->
+<button id="juke-btn" style="display:none">&#127925; jukebox</button>
+<div id="juke-panel" style="display:none">
+  <div class="juke-head"><span>&#127925; JUKEBOX</span><button id="juke-close" aria-label="close">&#10005;</button></div>
+  <div id="juke-dj-note" class="juke-dj-note" style="display:none">DJ is live — jukebox paused</div>
+  <div class="juke-now">
+    <div id="juke-now-title" class="juke-now-title">nothing playing</div>
+    <div class="juke-now-sub"><span id="juke-now-provider"></span><span id="juke-now-by"></span></div>
+    <div class="juke-progress"><div id="juke-progress-fill"></div></div>
+    <div class="juke-now-row">
+      <button id="juke-skip">skip <span id="juke-skip-count"></span></button>
+      <button id="juke-open-app">open in my app &#8599;</button>
+      <button id="juke-join" style="display:none">tap to join the music</button>
+    </div>
+    <div id="juke-countdown" class="juke-countdown" style="display:none"></div>
+    <div class="juke-vol-row"><span>vol</span><input id="juke-vol" type="range" min="0" max="100" value="70" aria-label="jukebox volume"></div>
+  </div>
+  <div class="juke-sub">UP NEXT</div>
+  <div id="juke-queue" class="juke-queue"><div class="juke-empty">queue is empty — drop a link</div></div>
+  <div class="juke-add-row">
+    <input id="juke-add-url" placeholder="paste a youtube / soundcloud link…" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="juke-add-btn">queue it</button>
+  </div>
+  <div id="juke-hint" class="juke-hint">everyone hears the same track at the same time — on their own device</div>
+  <div id="juke-yt-holder" class="juke-embed" style="display:none"></div>
+  <div id="juke-sc-holder" class="juke-embed" style="display:none"></div>
+</div>
 <div id="paint-overlay" style="display:none">
   <div class="paint-head">
     <span>&#127912; COMMUNITY WALL</span>
@@ -189,6 +217,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=20"></script>
+<script type="module" src="js/game.js?v=21"></script>
 </body>
 </html>
