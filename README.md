@@ -339,3 +339,38 @@ speakers. The share is released the instant the take lands.
   through the game's WebAudio chain, so the volume slider drives each
   provider player's own volume API — but **direct audio links** (mp3 etc.)
   ride the full chain natively, volume slider and all.
+
+## Community wall (builds 18, 26) — the wall remembers
+
+The sound room's monumental paint wall now persists. After strokes land
+(debounced ~2s) and on pagehide/tab-hidden, a downscaled JPEG snapshot plus
+a timestamp is saved to `localStorage` under the key `limbo-wall-v1`. On
+boot the snapshot is redrawn onto the wall canvas before first render — so
+a refresh or a game update brings back the last mural. The key is never
+renamed, and same-origin `localStorage` survives deploys, which is what
+makes updates safe. Any storage failure (private mode, quota) is silent:
+the wall just doesn't persist, never a crash, never a toast.
+
+When drifters meet in the sound room they exchange `wallHello {ts}` —
+each client's wall version time. Only a peer whose wall is NEWER answers,
+with the existing `wallSync` JPEG flow, so the room converges on the
+latest mural (last-writer-wins). Live strokes stay the truth while anyone
+is painting; the snapshot is the backstop. An incoming `wallSync` never
+stomps active painting: if your own brush landed in the last ~3s the mural
+is stashed and merged once you're quiet, and the merge keeps your strokes
+on top of the peer's mural instead of replacing them.
+
+Undo (paint overlay, next to the eraser): every stroke carries an id, and
+each client keeps an undoable stroke log under a flattened base canvas.
+Undo pops your most recent stroke, replays the rest, re-snapshots, and
+broadcasts `wallUndo {id}` so peers drop it from their logs and replay
+too. Eraser strokes undo like any other. The log caps at 500 strokes —
+past that the mural bakes into the base (pixels kept, undo history
+dropped). The log itself doesn't survive a reload, only the flattened
+snapshot does, so undo history starts fresh after a refresh.
+
+- **Honest line:** true permanent-for-everyone persistence would need a
+  tiny server holding the canonical mural. This is the serverless version:
+  your wall remembers across your refreshes and updates, and rooms
+  converge on the newest mural when drifters meet — but if nobody who saw
+  a mural ever comes back, that mural is gone with them.
