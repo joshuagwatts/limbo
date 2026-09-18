@@ -43,15 +43,16 @@
 <button id="decks-btn" style="display:none">take the decks</button>
 
 <!-- DJ source chooser (build 14): shown when tab share yields no audio,
-     so Brave users can fall back to mic/line-in or an audio file -->
+     so Brave users can fall back to an audio file or mic/line-in.
+     Build 16: play-from-device is first and first-class (works on phones). -->
 <div id="dj-chooser" style="display:none">
   <div class="dj-chooser-box">
     <div class="dj-chooser-title" id="dj-chooser-title">NO TAB AUDIO CAME THROUGH</div>
     <div class="dj-chooser-sub" id="dj-chooser-sub">pick another way to feed the decks</div>
     <div id="dj-src-hint" style="display:none"></div>
+    <button id="dj-src-file">🎵 play music from this device</button>
+    <button id="dj-src-mic">🎤 use microphone / line-in</button>
     <button id="dj-src-tab">try tab share again</button>
-    <button id="dj-src-mic">use microphone / line-in</button>
-    <button id="dj-src-file">play an audio file</button>
     <button id="dj-src-cancel">never mind</button>
     <div id="dj-src-note"></div>
   </div>
@@ -144,6 +145,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=15"></script>
+<script type="module" src="js/game.js?v=16"></script>
 </body>
 </html>
