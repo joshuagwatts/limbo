@@ -34,14 +34,9 @@
   <div id="realm-name">THE NEXUS</div>
   <div id="echo-counter">ECHOES 0 / 20</div>
   <div id="peer-count">DRIFTERS HERE: 1</div>
-  <div id="dj-line" style="display:none"></div>
   <div id="controls-hint">WASD / ARROWS — FLY&nbsp;&nbsp;·&nbsp;&nbsp;DRAG — LOOK&nbsp;&nbsp;·&nbsp;&nbsp;SPACE / SHIFT — RISE / SINK&nbsp;&nbsp;·&nbsp;&nbsp;T — CHAT&nbsp;&nbsp;·&nbsp;&nbsp;M — MUTE</div>
   <div id="mute-label">SOUND ON</div>
 </div>
-
-<!-- go live — relay your local mix (jam + mic + jukebox) to the room.
-     Only visible inside the sound room (build 27: the decks are gone). -->
-<button id="live-btn" style="display:none">🔴 go live</button>
 
 <!-- jam room — only visible inside the sound room -->
 <button id="jam-btn" style="display:none">&#127925; jam</button>
@@ -53,7 +48,6 @@
 <button id="juke-btn" style="display:none">&#127925; jukebox</button>
 <div id="juke-panel" style="display:none">
   <div class="juke-head"><span>&#127925; JUKEBOX</span><button id="juke-close" aria-label="close">&#10005;</button></div>
-  <div id="juke-dj-note" class="juke-dj-note" style="display:none">DJ is live — jukebox paused</div>
   <div class="juke-now">
     <div id="juke-now-title" class="juke-now-title">nothing playing</div>
     <div class="juke-now-sub"><span id="juke-now-provider"></span><span id="juke-now-by"></span></div>
@@ -90,6 +84,7 @@
   <div class="paint-head">
     <span>&#127912; COMMUNITY WALL</span>
     <div class="paint-head-btns">
+      <button id="paint-save" aria-label="save wall as PNG">💾 save</button>
       <button id="paint-done">done</button>
     </div>
   </div>
@@ -97,6 +92,7 @@
   <div class="paint-tools">
     <div id="paint-palette"></div>
     <button id="paint-eraser" aria-label="eraser">&#9003; erase</button>
+    <button id="paint-blend" aria-label="blend brush">&#127744; blend</button>
     <button id="paint-undo" aria-label="undo last stroke">&#8617; undo</button>
     <div id="paint-sizes">
       <button data-size="6">S</button>
@@ -224,6 +220,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=27"></script>
+<script type="module" src="js/game.js?v=28"></script>
 </body>
 </html>

@@ -26,17 +26,13 @@ every client heartbeats into a shared lobby room, so you can see which
 realm a friend is drifting in and hop straight to them.
 
 The Nexus has a 5th portal — the **SOUND ROOM**, a social listening space
-with the four realm artworks hanging as a gallery. One drifter at a time
-can **take the decks** (tab audio over WebRTC in a desktop browser) while
-everyone in the room hears the mix; the room's lights pulse with the bass.
-When tab audio fails (Brave blocks it, for one), a chooser offers playing
-music from the device first, then mic/line-in or tab share again — the
-decks never dead-end. Phones can DJ too: play music from the device or
-use the mic (tab share needs a desktop browser).
-Friends who are DJing show "on the decks" in the friends list.
-The generative ambient aura ducks out while you're in the sound room (it
-fades back in when you leave) — the room is for decks, jam, jukebox and
-wall, not the background pad.
+with the four realm artworks hanging as a gallery. Everyone in the room
+plays the **jam** together — synth notes, pads, jukebox tracks, sampler
+loops, mic — and every client hears the same mix built locally from the
+same broadcast notes, so nothing confuses anyone. The room's lights pulse
+with the bass. The generative ambient aura ducks out while you're in the
+sound room (it fades back in when you leave) — the room is for jam,
+jukebox and wall, not the background pad.
 
 The sound room is also a **JAM ROOM**: four instruments on glowing tabs —
 **LEAD** (the pocket synth: one chromatic octave, waveform + filter
@@ -327,9 +323,6 @@ link, sample it straight into a pad.
 Safety: the captured stream is recorded with `MediaRecorder` and **never
 connected to the WebAudio graph at all** — it cannot feed back into your
 speakers. The share is released the instant the take lands.
-- **DJ interaction:** while someone is live (🔴 go live) the jukebox
-  auto-pauses ("DJ is live — jukebox paused"); when they stop, someone
-  resumes the queue with a fresh `startedAt`.
 - **Autoplay:** browsers block unmuted autoplay without a gesture. Queueing
   or skipping (your tap) starts playback directly; on receiving a remote
   play the client attempts it and, if blocked, pulses a "tap to join the
@@ -413,15 +406,41 @@ it always belonged:
   a crash; the mic stops when you toggle off or leave the sound room. The
   mic never touches the "sample the room" tab-capture path (that API only
   sees the tab's rendered output — no software feedback loop exists).
-- **Go live (replaces "take the decks").** The decks button is now 🔴 go
-  live: it hangs a `MediaStreamDestination` off the post-limiter jam bus
-  (pre-master, so your own mute stays personal) and relays **your actual
-  mix** — jam instruments, jukebox track, mic — to the room through the
-  existing DJ relay path. Listeners hear exactly what you hear, minus your
-  mute setting. The room line reads "🔴 {name} is live · N listening · live
-  mix". Only works in the sound room; leaving the room stops the relay
-  automatically. The old tab-share/mic/file deck sources are gone with the
-  decks.
 - **Instant skip:** anyone can skip — one tap advances the track
   immediately, no votes, no thresholds. A skip arriving for a track the
   room already moved past is ignored, not a crash.
+
+## Build 28 — the broadcast button is gone
+
+Joshua's call: the 🔴 go-live button was confusing (it looked like the
+synth notes weren't shared until you tapped it, but they were always live
+— the button only relayed the full mix), so it's gone entirely.
+
+- **No broadcast, no relay, no DJ slot.** `goLive`/`stopLive`, the DJ claim
+  protocol, the `MediaStreamDestination` tap, remote-track listening, and
+  the "jukebox pauses while someone's live" rule are all removed from
+  `game.js` and `net.js`.
+- **What everyone hears now:** the jam mix is assembled locally on every
+  client from the same broadcast notes, pads, jukebox offsets, sampler
+  grabs, and mic input — no one person's feed, nothing to turn on. It
+  can't be confusing because there's nothing to misunderstand.
+- **The clock is leaderless:** the 15s clock heartbeat rides on whoever
+  played a note most recently (freshest-wins), so the groove survives
+  without a DJ holding the decks.
+- The sampler records the jam bus post-limiter, and the sound room's light
+  pulse reads bass from the same bus — both unchanged, both DJ-free.
+
+## Build 28 — wall: blend brush + PNG backup
+
+- **Blend brush.** A 🌀 blend button sits next to the eraser on the wall
+  panel. Dragging it smudges the paint already on the canvas — a real
+  finger-paint: each dab samples the average color under the brush, mixes
+  it into what the brush is carrying, and stamps a soft dab of the mix.
+  Not a translucent overlay; the colors genuinely blend. Blend strokes ride
+  the existing wall-stroke protocol (`b: 1` in the stroke data) so peers
+  render the same smudge, undo pops them like any stroke, and the
+  500-stroke bake cap treats them as ordinary pixels.
+- **Save wall.** A 💾 save button in the wall panel header downloads the
+  whole mural as a timestamped PNG (`limbo-wall-<date>.png`) straight to
+  the device — a manual backup on top of the existing localStorage
+  persistence, which is untouched.
