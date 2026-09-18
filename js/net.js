@@ -37,7 +37,7 @@ const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
 const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '26';
+const BUILD = '27';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
@@ -165,6 +165,9 @@ export class LimboNet {
     this.onJukeRemoveCb = null; // (data, peerId)
     this.onJukePlayCb = null; // (data, peerId)
     this.onJukeSkipVoteCb = null; // (data, peerId)
+    this.onJukeFileReqCb = null; // (data, peerId)
+    this.onJukeFileChunkCb = null; // (data, peerId)
+    this.onJukeFileHaveCb = null; // (data, peerId)
     this.onJukeStateReqCb = null; // (data, peerId)
     this.onJukeStateCb = null; // (data, peerId)
     this.onJamTickCb = null; // () — fires on our 15s DJ heartbeat while we hold the decks
@@ -504,12 +507,20 @@ export class LimboNet {
       const jukeSkipVoteAction = room.makeAction('jukeSkipVote');
       const jukeStateReqAction = room.makeAction('jukeStateReq');
       const jukeStateAction = room.makeAction('jukeState');
+      /* Phone files (build 27): song bytes travel peer-to-peer in 48KB
+         base64 chunks — no upload site, no expiring links. */
+      const jukeFileReqAction = room.makeAction('jukeFileReq');
+      const jukeFileChunkAction = room.makeAction('jukeFileChunk');
+      const jukeFileHaveAction = room.makeAction('jukeFileHave');
       this.sendJukeAdd = (data) => jukeAddAction.send(data);
       this.sendJukeRemove = (data) => jukeRemoveAction.send(data);
       this.sendJukePlay = (data) => jukePlayAction.send(data);
       this.sendJukeSkipVote = (data) => jukeSkipVoteAction.send(data);
       this.sendJukeStateReq = (data) => jukeStateReqAction.send(data);
       this.sendJukeState = (data) => jukeStateAction.send(data);
+      this.sendJukeFileReq = (data, target) => jukeFileReqAction.send(data, target);
+      this.sendJukeFileChunk = (data, target) => jukeFileChunkAction.send(data, target);
+      this.sendJukeFileHave = (data) => jukeFileHaveAction.send(data);
       jukeAddAction.onMessage = (d, info) => {
         if (this.onJukeAddCb) this.onJukeAddCb(d, info && info.peerId);
       };
@@ -527,6 +538,15 @@ export class LimboNet {
       };
       jukeStateAction.onMessage = (d, info) => {
         if (this.onJukeStateCb) this.onJukeStateCb(d, info && info.peerId);
+      };
+      jukeFileReqAction.onMessage = (d, info) => {
+        if (this.onJukeFileReqCb) this.onJukeFileReqCb(d, info && info.peerId);
+      };
+      jukeFileChunkAction.onMessage = (d, info) => {
+        if (this.onJukeFileChunkCb) this.onJukeFileChunkCb(d, info && info.peerId);
+      };
+      jukeFileHaveAction.onMessage = (d, info) => {
+        if (this.onJukeFileHaveCb) this.onJukeFileHaveCb(d, info && info.peerId);
       };
       room.onPeerJoin = (id) => {
         this.peers.set(id, true);
@@ -659,6 +679,9 @@ export class LimboNet {
     this.sendJukeSkipVote = null;
     this.sendJukeStateReq = null;
     this.sendJukeState = null;
+    this.sendJukeFileReq = null;
+    this.sendJukeFileChunk = null;
+    this.sendJukeFileHave = null;
   }
 
   /* ---------------- lobby presence (build 11) ----------------
@@ -774,7 +797,7 @@ export class LimboNet {
      after 45s of silence (tab closed, etc). Audio goes over Trystero's
      media API (addTrack / onPeerTrack), not the data channel. */
 
-  /* What our heartbeat says about DJing: roomKey where we're on the decks,
+  /* What our heartbeat says about going live: roomKey where we're live,
      or null. Re-broadcasts immediately. */
   setDj(roomKey) {
     this.presenceDj = roomKey ? String(roomKey).slice(0, 16) : null;
@@ -785,15 +808,14 @@ export class LimboNet {
     return {
       n: this.name,
       t: this.myDjClaim ? this.myDjClaim.t : Date.now(),
-      // build 14: short source label rides the claim so the HUD can say
-      // "on the decks · tab audio" / "· mic/line-in" / "· audio file".
+      // short source label rides the claim so the HUD can say
+      // "is live · live mix".
       s: this.djSourceLabel || '',
     };
   }
 
-  /* Build 14: label for our current DJ source ("tab audio", "mic/line-in",
-     "audio file: name.mp3"). Kept out of the 12Hz wisp payload — it only
-     rides the DJ claim (15s). */
+  /* Label for our live source ("live mix"). Kept out of the 12Hz wisp
+     payload — it only rides the DJ claim (15s). */
   setDjSource(label) {
     this.djSourceLabel = label ? String(label).slice(0, 48) : '';
   }

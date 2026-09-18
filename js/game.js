@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=26';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=26';
+import { LimboNet } from './net.js?v=27';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=27';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -748,8 +748,8 @@ function renderFriendsSection() {
     if (live) {
       const where = document.createElement('span');
       where.className = 'friend-realm';
-      // A DJing friend shows "on the decks" instead of the room name.
-      where.textContent = live.dj ? '\u{1F534} on the decks' : realmDisplayName(live.room);
+      // A live friend shows "is live" instead of the room name.
+      where.textContent = live.dj ? '\u{1F534} live' : realmDisplayName(live.room);
       const join = document.createElement('button');
       join.className = 'friend-join';
       join.textContent = 'join';
@@ -781,15 +781,15 @@ function renderFriendsSection() {
    the room's bass-reactive lights. */
 
 const djLineEl = document.getElementById('dj-line');
-const decksBtn = document.getElementById('decks-btn');
+const liveBtn = document.getElementById('live-btn');
 
 const dj = {
-  active: false,      // WE hold the decks
-  stream: null,       // our captured desktop audio (DJ side)
+  active: false,      // WE are live (relaying our mix)
+  stream: null,       // our MediaStreamDestination stream (live side)
   track: null,
-  source: null,       // 'tab' | 'mic' | 'file' — build 14 fallback chain
-  sourceLabel: '',    // short HUD label, e.g. "tab audio", "audio file: x.mp3"
-  sourceCleanup: null, // () => void — tears down whatever acquired the source
+  dest: null,         // MediaStreamDestination hanging off the jam bus
+  source: null,       // 'live' while we're on air
+  sourceLabel: '',    // short HUD label, e.g. "live mix"
   node: null,         // DJ-side analyser source node
   analyser: null,
   analyserData: null,
@@ -871,7 +871,7 @@ function detachDjListener() {
   dj.listenPeerId = null;
 }
 
-/* Earliest fresh claim wins — ours included when we hold the decks. */
+/* Earliest fresh claim wins — ours included when we're live. */
 function djWinner() {
   let best = null;
   if (net.myDjClaim) best = { name: myName, isSelf: true, t: net.myDjClaim.t, sourceLabel: dj.sourceLabel };
@@ -888,9 +888,12 @@ function renderDjHud() {
   if (jukeBtn) jukeBtn.style.display = inRoom ? '' : 'none';
   if (!inRoom && paint.open) setPaintOpen(false); // paint mode can't leave the room
   if (!inRoom) jukeLeaveRoom(); // the jukebox only plays in the sound room
-  if (decksBtn) {
-    decksBtn.style.display = inRoom ? '' : 'none';
-    if (inRoom) decksBtn.textContent = dj.active ? 'leave the decks' : 'take the decks';
+  if (liveBtn) {
+    liveBtn.style.display = inRoom ? '' : 'none';
+    if (inRoom) {
+      liveBtn.innerHTML = dj.active ? '&#9632; stop' : '&#128308; go live';
+      liveBtn.classList.toggle('on-air', dj.active);
+    }
   }
   if (!djLineEl) return;
   if (!inRoom) {
@@ -902,323 +905,82 @@ function renderDjHud() {
   if (w) {
     const n = net.peers.size + 1;
     const src = w.sourceLabel ? ` \u00B7 ${w.sourceLabel}` : '';
-    djLineEl.textContent = `\u{1F3A7} ${w.name} is on the decks \u00B7 ${n} listening${src}`;
+    djLineEl.textContent = `\u{1F534} ${w.name} is live \u00B7 ${n} listening${src}`;
   } else {
-    djLineEl.textContent = 'the decks are open';
+    djLineEl.textContent = 'nobody is live \u2014 go live and play for the room';
   }
   djLineEl.style.display = '';
 }
 
-/* ---------------- DJ source fallback chain (build 14) ----------------
-   Brave and some Chromium builds silently fail tab-audio capture, so
-   "take the decks" can no longer dead-end. acquireDjSource() returns
-   {stream, track, kind, label, cleanup} from the first working option:
-
-     a. tab share — getDisplayMedia({video, audio}); video tracks are
-        stopped at once (only requested for the picker UI on some
-        browsers); requires an audio track.
-     b. chooser — mic/line-in (getUserMedia with all processing off;
-        DJs can select a virtual-audio-cable / loopback device as the
-        mic in OS sound settings for true system audio) or an audio
-        file (HTMLAudioElement loop + captureStream — works in every
-        desktop browser, zero permissions).
-
-   Everything downstream (net.djStart, the analyser, the sampler's ring
-   buffer) only ever sees a MediaStream + audio track, so any source
-   just works.
-   Build 15: phones skip tab share entirely (no getDisplayMedia on mobile)
-   and go straight to the chooser with mic / audio-file only. */
-
-function isUserDismissal(e) {
-  const n = (e && e.name) || '';
-  return n === 'NotAllowedError' || n === 'AbortError';
+/* Make sure the WebAudio engine is up and running. The drift tap calls
+   audio.init(); this is the safety net for programmatic callers. */
+function audioEnsureRunning() {
+  try {
+    if (!audio.ctx) audio.init(110);
+    if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
+  } catch (e) {}
+  return !!(audio.ctx && audio.master);
 }
 
-async function tryTabShare() {
-  const disp = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-  try { (disp.getVideoTracks ? disp.getVideoTracks() : []).forEach((v) => { try { v.stop(); } catch (e) {} }); } catch (e) {}
-  const auds = disp.getAudioTracks ? disp.getAudioTracks() : [];
-  const track = auds[0];
-  if (!track) {
-    // No audio came through — Brave does exactly this. Stop everything
-    // so the indicator light doesn't linger, and let the caller fall
-    // through to the chooser.
-    try { (disp.getTracks ? disp.getTracks() : []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {}
-    return null;
-  }
-  return {
-    stream: disp,
-    track,
-    kind: 'tab',
-    label: 'tab audio',
-    cleanup: () => { try { track.stop(); } catch (e) {} },
-  };
-}
+/* ---------------- go live (build 27) ----------------
+   The decks are gone. "Go live" relays YOUR local mix to the room: the
+   jam master bus (instruments + mic, through reverb/delay/limiter) plus
+   any CORS-open jukebox track already riding the chain. A
+   MediaStreamDestination hangs off the post-limiter bus and its track
+   goes out over Trystero exactly like the old deck streams did, so the
+   listener side keeps working untouched. Synced provider jukebox tracks
+   (YouTube / SoundCloud) already play on every device anyway, so the
+   room hears everything. Local mute stays personal: the relay taps the
+   bus pre-master. */
 
-async function djMicSource() {
-  const gum = navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
-  if (!gum) throw new Error('no mic');
-  const s = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-  });
-  const track = s.getAudioTracks ? s.getAudioTracks()[0] : null;
-  if (!track) {
-    try { (s.getTracks ? s.getTracks() : []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {}
-    throw new Error('no mic track');
-  }
-  return {
-    stream: s,
-    track,
-    kind: 'mic',
-    label: 'mic/line-in',
-    cleanup: () => { try { (s.getTracks ? s.getTracks() : []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {} },
-  };
-}
-
-function djFileSource(file) {
-  return new Promise((resolve, reject) => {
-    let url = null;
-    let el = null;
-    try {
-      url = URL.createObjectURL(file);
-      el = new Audio();
-      el.loop = true;
-      el.preload = 'auto'; // keep it playing if the phone's tab slips to background
-      el.src = url;
-    } catch (e) { reject(e); return; }
-    const done = (err) => {
-      if (err) {
-        try { el.pause(); } catch (e) {}
-        if (url) try { URL.revokeObjectURL(url); } catch (e) {}
-        reject(err);
-        return;
-      }
-      let stream = null;
-      try { stream = el.captureStream ? el.captureStream() : null; } catch (e) { stream = null; }
-      const track = stream && stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
-      if (!track) {
-        try { el.pause(); } catch (e) {}
-        try { URL.revokeObjectURL(url); } catch (e) {}
-        reject(new Error('no audio track'));
-        return;
-      }
-      const rawName = (file && file.name) || 'track';
-      // Phone filenames can be long — keep the HUD line short.
-      const name = rawName.length > 24 ? rawName.slice(0, 21) + '…' : rawName;
-      resolve({
-        stream,
-        track,
-        kind: 'file',
-        label: 'audio file: ' + name,
-        cleanup: () => {
-          try { el.pause(); } catch (e) {}
-          try { track.stop(); } catch (e) {}
-          try { URL.revokeObjectURL(url); } catch (e) {}
-        },
-      });
-    };
-    try {
-      const p = el.play();
-      if (p && typeof p.then === 'function') p.then(() => done(null), (e) => done(e));
-      else done(null);
-    } catch (e) { done(e); }
-  });
-}
-
-/* Brave detection — navigator.brave.isBrave() is a promise and may not
-   exist at all; the UA string is the backup. Never throws, times out. */
-function braveLikely() {
-  return new Promise((resolve) => {
-    let done = false;
-    const fin = (v) => { if (!done) { done = true; resolve(!!v); } };
-    setTimeout(() => fin(false), 1500);
-    try {
-      const b = navigator.brave;
-      if (b && typeof b.isBrave === 'function') {
-        b.isBrave().then((v) => fin(v), () => fin(false));
-        return;
-      }
-    } catch (e) {}
-    try { fin(/Brave/i.test(navigator.userAgent || '')); } catch (e) { fin(false); }
-  });
-}
-
-const djChooserEl = document.getElementById('dj-chooser');
-const djSrcHintEl = document.getElementById('dj-src-hint');
-const djSrcNoteEl = document.getElementById('dj-src-note');
-let djChooserResolve = null;
-let djChooserReject = null;
-
-function djChooserOpen() {
-  return !!(djChooserEl && djChooserEl.style.display !== 'none');
-}
-
-function setChooserNote(t) {
-  if (djSrcNoteEl) djSrcNoteEl.textContent = t || '';
-}
-
-function closeDjChooser(val) {
-  const r = djChooserResolve;
-  djChooserResolve = null; djChooserReject = null;
-  if (djChooserEl) djChooserEl.style.display = 'none';
-  if (r) r(val);
-}
-
-function failDjChooser(err) {
-  const rj = djChooserReject;
-  djChooserResolve = null; djChooserReject = null;
-  if (djChooserEl) djChooserEl.style.display = 'none';
-  if (rj) rj(err);
-}
-
-/* The chooser: shown when tab share yields no audio or errors (other than
-   the user dismissing the picker) — and shown FIRST on phones, where tab
-   share is impossible, with only the phone-capable options (build 15).
-   Cancellable — "never mind" resolves null and the decks stay open. */
-function djChooserFlow({ allowTab = true, mobile = false } = {}) {
-  return new Promise((resolve, reject) => {
-    if (djChooserResolve) { resolve(null); return; } // one chooser at a time
-    const tabBtn = document.getElementById('dj-src-tab');
-    if (tabBtn) tabBtn.style.display = allowTab ? '' : 'none';
-    const titleEl = document.getElementById('dj-chooser-title');
-    const subEl = document.getElementById('dj-chooser-sub');
-    if (mobile) {
-      // Phones never attempted tab share — don't frame it as a failure.
-      if (titleEl) titleEl.textContent = 'TAKE THE DECKS';
-      if (subEl) subEl.textContent = 'pick how to feed the decks';
-      setChooserNote('tab share needs a desktop browser');
-    } else {
-      if (titleEl) titleEl.textContent = 'NO TAB AUDIO CAME THROUGH';
-      if (subEl) subEl.textContent = 'pick another way to feed the decks';
-      setChooserNote('');
-    }
-    if (djSrcHintEl) { djSrcHintEl.style.display = 'none'; djSrcHintEl.textContent = ''; }
-    if (djChooserEl) djChooserEl.style.display = '';
-    djChooserResolve = resolve;
-    djChooserReject = reject;
-    // Brave nudge fills in async once detection lands.
-    braveLikely().then((b) => {
-      if (b && djChooserOpen() && djSrcHintEl) {
-        djSrcHintEl.textContent = 'Brave sometimes blocks tab audio \u2014 try Shields down for this site, or use a file.';
-        djSrcHintEl.style.display = '';
-      }
-    });
-  });
-}
-
-function wireDjChooser() {
-  const tabBtn = document.getElementById('dj-src-tab');
-  const micBtn = document.getElementById('dj-src-mic');
-  const fileBtn = document.getElementById('dj-src-file');
-  const cancelBtn = document.getElementById('dj-src-cancel');
-  const fileInput = document.getElementById('dj-file-input');
-  if (tabBtn) tabBtn.addEventListener('click', async () => {
-    setChooserNote('pick a tab with sound playing\u2026');
-    try {
-      const src = await tryTabShare();
-      if (src) closeDjChooser(src);
-      else setChooserNote('still no audio \u2014 try another option');
-    } catch (e) {
-      if (isUserDismissal(e)) failDjChooser({ dismissed: true });
-      else setChooserNote('tab share failed \u2014 try another option');
-    }
-  });
-  if (micBtn) micBtn.addEventListener('click', async () => {
-    setChooserNote('requesting mic\u2026');
-    try {
-      closeDjChooser(await djMicSource());
-    } catch (e) {
-      setChooserNote(isUserDismissal(e)
-        ? 'mic was blocked \u2014 try another option'
-        : 'mic failed \u2014 try another option');
-    }
-    micBtn.blur();
-  });
-  if (fileBtn) fileBtn.addEventListener('click', () => {
-    if (fileInput) fileInput.click();
-    fileBtn.blur();
-  });
-  if (fileInput) fileInput.addEventListener('change', async () => {
-    const f = fileInput.files && fileInput.files[0];
-    fileInput.value = '';
-    if (!f) return; // user cancelled the file picker — stay in the chooser
-    setChooserNote('loading file\u2026');
-    try {
-      closeDjChooser(await djFileSource(f));
-    } catch (e) {
-      setChooserNote('couldn\u2019t use that file \u2014 try another');
-    }
-  });
-  if (cancelBtn) cancelBtn.addEventListener('click', () => {
-    closeDjChooser(null);
-    cancelBtn.blur();
-  });
-}
-
-/* One entry point for taking the decks. Fast path: tab share just works
-   and no chooser ever appears. Throws {dismissed:true} only when the user
-   cancels the system share picker (quiet — the decks stay open). */
-async function acquireDjSource({ allowTab = true, mobile = false } = {}) {
-  if (allowTab) {
-    try {
-      const src = await tryTabShare();
-      if (src) return src;
-    } catch (e) {
-      if (isUserDismissal(e)) throw { dismissed: true };
-      // any other error → fall through to the chooser
-    }
-  }
-  return djChooserFlow({ allowTab, mobile });
-}
-
-async function takeDecks() {
+async function goLive() {
   if (dj.active) return true;
   if (!active || active.key !== SOUND_ROOM_KEY) return false;
-  const coarse = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
-  const gdm = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
-  // Phones can't tab-share, but mic and audio files work fine — go straight
-  // to the chooser with only the phone-capable options. (build 15)
-  let src = null;
   try {
-    src = await acquireDjSource({ allowTab: coarse ? false : gdm, mobile: coarse });
+    if (!audioEnsureRunning()) return false;
+    const ch = jamEnsureChain(); // the mix bus we relay
+    if (!ch || !ch.comp) return false;
+    const dest = audio.ctx.createMediaStreamDestination();
+    ch.comp.connect(dest); // post-limiter, pre-master
+    const stream = dest.stream;
+    const track = stream.getAudioTracks()[0] || null;
+    dj.dest = dest;
+    dj.stream = stream;
+    dj.track = track;
+    dj.source = 'live';
+    dj.sourceLabel = 'live mix';
+    dj.active = true;
+    const a = makeAnalyserFor(stream);
+    if (a) { dj.node = a.node; dj.analyser = a.analyser; dj.analyserData = a.data; }
+    if (net.enabled) {
+      if (track) net.djStart(track, stream);
+      net.setDjSource('live mix');
+      net.setDj(SOUND_ROOM_KEY); // friends see "is live" in the lobby heartbeat
+    }
+    jamOnBecomeDj(); // start the shared beat clock (broadcasts only when net is up)
+    addSystemLine('you\u2019re live \u2014 the room hears your mix');
+    renderDjHud();
+    renderFriendsSection();
+    return true;
   } catch (e) {
-    // User cancelled the system share picker — decks stay open, quiet.
-    if (e && e.dismissed) addSystemLine('the decks stay open \u2014 screen share was dismissed');
+    addSystemLine('couldn\u2019t go live \u2014 ' + (e && e.message ? e.message : 'audio unavailable'));
     return false;
   }
-  if (!src) return false; // "never mind" from the chooser
-  const { stream, track, kind, label, cleanup } = src;
-  dj.stream = stream;
-  dj.track = track;
-  dj.source = kind;
-  dj.sourceLabel = label;
-  dj.sourceCleanup = cleanup;
-  dj.active = true;
-  const a = makeAnalyserFor(stream);
-  if (a) { dj.node = a.node; dj.analyser = a.analyser; dj.analyserData = a.data; }
-  if (track) track.onended = () => stopDecks(); // user stopped sharing from the browser UI
-  if (net.enabled) {
-    // Claim label stays short; the full filename is local-only.
-    net.setDjSource(kind === 'file' ? 'audio file' : label);
-    net.djStart(track, stream);
-    net.setDj(SOUND_ROOM_KEY); // friends see "on the decks" in the lobby heartbeat
-  }
-  jamOnBecomeDj(); // start the shared beat clock (broadcasts only when net is up)
-  addSystemLine(`you\u2019re on the decks \u2014 ${label}`);
-  renderDjHud();
-  renderFriendsSection();
-  return true;
 }
 
-function stopDecks(yielded = false, byName = '') {
+function stopLive(yielded = false, byName = '') {
   if (!dj.active) return;
   dj.active = false;
-  jamStopClock(); // the grid dies with the DJ — a new DJ starts a fresh one
-  jamStopRecorder(); // the sampler's ring buffer dies with the stream
+  jamStopClock(); // the grid dies with the set — a new live set starts a fresh one
+  jamStopRecorder(); // the sampler's ring buffer dies with the relay
   detachDjAnalyser();
-  // Whatever acquired the source (share, mic, file) tears it down.
-  try { if (dj.sourceCleanup) dj.sourceCleanup(); } catch (e) {}
-  dj.sourceCleanup = null;
+  // Unhook the relay tap; the jam bus itself keeps playing locally.
+  try {
+    const ch = jamEnsureChain();
+    if (ch && ch.comp && dj.dest) { try { ch.comp.disconnect(dj.dest); } catch (e2) {} }
+  } catch (e) {}
+  try { if (dj.track) dj.track.stop(); } catch (e) {}
+  dj.dest = null;
   dj.source = null;
   dj.sourceLabel = '';
   dj.track = null;
@@ -1226,10 +988,10 @@ function stopDecks(yielded = false, byName = '') {
   net.djStop(); // release the claim + pull the track
   net.setDj(null);
   if (yielded && byName) {
-    showUnlockToast([`${byName} took the decks`]);
-    addSystemLine(`${byName} took the decks`);
+    showUnlockToast([`${byName} went live`]);
+    addSystemLine(`${byName} went live`);
   } else if (!yielded) {
-    addSystemLine('you stepped away from the decks');
+    addSystemLine('you went quiet');
   }
   renderDjHud();
   renderFriendsSection();
@@ -1288,6 +1050,11 @@ const jamMetroVolEl = document.getElementById('jam-metro-vol');
 const jamBassKeysEl = document.getElementById('jam-bass-keys');
 const jamDrumsEl = document.getElementById('jam-drums');
 const jamChordsEl = document.getElementById('jam-chords');
+const jamMicBtnEl = document.getElementById('jam-mic-btn');
+const jamMicMuteEl = document.getElementById('jam-mic-mute');
+const jamMicMeterEl = document.getElementById('jam-mic-meter');
+const jamMicMeterFillEl = document.getElementById('jam-mic-meter-fill');
+const jamMicNoteEl = document.getElementById('jam-mic-note');
 
 /* Build 20 instruments. Every player picks one; the pick rides every
    jamNote (inst) so each client renders the SENDER's voice, and each
@@ -1489,6 +1256,143 @@ function jamDestFor(inst) {
   const ch = jamEnsureChain();
   if (ch && ch.gains[inst]) return ch.gains[inst];
   return audio.master;
+}
+
+/* ---------------- mic in (build 27) ----------------
+   Your voice joins the jam like any instrument: mic -> gain -> jam bus
+   (reverb, delay, limiter) -> speakers, and out to the room when you're
+   live. echoCancellation + noiseSuppression are on; the headphone note in
+   the panel says the rest. The mic NEVER touches the "sample the room"
+   tab-capture path — that API only sees the tab's rendered output, so no
+   software feedback loop exists. Denial is an honest toast, never a crash. */
+const jamMic = {
+  on: false,
+  muted: false,
+  stream: null,
+  src: null,
+  gain: null,
+  analyser: null,
+  analyserData: null,
+  meterRaf: 0,
+};
+
+async function jamMicToggle() {
+  if (jamMic.on) { jamMicOff(); return; }
+  const gum = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+    ? (c) => navigator.mediaDevices.getUserMedia(c) // bound: the method needs its receiver
+    : null;
+  if (!gum) {
+    showUnlockToast(['this browser has no mic input']);
+    return;
+  }
+  try {
+    if (!audioEnsureRunning()) { showUnlockToast(['audio isn\u2019t running']); return; }
+    const stream = await gum({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const track = stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+    if (!track) {
+      try { (stream.getTracks() || []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {}
+      throw new Error('no mic track');
+    }
+    const ch = jamEnsureChain();
+    if (!ch || !ch.bus) { try { track.stop(); } catch (e) {} throw new Error('no jam bus'); }
+    const ctx = audio.ctx;
+    const srcNode = ctx.createMediaStreamSource(stream);
+    const gain = ctx.createGain();
+    gain.gain.value = 1.0;
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    srcNode.connect(gain);
+    gain.connect(analyser);
+    analyser.connect(ch.bus); // into the mix like any instrument
+    jamMic.stream = stream;
+    jamMic.src = srcNode;
+    jamMic.gain = gain;
+    jamMic.analyser = analyser;
+    jamMic.analyserData = new Uint8Array(analyser.frequencyBinCount);
+    jamMic.on = true;
+    jamMic.muted = false;
+    track.onended = () => jamMicOff(); // OS / browser revoked the mic
+    renderJamMic();
+    jamMicMeterLoop();
+    addSystemLine('mic is live in the jam \u2014 headphones on');
+  } catch (e) {
+    jamMicDeny(e);
+  }
+}
+
+function jamMicDeny(e) {
+  const n = (e && e.name) || '';
+  if (n === 'NotAllowedError' || n === 'SecurityError') {
+    showUnlockToast(['mic was blocked \u2014 allow it in the browser bar, then tap again']);
+    addSystemLine('mic blocked \u2014 check the browser permission');
+  } else if (n === 'NotFoundError' || (e && e.message === 'no mic track')) {
+    showUnlockToast(['no mic found on this device']);
+  } else if (n === 'AbortError') {
+    // user dismissed the picker — quiet
+  } else {
+    showUnlockToast(['couldn\u2019t open the mic']);
+  }
+  renderJamMic();
+}
+
+function jamMicOff() {
+  if (!jamMic.on && !jamMic.stream) return;
+  jamMic.on = false;
+  jamMic.muted = false;
+  if (jamMic.meterRaf) { try { cancelAnimationFrame(jamMic.meterRaf); } catch (e) {} jamMic.meterRaf = 0; }
+  try { if (jamMic.gain) jamMic.gain.disconnect(); } catch (e) {}
+  try { if (jamMic.analyser) jamMic.analyser.disconnect(); } catch (e) {}
+  try { if (jamMic.src) jamMic.src.disconnect(); } catch (e) {}
+  try {
+    if (jamMic.stream) (jamMic.stream.getTracks() || []).forEach((t) => { try { t.stop(); } catch (e2) {} });
+  } catch (e) {}
+  jamMic.stream = jamMic.src = jamMic.gain = jamMic.analyser = jamMic.analyserData = null;
+  if (jamMicMeterFillEl) jamMicMeterFillEl.style.width = '0%';
+  renderJamMic();
+}
+
+function jamMicToggleMute() {
+  if (!jamMic.on || !jamMic.gain || !audio.ctx) return;
+  jamMic.muted = !jamMic.muted;
+  try {
+    jamMic.gain.gain.setTargetAtTime(jamMic.muted ? 0 : 1.0, audio.ctx.currentTime, 0.03);
+  } catch (e) {}
+  renderJamMic();
+}
+
+/* Level meter: average the analyser bins into a 0..1 bar. */
+function jamMicLevel() {
+  if (!jamMic.on || !jamMic.analyser || !jamMic.analyserData) return 0;
+  try {
+    jamMic.analyser.getByteFrequencyData(jamMic.analyserData);
+  } catch (e) { return 0; }
+  let sum = 0;
+  const d = jamMic.analyserData;
+  for (let i = 0; i < d.length; i++) sum += d[i];
+  return Math.min(1, (sum / d.length / 255) * 3);
+}
+
+function jamMicMeterLoop() {
+  if (!jamMic.on) return;
+  if (jamMicMeterFillEl) {
+    jamMicMeterFillEl.style.width = Math.round(jamMicLevel() * 100) + '%';
+  }
+  jamMic.meterRaf = requestAnimationFrame(jamMicMeterLoop);
+}
+
+function renderJamMic() {
+  if (jamMicBtnEl) {
+    jamMicBtnEl.classList.toggle('on', jamMic.on);
+    jamMicBtnEl.innerHTML = jamMic.on ? '&#127908; mic on' : '&#127908; mic';
+  }
+  if (jamMicMuteEl) {
+    jamMicMuteEl.style.display = jamMic.on ? '' : 'none';
+    jamMicMuteEl.textContent = jamMic.muted ? 'unmute' : 'mute';
+  }
+  if (jamMicMeterEl) jamMicMeterEl.style.display = jamMic.on ? '' : 'none';
+  if (jamMicNoteEl) jamMicNoteEl.style.display = jamMic.on ? '' : 'none';
 }
 
 /* Keep the delay musical under tempo changes — dotted eighth, eased. */
@@ -1718,7 +1622,7 @@ function jamStopClock() {
   renderJamTransport();
 }
 
-/* We just took the decks: fresh grid, auto-detect armed for this session. */
+/* We just went live: fresh grid, auto-detect armed for this session. */
 function jamOnBecomeDj() {
   jam.manual = false;
   jam.detector = new OnsetDetector();
@@ -1832,7 +1736,7 @@ function jamEnsureRecorder() {
     proc.connect(sink);
     sink.connect(ctx.destination);
     /* Build 20: the sampler grabs the jam bus post-effects too — the ring
-       now hears decks + jam (reverb, delay, limiter), i.e. what the room
+       now hears the live mix + jam (reverb, delay, limiter), i.e. what the room
        hears. The tap is parallel; the DJ's own path is untouched. */
     const ch = jamEnsureChain();
     if (ch && ch.comp) {
@@ -1842,7 +1746,7 @@ function jamEnsureRecorder() {
         ch.comp.connect(tap);
         tap.connect(proc);
         rec.jamTap = tap;
-      } catch (e) { /* decks-only grab still works */ }
+      } catch (e) { /* live-mix-only grab still works */ }
     }
     jam.rec = rec;
     return rec;
@@ -1854,7 +1758,7 @@ function jamEnsureRecorder() {
 function jamGrabLoop() {
   const rec = jamEnsureRecorder();
   if (!rec) {
-    showUnlockToast(['need the decks live to sample \u{1F3A7}']);
+    showUnlockToast(['need someone live to sample \u{1F3A7}']);
     renderJamSamplerHint();
     return false;
   }
@@ -1903,7 +1807,7 @@ function jamGrabLoop() {
    The jukebox plays through YouTube/SoundCloud IFRAMES, whose audio is
    completely invisible to page JavaScript (no WebAudio node, no
    captureStream — nothing). So "sample the jukebox" means capturing the
-   whole room mix (jukebox + jam + decks) via the only browser-native path:
+   whole room mix (jukebox + jam + mic) via the only browser-native path:
    tab-audio capture with getDisplayMedia. That API exists on desktop
    Chrome/Edge only — mobile browsers offer no tab-audio track at all, so
    on phones the button explains itself honestly instead of failing
@@ -2542,13 +2446,13 @@ function wallSample() {
      jukeRemove   {id, by}
      jukePlay     {id, url, provider, videoId, title, addedBy, startedAt,
                    durationMs, by} | {stopped:true, by}
-     jukeSkipVote {id, voter}
+     jukeSkipVote {id, voter}  — legacy name; instant skip, no voting
      jukeStateReq {reqId} / jukeState {reqId, now, queue}
    Advance duty: whoever queued the finished track broadcasts the next
    jukePlay. Watchdog: if a track has been over >8s with no new jukePlay,
    ANY peer may broadcast the advance — first jukePlay wins, ties broken
    by earliest startedAt (1.5s contention window).
-   While a DJ is live on the decks the jukebox auto-pauses; when the DJ
+   While someone is live the jukebox auto-pauses; when they stop,
    leaves, someone resumes the queue with a fresh startedAt (jittered,
    first broadcast wins). */
 
@@ -2559,7 +2463,6 @@ const juke = {
   nowStartedAt: 0,    // adopted startedAt (tie-breaks)
   adoptedAt: 0,       // Date.now() when we adopted the current play
   lastPlaySeenAt: 0,  // newest startedAt we've seen (watchdog + resume guards)
-  skips: {},          // trackId -> Set of voter names
   answeredReq: new Set(),
   player: null,       // {kind, play, pause, seekTo(sec), pos()->sec|null, dur()->sec|null, setVolume(0-100), destroy}
   volume: 0.7,
@@ -2575,11 +2478,13 @@ const juke = {
   warmSc: null,       // {widget, ready, queue, armed, playingId} persistent invisible SC widget
   watchT: null,       // build 25: hardened playback watchdog timer
   playerErrored: false, // a provider error event fired for the current track
+  phoneFiles: {},   // build 27: fileId -> {buf: Uint8Array, name, size, type} (uploader or fetched)
+  phoneFetch: {},   // build 27: fileId -> chunk-reassembly state
+  phoneHave: {},    // build 27: fileId -> Set of names holding the bytes
   direct: null,       // build 25: direct-audio playback state
   playerFactory: null, // test seam: {youtube(d, offset, hooks), soundcloud(d, offset, hooks), direct(d, offset, hooks)}
   extTimer: null, extCount: 0,
 };
-const JUKE_SKIP_VOTES = 2;      // votes needed to skip
 const JUKE_RESYNC_MS = 20000;  // resync nudge cadence
 const JUKE_DRIFT_S = 2.5;      // seek if further off than this
 const JUKE_WATCHDOG_MS = 8000; // track over this long with no advance -> anyone may advance
@@ -2812,12 +2717,16 @@ function jukeResolveYTPlaylist(playlistId) {
   });
 }
 
-const JUKE_PROVIDERS = ['youtube', 'youtube-playlist', 'soundcloud', 'soundcloud-set', 'soundcloud-short', 'direct-audio', 'external'];
+const JUKE_PROVIDERS = ['youtube', 'youtube-playlist', 'soundcloud', 'soundcloud-set', 'soundcloud-short', 'direct-audio', 'external', 'phone-file'];
 function jukeValidAdd(d) {
   if (!d || typeof d !== 'object') return false;
   if (typeof d.id !== 'string' || !d.id || d.id.length > 40) return false;
-  if (typeof d.url !== 'string' || !d.url || d.url.length > 500) return false;
   if (!JUKE_PROVIDERS.includes(d.provider)) return false;
+  if (d.provider === 'phone-file') {
+    // P2P track: no URL — the bytes travel over the data channel.
+    if (typeof d.fileId !== 'string' || !d.fileId || d.fileId.length > 40) return false;
+    if (typeof d.fileName !== 'string' || !d.fileName || d.fileName.length > 120) return false;
+  } else if (typeof d.url !== 'string' || !d.url || d.url.length > 500) return false;
   if (typeof d.title !== 'string' || !d.title || d.title.length > 140) return false;
   if (typeof d.addedBy !== 'string' || !d.addedBy || d.addedBy.length > 16) return false;
   if (typeof d.addedAt !== 'number') return false;
@@ -2828,8 +2737,10 @@ function jukeValidPlay(d) {
   if (!d || typeof d !== 'object') return false;
   if (d.stopped) return typeof d.by === 'string';
   if (typeof d.id !== 'string' || !d.id) return false;
-  if (typeof d.url !== 'string' || !d.url) return false;
   if (!JUKE_PROVIDERS.includes(d.provider)) return false;
+  if (d.provider === 'phone-file') {
+    if (typeof d.fileId !== 'string' || !d.fileId) return false;
+  } else if (typeof d.url !== 'string' || !d.url) return false;
   if (typeof d.title !== 'string') return false;
   if (typeof d.startedAt !== 'number' || typeof d.by !== 'string') return false;
   if (typeof d.addedBy !== 'string') return false;
@@ -3011,35 +2922,242 @@ function handleJukeRemove(d, peerId) {
   } else renderJuke();
 }
 
-/* ---------- skip votes ---------- */
-
-function jukeVoteSkip() {
+/* ---------- instant skip (build 27) ----------
+   Anyone can skip: one tap advances the track immediately, no votes.
+   The wire action is still called 'jukeSkipVote' (net.js) — the name is
+   legacy, the semantics are now "skip now". Both the tapper and every
+   receiver call jukeAdvance(); competing jukePlay broadcasts resolve via
+   the existing earliest-startedAt contention rule. */
+function jukeSkipNow() {
   if (!juke.now || juke.now.stopped) return;
   const id = juke.now.id;
-  if (!juke.skips[id]) juke.skips[id] = new Set();
-  if (juke.skips[id].has(myName)) return; // already voted
   if (net.enabled && net.sendJukeSkipVote) {
     try { net.sendJukeSkipVote({ id, voter: myName }); } catch (e) {}
   }
-  handleJukeSkipVote({ id, voter: myName }, 'self');
+  handleJukeSkip({ id, voter: myName }, 'self');
 }
 
-function handleJukeSkipVote(d, peerId) {
-  if (!d || typeof d.id !== 'string' || typeof d.voter !== 'string' || !d.voter) return;
-  if (!juke.now || juke.now.id !== d.id) return; // stale vote
-  if (!juke.skips[d.id]) juke.skips[d.id] = new Set();
-  juke.skips[d.id].add(d.voter);
-  renderJuke();
-  if (juke.skips[d.id].size >= JUKE_SKIP_VOTES) {
-    delete juke.skips[d.id];
-    jukeAdvance();
+function handleJukeSkip(d, peerId) {
+  if (!d || typeof d.id !== 'string') return;
+  if (!juke.now || juke.now.id !== d.id) return; // stale skip — already moved on
+  jukeAdvance();
+}
+
+/* ---------- phone files (build 27) ----------
+   "Play from my phone": the picked audio file travels to the room over
+   Trystero's data channel — no upload site, no link that can expire, no
+   CORS games. Queue items carry metadata only (provider 'phone-file');
+   the bytes fan out peer-to-peer in 48KB base64 chunks, each client
+   assembles a local blob and plays it through the normal direct-audio
+   path (fetch + decodeAudioData on a blob: URL — full jam-bus chain, so
+   phone tracks are grab-able and FX-able like any direct link).
+   Protocol (sound-room scoped):
+     jukeFileReq   {fileId, from}        — receiver -> room (targeted after the first chunk)
+     jukeFileChunk {fileId, i, n, data}  — holder -> receiver, base64 48KB slices
+     jukeFileHave  {fileId, by}          — "I have the whole file, ask me too" */
+const JUKE_PHONE_CHUNK = 48 * 1024; // bytes per chunk (base64 ~64KB, data-channel safe)
+const JUKE_PHONE_BATCH = 8;         // chunks served per request
+const JUKE_PHONE_MAX = 50 * 1024 * 1024; // 50MB cap — the room hears it tonight, not forever
+const JUKE_PHONE_FETCH_MS = 20000;  // no chunks this long -> honest error, move on
+
+function jukeB64encode(u8) {
+  let s = '';
+  for (let i = 0; i < u8.length; i += 8192) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
   }
+  return btoa(s);
+}
+function jukeB64decode(b64) {
+  const s = atob(b64);
+  const u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+  return u8;
+}
+
+/* File picker -> queue. Runs inside the tap gesture; the file is read
+   once, queued as metadata, and the bytes stay on this device until the
+   track plays. */
+async function jukeAddPhoneFile(file) {
+  if (!file) return null;
+  const size = file.size || 0;
+  if (size > JUKE_PHONE_MAX) {
+    jukeHint('that file is over 50MB \u2014 trim it down and try again');
+    return null;
+  }
+  if (size <= 0) { jukeHint('that file looks empty'); return null; }
+  const name = file.name || 'phone track';
+  const type = file.type || '';
+  const audioish = /audio\//i.test(type) ||
+    /\.(mp3|m4a|aac|ogg|oga|wav|wave|flac|opus|weba)$/i.test(name);
+  if (!audioish) { jukeHint('that doesn\u2019t look like an audio file'); return null; }
+  let ab = null;
+  try { ab = await file.arrayBuffer(); }
+  catch (e) { jukeHint('couldn\u2019t read that file'); return null; }
+  const fileId = jukeMakeId();
+  juke.phoneFiles[fileId] = { buf: new Uint8Array(ab), name, size, type };
+  const stem = name.replace(/\.[a-z0-9]+$/i, '').slice(0, 100) || 'phone track';
+  const item = {
+    id: jukeMakeId(), provider: 'phone-file', fileId,
+    fileName: name.slice(0, 120), title: stem,
+    addedBy: myName, addedAt: Date.now(),
+  };
+  juke.queue.push(item);
+  if (net.enabled && net.sendJukeAdd) { try { net.sendJukeAdd(item); } catch (e) {} }
+  jukeHint(`\u{1F4F1} "${stem}" queued \u2014 the room pulls it from your phone when it plays`);
+  renderJuke();
+  if (!juke.now && !juke.pausedForDj && !djWinner()) jukeAdvance(); // empty room: starts now
+  return item;
+}
+
+/* Play entry for phone files. The uploader (or anyone who already has
+   the bytes) plays immediately; everyone else pulls chunks first and
+   the assemble step starts them at the wall-clock offset. */
+function jukePlayPhoneFile(d, offset) {
+  const local = juke.phoneFiles[d.fileId];
+  if (local && local.buf) {
+    let st = juke.phoneFetch[d.fileId];
+    let url = st && st.blobUrl;
+    if (!url) {
+      url = URL.createObjectURL(new Blob([local.buf], { type: local.type || 'audio/mpeg' }));
+      st = { blobUrl: url, done: true, buf: local.buf, chunks: [], n: 0, got: 0 };
+      juke.phoneFetch[d.fileId] = st;
+    }
+    // Late joiners can pull from us too.
+    if (net.enabled && net.sendJukeFileHave) { try { net.sendJukeFileHave({ fileId: d.fileId, by: myName }); } catch (e) {} }
+    jukePlayDirect({ ...d, url }, offset);
+    return;
+  }
+  // Receiving: show progress until the bytes land.
+  jukePhoneProgress(d, 0);
+  jukeRequestPhoneFile(d);
+}
+
+/* Do we hold this phone file's audio bytes locally? */
+function jukeHasPhoneBytes(d) {
+  if (!d || !d.fileId) return false;
+  const rec = juke.phoneFiles[d.fileId];
+  return !!(rec && rec.buf);
+}
+
+/* When the now-playing track is someone else's phone file and the bytes
+   haven't landed, the title slot shows the honest fetch state instead of
+   the track title — so a later re-render can never clobber the progress. */
+function jukePhonePendingText() {
+  const d = juke.now;
+  if (!d || d.provider !== 'phone-file' || jukeHasPhoneBytes(d)) return null;
+  const st = juke.phoneFetch[d.fileId];
+  const pct = st && st.n ? Math.round((st.got / st.n) * 100) : 0;
+  return `fetching from ${(d.addedBy || d.by || 'a drifter')}'s phone… ${pct}%`;
+}
+
+/* Progress readout for an in-flight phone-file fetch: the now-playing
+   title slot doubles as the progress bar. */
+function jukePhoneProgress(d, pct) {
+  if (!juke.now || juke.now.id !== (d && d.id)) return;
+  renderJuke(); // the title slot shows jukePhonePendingText() while fetching
+}
+
+function jukeRequestPhoneFile(d) {
+  const fileId = d.fileId;
+  let st = juke.phoneFetch[fileId];
+  if (!st) {
+    st = { chunks: [], n: 0, got: 0, server: null, done: false, timer: null, d };
+    juke.phoneFetch[fileId] = st;
+  } else if (st.done) return;
+  st.d = d;
+  clearTimeout(st.timer);
+  st.timer = setTimeout(() => jukePhoneFetchTimeout(fileId), JUKE_PHONE_FETCH_MS);
+  const target = st.server || undefined; // pin to the first responder
+  if (net.enabled && net.sendJukeFileReq) {
+    try { net.sendJukeFileReq({ fileId, from: st.got }, target); } catch (e) {}
+  }
+}
+
+function handleJukeFileReq(d, peerId) {
+  if (!d || typeof d.fileId !== 'string' || typeof d.from !== 'number' || d.from < 0) return;
+  const f = juke.phoneFiles[d.fileId];
+  if (!f || !f.buf || !f.buf.length) return;
+  const n = Math.ceil(f.buf.length / JUKE_PHONE_CHUNK);
+  const end = Math.min(n, Math.floor(d.from) + JUKE_PHONE_BATCH);
+  for (let i = Math.floor(d.from); i < end; i++) {
+    const slice = f.buf.subarray(i * JUKE_PHONE_CHUNK, Math.min(f.buf.length, (i + 1) * JUKE_PHONE_CHUNK));
+    try {
+      if (net.enabled && net.sendJukeFileChunk) {
+        net.sendJukeFileChunk({ fileId: d.fileId, i, n, data: jukeB64encode(slice) }, peerId);
+      }
+    } catch (e) { return; }
+  }
+}
+
+function handleJukeFileChunk(d, peerId) {
+  if (!d || typeof d.fileId !== 'string' || typeof d.i !== 'number' ||
+      typeof d.n !== 'number' || typeof d.data !== 'string') return;
+  const st = juke.phoneFetch[d.fileId];
+  if (!st || st.done) return;
+  if (st.n && st.n !== d.n) return; // mismatched sender
+  st.n = d.n;
+  if (!st.server) st.server = peerId; // pin to the first responder
+  if (peerId !== st.server) return; // ignore duplicate servers
+  if (st.chunks[d.i]) return; // duplicate chunk
+  let u8 = null;
+  try { u8 = jukeB64decode(d.data); } catch (e) { return; }
+  st.chunks[d.i] = u8;
+  st.got++;
+  clearTimeout(st.timer); // bytes are flowing — keep waiting
+  st.timer = setTimeout(() => jukePhoneFetchTimeout(d.fileId), JUKE_PHONE_FETCH_MS);
+  jukePhoneProgress(st.d, Math.round(st.got / st.n * 100));
+  if (st.got < st.n) {
+    // Next batch, targeted at our server.
+    if (net.enabled && net.sendJukeFileReq) {
+      try { net.sendJukeFileReq({ fileId: d.fileId, from: st.got }, st.server); } catch (e) {}
+    }
+    return;
+  }
+  jukePhoneAssemble(d.fileId);
+}
+
+function jukePhoneAssemble(fileId) {
+  const st = juke.phoneFetch[fileId];
+  if (!st || st.done) return;
+  clearTimeout(st.timer);
+  let len = 0;
+  for (const c of st.chunks) { if (c) len += c.length; }
+  const buf = new Uint8Array(len);
+  let off = 0;
+  for (const c of st.chunks) { if (c) { buf.set(c, off); off += c.length; } }
+  const name = (st.d && st.d.fileName) || 'phone track';
+  juke.phoneFiles[fileId] = { buf, name, size: len, type: 'audio/mpeg' };
+  const url = URL.createObjectURL(new Blob([buf], { type: 'audio/mpeg' }));
+  st.blobUrl = url; st.done = true; st.buf = buf;
+  if (net.enabled && net.sendJukeFileHave) { try { net.sendJukeFileHave({ fileId, by: myName }); } catch (e) {} }
+  // Still the now-playing track: start it at the wall-clock offset, like a late joiner.
+  if (juke.now && juke.now.fileId === fileId && juke.now.provider === 'phone-file') {
+    jukePlayDirect({ ...juke.now, url }, jukeOffsetFor(juke.now));
+  } else renderJuke();
+}
+
+function jukePhoneFetchTimeout(fileId) {
+  const st = juke.phoneFetch[fileId];
+  if (!st || st.done) return;
+  st.done = true;
+  if (juke.now && juke.now.fileId === fileId && juke.now.provider === 'phone-file') {
+    // Nobody served the bytes — the uploader probably left.
+    const who = (st.d && st.d.addedBy) || 'the uploader';
+    jukeHint(`that phone track is gone \u2014 ${who} may have left the room`);
+    jukeOnTrackError(); // honest error path: the room moves on
+  }
+}
+
+function handleJukeFileHave(d, peerId) {
+  if (!d || typeof d.fileId !== 'string') return;
+  if (!juke.phoneHave[d.fileId]) juke.phoneHave[d.fileId] = new Set();
+  juke.phoneHave[d.fileId].add(d.by || peerId);
 }
 
 /* ---------- playback ---------- */
 
 /* Pop the next track FIFO and broadcast it. Whoever calls this becomes
-   the broadcaster (queuer of the finished track, skip voter, watchdog,
+   the broadcaster (queuer of the finished track, skipper, watchdog,
    DJ-leave resumer). */
 function jukeAdvance() {
   if (juke.pausedForDj) return null;
@@ -3062,6 +3180,10 @@ function jukeAdvance() {
     addedBy: next.addedBy, startedAt: Date.now(),
     durationMs: 0, by: myName,
   };
+  if (next.provider === 'phone-file') {
+    play.fileId = next.fileId;
+    play.fileName = next.fileName;
+  }
   // Playlist grouping survives the queue -> now-playing hop (and the broadcast).
   if (next.group) {
     play.group = next.group;
@@ -3097,7 +3219,6 @@ function jukeAdoptPlay(d) {
   juke.adoptedAt = Date.now();
   juke.lastPlaySeenAt = Math.max(juke.lastPlaySeenAt, d.startedAt);
   juke.overSince = 0;
-  juke.skips[d.id] = new Set();
   // The broadcaster popped it locally; receivers drop it from their queue.
   const i = juke.queue.findIndex((t) => t.id === d.id);
   if (i !== -1) juke.queue.splice(i, 1);
@@ -3118,6 +3239,7 @@ function jukeStartPlayback(d) {
   if (d.provider === 'youtube') jukePlayYT(d, offset);
   else if (d.provider === 'soundcloud') jukePlaySC(d, offset);
   else if (d.provider === 'direct-audio') jukePlayDirect(d, offset);
+  else if (d.provider === 'phone-file') jukePlayPhoneFile(d, offset);
   else jukePlayExternal(d);
   jukeArmEndWatcher();
   jukeArmResync();
@@ -4059,7 +4181,6 @@ function jukeLeaveRoom() {
   jukeStopPlayback();
   juke.now = null;
   juke.queue = [];
-  juke.skips = {};
   juke.pausedForDj = false;
   clearTimeout(juke.djResumeTimer);
   if (juke.open) setJukePanel(false);
@@ -4092,6 +4213,7 @@ function jukeProviderIcon(p) {
     : p === 'soundcloud' ? '☁ sc'
     : p === 'soundcloud-set' || p === 'soundcloud-short' ? '☁ set'
     : p === 'direct-audio' ? '⚡ direct'
+    : p === 'phone-file' ? '📱 phone'
     : '↗ ext';
 }
 
@@ -4101,18 +4223,17 @@ function renderJuke() {
   const provEl = document.getElementById('juke-now-provider');
   const byEl = document.getElementById('juke-now-by');
   const skipBtn = document.getElementById('juke-skip');
-  const skipCount = document.getElementById('juke-skip-count');
   const openApp = document.getElementById('juke-open-app');
   const joinBtn = document.getElementById('juke-join');
   const djNote = document.getElementById('juke-dj-note');
   const qEl = document.getElementById('juke-queue');
   if (djNote) djNote.style.display = juke.pausedForDj ? '' : 'none';
   if (juke.now && !juke.now.stopped) {
-    if (titleEl) titleEl.textContent = juke.now.title || 'untitled';
+    if (titleEl) titleEl.textContent = jukePhonePendingText() || juke.now.title || 'untitled';
     if (provEl) provEl.textContent = jukeProviderIcon(juke.now.provider);
-    if (byEl) byEl.textContent = `queued by ${juke.now.addedBy || juke.now.by || 'a drifter'}`;
-    const votes = juke.skips[juke.now.id] ? juke.skips[juke.now.id].size : 0;
-    if (skipCount) skipCount.textContent = votes > 0 ? `${votes}/${JUKE_SKIP_VOTES}` : '';
+    if (byEl) byEl.textContent = juke.now.provider === 'phone-file'
+      ? `\u{1F4F1} from ${(juke.now.addedBy || juke.now.by || 'a drifter')}'s phone`
+      : `queued by ${juke.now.addedBy || juke.now.by || 'a drifter'}`;
     if (skipBtn) skipBtn.disabled = false;
     if (openApp) {
       openApp.disabled = false;
@@ -4122,7 +4243,6 @@ function renderJuke() {
     if (titleEl) titleEl.textContent = juke.pausedForDj ? 'paused for the DJ' : 'nothing playing';
     if (provEl) provEl.textContent = '';
     if (byEl) byEl.textContent = '';
-    if (skipCount) skipCount.textContent = '';
     if (skipBtn) skipBtn.disabled = true;
     if (openApp) { openApp.disabled = true; openApp.onclick = null; }
   }
@@ -4163,7 +4283,9 @@ function renderJuke() {
         nm.textContent = t.title;
         const meta = document.createElement('span');
         meta.className = 'juke-row-meta';
-        meta.textContent = `${jukeProviderIcon(t.provider)} · ${t.addedBy}`;
+        meta.textContent = t.provider === 'phone-file'
+        ? `\u{1F4F1} from ${t.addedBy}'s phone`
+        : `${jukeProviderIcon(t.provider)} · ${t.addedBy}`;
         row.appendChild(nm);
         row.appendChild(meta);
         if (t.addedBy === myName) {
@@ -4209,7 +4331,17 @@ if (jukeAddBtn) {
   });
 }
 const jukeSkipBtn = document.getElementById('juke-skip');
-if (jukeSkipBtn) jukeSkipBtn.addEventListener('click', () => { jukeVoteSkip(); jukeSkipBtn.blur(); });
+if (jukeSkipBtn) jukeSkipBtn.addEventListener('click', () => { jukeSkipNow(); jukeSkipBtn.blur(); });
+  const jukePhoneBtn = document.getElementById('juke-phone-btn');
+  const jukePhoneInput = document.getElementById('juke-phone-input');
+  if (jukePhoneBtn && jukePhoneInput) {
+    jukePhoneBtn.addEventListener('click', () => { jukePhoneInput.click(); jukePhoneBtn.blur(); });
+    jukePhoneInput.addEventListener('change', () => {
+      const f = jukePhoneInput.files && jukePhoneInput.files[0];
+      jukePhoneInput.value = ''; // same file twice in a row still fires
+      if (f) jukeAddPhoneFile(f);
+    });
+  }
 const jukeJoinBtn = document.getElementById('juke-join');
 if (jukeJoinBtn) jukeJoinBtn.addEventListener('click', () => { jukeJoinTap(); jukeJoinBtn.blur(); });
 const jukeVolEl = document.getElementById('juke-vol');
@@ -4533,9 +4665,9 @@ function renderJamSamplerHint() {
   if (!jamHintEl) return;
   const live = !!(dj.stream || (dj.listenAudioEl && dj.listenAudioEl.srcObject));
   jamHintEl.textContent = !live
-    ? 'need the decks live to sample \u{1F3A7}'
+    ? 'need someone live to sample \u{1F3A7}'
     : jam.pads.every((p) => !p)
-      ? 'grab a loop from the decks, then tap a pad on the bar'
+      ? 'grab a loop from the live mix, then tap a pad on the bar'
       : '';
 }
 
@@ -4622,6 +4754,8 @@ if (jamBpmDownEl) jamBpmDownEl.addEventListener('click', () => { jamSetBpm(jam.b
 if (jamBpmUpEl) jamBpmUpEl.addEventListener('click', () => { jamSetBpm(jam.bpm + 1, { manual: true }); jamBpmUpEl.blur(); });
 if (jamGrabEl) jamGrabEl.addEventListener('click', () => { jamGrabLoop(); jamGrabEl.blur(); });
 if (jamGrabRoomEl) jamGrabRoomEl.addEventListener('click', () => { jamRoomSample(); jamGrabRoomEl.blur(); });
+if (jamMicBtnEl) jamMicBtnEl.addEventListener('click', () => { jamMicToggle(); jamMicBtnEl.blur(); });
+if (jamMicMuteEl) jamMicMuteEl.addEventListener('click', () => { jamMicToggleMute(); jamMicMuteEl.blur(); });
 if (jamInstTabsEl) {
   jamInstTabsEl.querySelectorAll('.jam-inst-tab').forEach((b) => {
     b.addEventListener('click', () => { selectJamInstrument(b.dataset.inst); b.blur(); });
@@ -4652,14 +4786,13 @@ if (jamCutoffEl) jamCutoffEl.addEventListener('input', () => { jam.cutoff = Numb
 if (jamResoEl) jamResoEl.addEventListener('input', () => { jam.reso = Number(jamResoEl.value) || 0; });
 
 
-if (decksBtn) {
-  decksBtn.addEventListener('click', () => {
-    if (dj.active) stopDecks();
-    else takeDecks();
-    decksBtn.blur();
+if (liveBtn) {
+  liveBtn.addEventListener('click', () => {
+    if (dj.active) stopLive();
+    else goLive();
+    liveBtn.blur();
   });
 }
-wireDjChooser(); // build 14: source fallback chooser for the decks
 
 // Boot: dress the wisp in the saved look; net reads the equipped look
 // for every ~12Hz broadcast so peers see it too.
@@ -4939,7 +5072,7 @@ function buildSoundRoom(textures) {
         pt.ring.rotation.z -= dt * 0.15;
         pt.pos.copy(pt.group.position);
       }
-      // The room breathes with the music; idle when nobody's on the decks.
+      // The room breathes with the music; idle when nobody's live.
       // Community wall (build 18): ~1s sampler reads the wall's average
       // color + paint energy and tints the room. Blank wall -> default look.
       // (elapsedTime, not accumulated dt: dt is clamped and headless GPUs
@@ -5444,8 +5577,8 @@ function showTitleCard(name) {
 
 function goTo(key) {
   if (transitioning || !worlds[key]) return;
-  // Leaving the sound room: step away from the decks automatically.
-  if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) stopDecks();
+  // Leaving the sound room: stop the live relay + the mic automatically.
+  if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) { stopLive(); jamMicOff(); }
   transitioning = true;
   fadeEl.classList.add('on');
   setTimeout(() => {
@@ -5712,7 +5845,7 @@ net.onPresenceCb = () => { if (settingsOpen) renderFriendsSection(); };
 net.onDjCb = () => {
   const w = djWinner();
   if (dj.active && w && !w.isSelf) {
-    stopDecks(true, w.name); // their claim is earlier: yield gracefully
+    stopLive(true, w.name); // their claim is earlier: yield gracefully
     return;
   }
   if (!dj.active && !w) {
@@ -5731,7 +5864,7 @@ net.onRemoteTrackCb = (track, stream, peerId) => {
   if (w && !w.isSelf && w.peerId !== peerId) return; // not the DJ's track
   attachDjListener(stream); // starts with detachDjListener, so set the peer after
   dj.listenPeerId = peerId;
-  addSystemLine(`${w ? w.name : 'a drifter'} is on the decks \u{1F3A7}`);
+  addSystemLine(`${w ? w.name : 'a drifter'} is live \u{1F534}`);
   renderDjHud();
 };
 
@@ -5750,9 +5883,12 @@ net.onJamTickCb = () => jamBroadcastClock(); // 15s clock re-broadcast while we 
 net.onJukeAddCb = handleJukeAdd;
 net.onJukeRemoveCb = handleJukeRemove;
 net.onJukePlayCb = handleJukePlay;
-net.onJukeSkipVoteCb = handleJukeSkipVote;
+net.onJukeSkipVoteCb = handleJukeSkip; // wire name is legacy; semantics are instant-skip
 net.onJukeStateReqCb = handleJukeStateReq;
 net.onJukeStateCb = handleJukeState;
+net.onJukeFileReqCb = handleJukeFileReq; // build 27: phone-file P2P
+net.onJukeFileChunkCb = handleJukeFileChunk;
+net.onJukeFileHaveCb = handleJukeFileHave;
 
 /* ---------------- settings panel ----------------
    Gear button opens it; D key is a desktop shortcut to the same panel.
@@ -5996,7 +6132,7 @@ function loop() {
   active.update(dt, t);
 
   // Sound room reactivity (build 12): bass energy from the DJ stream —
-  // ours when we're on the decks, the remote one when we're listening.
+  // ours when we're live, the remote one when we're listening.
   {
     let target = 0;
     const an = dj.analyser || dj.listenAnalyser;
@@ -6127,15 +6263,11 @@ window.__limbo = {
     const s = worlds.soundroom && worlds.soundroom.scene;
     return !!(s && s.getObjectByName('gallery-' + key));
   },
-  takeDecks,
-  stopDecks,
-  // DJ source fallback chain (build 14) + mobile decks (build 15)
-  acquireDjSource: (o) => acquireDjSource(o || {}),
-  djChooserOpen,
+  goLive,
+  stopLive,
   djSource: () => ({ kind: dj.source, label: dj.sourceLabel }),
   djClaimPayload: () => net._djClaimPayload(),
   setDjSource: (l) => net.setDjSource(l),
-  braveLikely: () => braveLikely(),
   djState: () => ({
     active: dj.active,
     sourceKind: dj.source,
@@ -6154,6 +6286,11 @@ window.__limbo = {
   renderDjHud,
   remoteTrack: (track, stream, peerId) => net._onRemoteTrack(track, stream, peerId),
   // jam room (build 13)
+  // build 27: mic in
+  jamMicToggle: () => jamMicToggle(),
+  jamMicOff: () => jamMicOff(),
+  jamMicToggleMute: () => jamMicToggleMute(),
+  jamMicState: () => ({ on: jamMic.on, muted: jamMic.muted, hasStream: !!jamMic.stream, level: jamMicLevel() }),
   jamState: () => ({
     open: jam.open,
     bpm: jam.bpm,
@@ -6377,11 +6514,11 @@ window.__limbo = {
   jukeHandleAdd: (d, pid) => handleJukeAdd(d, pid || 'test-peer'),
   jukeHandleRemove: (d, pid) => handleJukeRemove(d, pid || 'test-peer'),
   jukeHandlePlay: (d, pid) => handleJukePlay(d, pid || 'test-peer'),
-  jukeHandleSkip: (d, pid) => handleJukeSkipVote(d, pid || 'test-peer'),
+  jukeHandleSkip: (d, pid) => handleJukeSkip(d, pid || 'test-peer'),
   jukeHandleState: (d, pid) => handleJukeState(d, pid || 'test-peer'),
   jukeHandleStateReq: (d, pid) => handleJukeStateReq(d, pid || 'test-peer'),
   jukeAdvance: () => jukeAdvance(),
-  jukeVoteSkip: () => jukeVoteSkip(),
+  jukeSkipNow: () => jukeSkipNow(),
   jukeOffsetFor: (d, nowMs) => jukeOffsetFor(d, nowMs),
   jukeValidPlay: (d) => jukeValidPlay(d),
   jukeResyncTick: () => jukeResyncTick(),
@@ -6420,7 +6557,24 @@ window.__limbo = {
     sc: !!(juke.warmSc && juke.warmSc.ready),
   }),
   jukeDirectRms: () => jukeDirectRms(),
+  // build 27: phone-file P2P
+  jukeAddPhoneFile: (f) => jukeAddPhoneFile(f),
+  jukePhoneState: (fileId) => ({
+    stored: !!(juke.phoneFiles[fileId] && juke.phoneFiles[fileId].buf),
+    size: juke.phoneFiles[fileId] && juke.phoneFiles[fileId].buf ? juke.phoneFiles[fileId].buf.length : 0,
+    fetch: juke.phoneFetch[fileId] ? {
+      got: juke.phoneFetch[fileId].got, n: juke.phoneFetch[fileId].n,
+      done: !!juke.phoneFetch[fileId].done, server: juke.phoneFetch[fileId].server,
+    } : null,
+  }),
+  jukeHandleFileReq: (d, pid) => handleJukeFileReq(d, pid || 'test-peer'),
+  jukeHandleFileChunk: (d, pid) => handleJukeFileChunk(d, pid || 'test-peer'),
+  jukeHandleFileHave: (d, pid) => handleJukeFileHave(d, pid || 'test-peer'),
+  jukePhoneChunkSize: () => JUKE_PHONE_CHUNK,
+  jukeB64: { encode: (u8) => jukeB64encode(u8), decode: (s) => jukeB64decode(s) },
+  jukePhoneProgressText: () => { const el = document.getElementById('juke-now-title'); return el ? el.textContent : null; },
+  jukeTestPhoneFetch: (d) => jukeRequestPhoneFile(d),
+  djStreamOk: () => !!(dj.stream && dj.stream.getAudioTracks && dj.stream.getAudioTracks().length),
   // phone-first: WebAudio unlock state (must be 'running' after a gesture)
   audioCtxState: () => { try { return audio.ctx ? audio.ctx.state : null; } catch (e) { return null; } },
-  jukeSkipVotes: (id) => (juke.skips[id] ? [...juke.skips[id]] : []),
 };
