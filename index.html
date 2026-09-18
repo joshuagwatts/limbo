@@ -39,25 +39,9 @@
   <div id="mute-label">SOUND ON</div>
 </div>
 
-<!-- take the decks — only visible inside the sound room -->
-<button id="decks-btn" style="display:none">take the decks</button>
-
-<!-- DJ source chooser (build 14): shown when tab share yields no audio,
-     so Brave users can fall back to an audio file or mic/line-in.
-     Build 16: play-from-device is first and first-class (works on phones). -->
-<div id="dj-chooser" style="display:none">
-  <div class="dj-chooser-box">
-    <div class="dj-chooser-title" id="dj-chooser-title">NO TAB AUDIO CAME THROUGH</div>
-    <div class="dj-chooser-sub" id="dj-chooser-sub">pick another way to feed the decks</div>
-    <div id="dj-src-hint" style="display:none"></div>
-    <button id="dj-src-file">🎵 play music from this device</button>
-    <button id="dj-src-mic">🎤 use microphone / line-in</button>
-    <button id="dj-src-tab">try tab share again</button>
-    <button id="dj-src-cancel">never mind</button>
-    <div id="dj-src-note"></div>
-  </div>
-  <input type="file" id="dj-file-input" accept="audio/*" style="display:none">
-</div>
+<!-- go live — relay your local mix (jam + mic + jukebox) to the room.
+     Only visible inside the sound room (build 27: the decks are gone). -->
+<button id="live-btn" style="display:none">🔴 go live</button>
 
 <!-- jam room — only visible inside the sound room -->
 <button id="jam-btn" style="display:none">&#127925; jam</button>
@@ -75,7 +59,7 @@
     <div class="juke-now-sub"><span id="juke-now-provider"></span><span id="juke-now-by"></span></div>
     <div class="juke-progress"><div id="juke-progress-fill"></div></div>
     <div class="juke-now-row">
-      <button id="juke-skip">skip <span id="juke-skip-count"></span></button>
+      <button id="juke-skip">skip</button>
       <button id="juke-open-app">open in my app &#8599;</button>
       <button id="juke-join" style="display:none">tap to join the music</button>
     </div>
@@ -88,6 +72,14 @@
     <input id="juke-add-url" placeholder="paste a youtube / soundcloud / mp3 link…" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="juke-add-btn">queue it</button>
   </div>
+  <!-- build 27: play a song straight from the phone. The file travels to
+       the room over the P2P data channel (no upload site, no link that can
+       die) and everyone hears it in sync like any other jukebox track. -->
+  <div class="juke-add-row">
+    <button id="juke-phone-btn">&#128241; play from my phone</button>
+    <input type="file" id="juke-phone-input" accept="audio/*" style="display:none">
+  </div>
+  <div id="juke-phone-status" class="juke-phone-status" style="display:none"></div>
   <div id="juke-hint" class="juke-hint">everyone hears the same track at the same time — on their own device</div>
 </div>
 <!-- jukebox provider players: persistent + permanently invisible (build 25).
@@ -159,9 +151,19 @@
   <div class="jam-sub">SAMPLER</div>
   <div class="jam-sampler-row">
     <button id="jam-grab">grab loop</button>
-    <button id="jam-grab-room" title="record the room mix (jukebox + jam + decks)">&#127908; sample the room</button>
+    <button id="jam-grab-room" title="record the room mix (jukebox + jam + mic)">&#127908; sample the room</button>
     <div id="jam-pads"></div>
   </div>
+  <!-- build 27: mic in. Your voice joins the jam bus like any instrument —
+       through the reverb, delay and limiter, out to the room when live.
+       Headphones on, or the room hears itself. -->
+  <div class="jam-sub">MIC</div>
+  <div class="jam-mic-row">
+    <button id="jam-mic-btn">&#127908; mic</button>
+    <button id="jam-mic-mute" style="display:none">mute</button>
+    <div id="jam-mic-meter" class="jam-mic-meter" style="display:none" aria-hidden="true"><div id="jam-mic-meter-fill"></div></div>
+  </div>
+  <div id="jam-mic-note" class="jam-mic-note" style="display:none">headphones on — your speakers feed the mic back into the room</div>
   <div id="jam-room-note" class="jam-room-note" hidden></div>
   <div id="jam-hint" class="jam-hint"></div>
   <div class="jam-sub">IN THE ROOM</div>
@@ -222,6 +224,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=26"></script>
+<script type="module" src="js/game.js?v=27"></script>
 </body>
 </html>

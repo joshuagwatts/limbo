@@ -266,7 +266,8 @@ moment, ~1s sync. Good enough for hanging out.
   loading — check your connection". If the browser blocks autoplay, a
   pulsing "tap to join the music" button appears — one tap and you're in.
 - **Queue:** FIFO; anyone can queue, only the queuer can remove their track.
-  Skip takes 2 votes. Late joiners get the full queue + now-playing and land
+  Anyone can skip — one tap advances the track immediately, no votes.
+  Late joiners get the full queue + now-playing and land
   mid-track via offset math. A 20s resync nudge re-seeks anyone who drifted
   >2.5s. The first link pasted into an empty queue starts playing
   immediately, inside your tap.
@@ -291,7 +292,7 @@ moment, ~1s sync. Good enough for hanging out.
 ## Room sampler (build 24) — sample the room mix
 
 The sampler's "🎙 sample the room" button records the whole room mix
-(jukebox + jam + decks) straight into the next pad — same grab length as
+(jukebox + jam + the live mix) straight into the next pad — same grab length as
 "grab loop" (2 bars on the clock, 4s free-time), same pad slot behavior.
 
 The honest part: YouTube/SoundCloud tracks play through iframes, and
@@ -326,8 +327,8 @@ link, sample it straight into a pad.
 Safety: the captured stream is recorded with `MediaRecorder` and **never
 connected to the WebAudio graph at all** — it cannot feed back into your
 speakers. The share is released the instant the take lands.
-- **DJ interaction:** while a DJ is live on the decks the jukebox
-  auto-pauses ("DJ is live — jukebox paused"); when the DJ leaves, someone
+- **DJ interaction:** while someone is live (🔴 go live) the jukebox
+  auto-pauses ("DJ is live — jukebox paused"); when they stop, someone
   resumes the queue with a fresh `startedAt`.
 - **Autoplay:** browsers block unmuted autoplay without a gesture. Queueing
   or skipping (your tap) starts playback directly; on receiving a remote
@@ -374,3 +375,53 @@ snapshot does, so undo history starts fresh after a refresh.
   your wall remembers across your refreshes and updates, and rooms
   converge on the newest mural when drifters meet — but if nobody who saw
   a mural ever comes back, that mural is gone with them.
+
+## Build 27 — the decks are gone (jukebox + jam consolidate)
+
+The DJ decks are removed. Everything they did now lives in the two places
+it always belonged:
+
+- **Play a song from your phone → jukebox.** The jukebox gets a 📱 button:
+  pick an audio file on your phone and it's queued for the room. No file
+  host, no expiring links, no CORS roulette — the file travels **peer to
+  peer over the existing Trystero data channel** (48KB base64 chunks, 8 per
+  request, receiver-pinned to whoever is serving). The queue carries
+  metadata only (`fileId`/`fileName`); anyone holding the bytes advertises
+  them, so late joiners can pull from any holder. The now-playing line and
+  queue rows badge it honestly: "📱 from {name}'s phone".
+- **Why P2P and not a free upload host:** ten keyless hosts were probed
+  with real browser traffic (catbox, tmpfiles, gofile, pixeldrain, uguu,
+  0x0.st, qu.ax, transfer.sh, filebin…). None offers both browser-upload
+  CORS *and* file-fetch CORS — uploads either get blocked at the POST or
+  the returned file can't be fetched/decoded by the page. So the file never
+  leaves the room's devices.
+- **The uploader's answer to "can't a phone song work like the jukebox
+  stream sync?":** yes — better. The uploader plays their file instantly
+  from memory (blob URL → fetch → `decodeAudioData`) on the **full
+  WebAudio chain** — FX sends, limiter, aura ducking — and receivers play
+  the reassembled bytes the same way, landing at the room's wall-clock
+  offset when they arrive late. Phone tracks are first-class citizens, and
+  the sampler's "grab loop" captures them natively.
+- **Honest edges:** 50MB cap per file (memory + chunk sanity), audio types
+  only. Fetch has a 20s no-chunk watchdog — if nobody serves the file the
+  room gets "that track is gone" and moves on, never silence. If the
+  uploader leaves mid-track, whoever still holds the bytes keeps serving.
+- **Microphone → jam.** The jam panel gets a 🎙 mic button: your voice
+  joins the jam like any instrument (mic → jam bus → reverb/delay/limiter),
+  with `echoCancellation` + `noiseSuppression` on, a mute toggle, a live
+  level meter, and a "headphones on" note. Denial is an honest toast, never
+  a crash; the mic stops when you toggle off or leave the sound room. The
+  mic never touches the "sample the room" tab-capture path (that API only
+  sees the tab's rendered output — no software feedback loop exists).
+- **Go live (replaces "take the decks").** The decks button is now 🔴 go
+  live: it hangs a `MediaStreamDestination` off the post-limiter jam bus
+  (pre-master, so your own mute stays personal) and relays **your actual
+  mix** — jam instruments, jukebox track, mic — to the room through the
+  existing DJ relay path. Listeners hear exactly what you hear, minus your
+  mute setting. The room line reads "🔴 {name} is live · N listening · live
+  mix". Only works in the sound room; leaving the room stops the relay
+  automatically. The old tab-share/mic/file deck sources are gone with the
+  decks.
+- **Instant skip:** anyone can skip — one tap advances the track
+  immediately, no votes, no thresholds. A skip arriving for a track the
+  room already moved past is ignored, not a crash.
