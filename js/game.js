@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=23';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=23';
+import { LimboNet } from './net.js?v=24';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=24';
 
 /* ---------------- configuration ---------------- */
 
@@ -1257,6 +1257,8 @@ const jamBpmDownEl = document.getElementById('jam-bpm-down');
 const jamBpmUpEl = document.getElementById('jam-bpm-up');
 const jamKeysEl = document.getElementById('jam-keys');
 const jamGrabEl = document.getElementById('jam-grab');
+const jamGrabRoomEl = document.getElementById('jam-grab-room');
+const jamRoomNoteEl = document.getElementById('jam-room-note');
 const jamPadsEl = document.getElementById('jam-pads');
 const jamHintEl = document.getElementById('jam-hint');
 const jamJammersEl = document.getElementById('jam-jammers');
@@ -1873,6 +1875,207 @@ function jamGrabLoop() {
   jam.padRound = (jam.padRound + 1) % jam.pads.length;
   addSystemLine(`loop grabbed — pad ${slot + 1} is loaded`);
   renderJamPads();
+  renderJamSamplerHint();
+  return true;
+}
+
+/* ---------------- room sampler: capture the jukebox (build 24) ------------
+   The jukebox plays through YouTube/SoundCloud IFRAMES, whose audio is
+   completely invisible to page JavaScript (no WebAudio node, no
+   captureStream — nothing). So "sample the jukebox" means capturing the
+   whole room mix (jukebox + jam + decks) via the only browser-native path:
+   tab-audio capture with getDisplayMedia. That API exists on desktop
+   Chrome/Edge only — mobile browsers offer no tab-audio track at all, so
+   on phones the button explains itself honestly instead of failing
+   silently. The captured stream is recorded with MediaRecorder and NEVER
+   touches the WebAudio graph, so it can never feed back into the
+   speakers. */
+const ROOM_DESKTOP_NOTE =
+  'Room sampling needs Chrome or Edge on desktop — phones can\u2019t capture the embedded player\u2019s audio.';
+jam.room = { sampling: false, requesting: false, lastCapture: null, lenOverride: null };
+
+function jamRoomSupported() {
+  return !!(
+    navigator.mediaDevices &&
+    typeof navigator.mediaDevices.getDisplayMedia === 'function' &&
+    typeof window.MediaRecorder === 'function'
+  );
+}
+
+function jamRoomGrabLenSec() {
+  if (jam.room.lenOverride != null) return jam.room.lenOverride;
+  const beatNow = jamBeatNow();
+  return beatNow != null && Number.isFinite(jam.bpm) && jam.bpm > 0 ? (8 * 60) / jam.bpm : 4;
+}
+
+function jamRenderRoomNote() {
+  if (!jamRoomNoteEl) return;
+  if (jamRoomSupported()) {
+    jamRoomNoteEl.hidden = true;
+    jamRoomNoteEl.textContent = '';
+    return;
+  }
+  jamRoomNoteEl.hidden = false;
+  jamRoomNoteEl.textContent = ROOM_DESKTOP_NOTE;
+}
+
+function jamRoomCount(sec) {
+  if (!jamGrabRoomEl) return;
+  if (sec == null) {
+    jamGrabRoomEl.innerHTML = '&#127908; sample the room';
+    return;
+  }
+  jamGrabRoomEl.textContent = `\u25CF rec ${Math.ceil(sec)}s`;
+}
+
+function jamRoomStopStream(stream) {
+  if (!stream) return;
+  try {
+    stream.getTracks().forEach((t) => {
+      try {
+        t.stop();
+      } catch (e) {}
+    });
+  } catch (e) {}
+}
+
+async function jamRoomSample() {
+  if (jam.room.sampling || jam.room.requesting) return false; // double-tap guard
+  if (!jamRoomSupported()) {
+    jamRenderRoomNote();
+    showUnlockToast([ROOM_DESKTOP_NOTE]);
+    return false;
+  }
+  jam.room.requesting = true;
+  const doneRequesting = () => { jam.room.requesting = false; };
+  let stream = null;
+  try {
+    try {
+      // Audio-only first: the picker stays simple and honest.
+      stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
+    } catch (e1) {
+      // Older Chrome builds only offer tab audio when video is requested too;
+      // the video track is stopped immediately — we never look at it.
+      stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+    }
+  } catch (e) {
+    doneRequesting();
+    const n = (e && e.name) || '';
+    if (n === 'NotAllowedError' || n === 'SecurityError') {
+      showUnlockToast(['tab capture blocked \u2014 check the browser prompt \u{1F3A7}']);
+    } else {
+      showUnlockToast(['room capture cancelled']);
+    }
+    return false;
+  }
+  stream.getVideoTracks().forEach((t) => {
+    try {
+      t.stop();
+    } catch (e) {}
+  });
+  if (!stream.getAudioTracks().length) {
+    doneRequesting();
+    jamRoomStopStream(stream);
+    showUnlockToast(['no audio from that tab \u2014 pick the LIMBO tab and enable tab audio']);
+    return false;
+  }
+  const ctx = audio.ctx;
+  if (!ctx || typeof ctx.decodeAudioData !== 'function') {
+    doneRequesting();
+    jamRoomStopStream(stream);
+    showUnlockToast(['audio isn\u2019t ready yet \u2014 tap something in the room first']);
+    return false;
+  }
+  let mr = null;
+  try {
+    mr = new MediaRecorder(stream);
+  } catch (e) {
+    doneRequesting();
+    jamRoomStopStream(stream);
+    showUnlockToast(['this browser can\u2019t record tab audio']);
+    return false;
+  }
+  doneRequesting();
+  const lenSec = jamRoomGrabLenSec();
+  const chunks = [];
+  const mime = mr.mimeType || '';
+  jam.room.sampling = true;
+  if (jamGrabRoomEl) {
+    jamGrabRoomEl.disabled = true;
+    jamGrabRoomEl.classList.add('rec');
+  }
+  jamRoomCount(lenSec);
+  const stopped = new Promise((resolve) => {
+    mr.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size) chunks.push(ev.data);
+    };
+    mr.onstop = () => resolve();
+    mr.onerror = () => resolve();
+  });
+  let remaining = lenSec;
+  const countTick = setInterval(() => {
+    remaining -= 0.25;
+    if (remaining <= 0) {
+      clearInterval(countTick);
+      try {
+        mr.stop();
+      } catch (e) {}
+    } else {
+      jamRoomCount(remaining);
+    }
+  }, 250);
+  // hard safety net in case the interval stalls
+  setTimeout(() => {
+    try {
+      mr.stop();
+    } catch (e) {}
+  }, (lenSec + 3) * 1000);
+  try {
+    mr.start(250);
+  } catch (e) {
+    clearInterval(countTick);
+    jamRoomStopStream(stream);
+    jam.room.sampling = false;
+    if (jamGrabRoomEl) {
+      jamGrabRoomEl.disabled = false;
+      jamGrabRoomEl.classList.remove('rec');
+    }
+    jamRoomCount(null);
+    showUnlockToast(['this browser can\u2019t record tab audio']);
+    return false;
+  }
+  await stopped;
+  clearInterval(countTick);
+  jamRoomStopStream(stream); // release the share the instant we have the take
+  try {
+    const blob = new Blob(chunks, { type: mime || 'audio/webm' });
+    const ab = await blob.arrayBuffer();
+    // The take never entered the WebAudio graph (MediaRecorder only), so
+    // connectedToDestination is false by construction — no feedback possible.
+    const buf = await ctx.decodeAudioData(ab.slice(0));
+    const slot = jam.padRound;
+    jam.pads[slot] = buf;
+    jam.padRound = (jam.padRound + 1) % jam.pads.length;
+    jam.room.lastCapture = {
+      pad: slot,
+      length: buf.length,
+      sampleRate: buf.sampleRate,
+      channels: buf.numberOfChannels,
+      mime,
+      lenSec,
+      connectedToDestination: false,
+    };
+    addSystemLine(`room sampled \u2014 pad ${slot + 1} is loaded`);
+    renderJamPads();
+  } catch (e) {
+    showUnlockToast(['couldn\u2019t decode that take \u2014 try again']);
+  }
+  jam.room.sampling = false;
+  if (jamGrabRoomEl) {
+    jamGrabRoomEl.disabled = false;
+    jamGrabRoomEl.classList.remove('rec');
+  }
+  jamRoomCount(null);
   renderJamSamplerHint();
   return true;
 }
@@ -3433,6 +3636,7 @@ function setJamPanel(open) {
     renderJamPads();
     renderJamSamplerHint();
     renderJamJammers();
+    jamRenderRoomNote();
   } else {
     try { applySkin(equipped.skin); } catch (e) {} // wisp glow back to the skin
   }
@@ -3584,6 +3788,7 @@ if (jamTapEl) jamTapEl.addEventListener('click', () => { jamTapTempo(); jamTapEl
 if (jamBpmDownEl) jamBpmDownEl.addEventListener('click', () => { jamSetBpm(jam.bpm - 1, { manual: true }); jamBpmDownEl.blur(); });
 if (jamBpmUpEl) jamBpmUpEl.addEventListener('click', () => { jamSetBpm(jam.bpm + 1, { manual: true }); jamBpmUpEl.blur(); });
 if (jamGrabEl) jamGrabEl.addEventListener('click', () => { jamGrabLoop(); jamGrabEl.blur(); });
+if (jamGrabRoomEl) jamGrabRoomEl.addEventListener('click', () => { jamRoomSample(); jamGrabRoomEl.blur(); });
 if (jamInstTabsEl) {
   jamInstTabsEl.querySelectorAll('.jam-inst-tab').forEach((b) => {
     b.addEventListener('click', () => { selectJamInstrument(b.dataset.inst); b.blur(); });
@@ -5204,6 +5409,23 @@ window.__limbo = {
   jamTestPadHead: (i, n) => {
     const b = jam.pads[i];
     return b ? Array.from(b.getChannelData(0).slice(0, n || 256)) : null;
+  },
+  // room sampler (build 24): tab-audio capture of the room mix
+  jamRoomSupported,
+  jamRoomSample,
+  jamRoomTestInfo: () => ({
+    sampling: jam.room.sampling,
+    requesting: jam.room.requesting,
+    supported: jamRoomSupported(),
+    last: jam.room.lastCapture ? { ...jam.room.lastCapture } : null,
+  }),
+  jamTestRoomLen: (s) => { jam.room.lenOverride = s; },
+  jamTestPadRms: (i) => {
+    const b = jam.pads[i];
+    if (!b) return null;
+    let sum = 0; const d = b.getChannelData(0);
+    for (let k = 0; k < d.length; k++) sum += d[k] * d[k];
+    return Math.sqrt(sum / d.length);
   },
   // community wall (build 18; build 19: planeW/planeH report the
   // in-world size so tests can verify the 2x scale-up)
