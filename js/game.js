@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=14';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=14';
+import { LimboNet } from './net.js?v=15';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote } from './jam.js?v=15';
 
 /* ---------------- configuration ---------------- */
 
@@ -893,7 +893,9 @@ function renderDjHud() {
 
    Everything downstream (net.djStart, the analyser, the sampler's ring
    buffer) only ever sees a MediaStream + audio track, so any source
-   just works. */
+   just works.
+   Build 15: phones skip tab share entirely (no getDisplayMedia on mobile)
+   and go straight to the chooser with mic / audio-file only. */
 
 function isUserDismissal(e) {
   const n = (e && e.name) || '';
@@ -949,6 +951,7 @@ function djFileSource(file) {
       url = URL.createObjectURL(file);
       el = new Audio();
       el.loop = true;
+      el.preload = 'auto'; // keep it playing if the phone's tab slips to background
       el.src = url;
     } catch (e) { reject(e); return; }
     const done = (err) => {
@@ -967,7 +970,9 @@ function djFileSource(file) {
         reject(new Error('no audio track'));
         return;
       }
-      const name = (file && file.name) || 'track';
+      const rawName = (file && file.name) || 'track';
+      // Phone filenames can be long — keep the HUD line short.
+      const name = rawName.length > 24 ? rawName.slice(0, 21) + '…' : rawName;
       resolve({
         stream,
         track,
@@ -1035,15 +1040,27 @@ function failDjChooser(err) {
 }
 
 /* The chooser: shown when tab share yields no audio or errors (other than
-   the user dismissing the picker). Cancellable — "never mind" resolves
-   null and the decks stay open. */
-function djChooserFlow({ allowTab = true } = {}) {
+   the user dismissing the picker) — and shown FIRST on phones, where tab
+   share is impossible, with only the phone-capable options (build 15).
+   Cancellable — "never mind" resolves null and the decks stay open. */
+function djChooserFlow({ allowTab = true, mobile = false } = {}) {
   return new Promise((resolve, reject) => {
     if (djChooserResolve) { resolve(null); return; } // one chooser at a time
     const tabBtn = document.getElementById('dj-src-tab');
     if (tabBtn) tabBtn.style.display = allowTab ? '' : 'none';
+    const titleEl = document.getElementById('dj-chooser-title');
+    const subEl = document.getElementById('dj-chooser-sub');
+    if (mobile) {
+      // Phones never attempted tab share — don't frame it as a failure.
+      if (titleEl) titleEl.textContent = 'TAKE THE DECKS';
+      if (subEl) subEl.textContent = 'pick how to feed the decks';
+      setChooserNote('tab share needs a desktop browser');
+    } else {
+      if (titleEl) titleEl.textContent = 'NO TAB AUDIO CAME THROUGH';
+      if (subEl) subEl.textContent = 'pick another way to feed the decks';
+      setChooserNote('');
+    }
     if (djSrcHintEl) { djSrcHintEl.style.display = 'none'; djSrcHintEl.textContent = ''; }
-    setChooserNote('');
     if (djChooserEl) djChooserEl.style.display = '';
     djChooserResolve = resolve;
     djChooserReject = reject;
@@ -1109,7 +1126,7 @@ function wireDjChooser() {
 /* One entry point for taking the decks. Fast path: tab share just works
    and no chooser ever appears. Throws {dismissed:true} only when the user
    cancels the system share picker (quiet — the decks stay open). */
-async function acquireDjSource({ allowTab = true } = {}) {
+async function acquireDjSource({ allowTab = true, mobile = false } = {}) {
   if (allowTab) {
     try {
       const src = await tryTabShare();
@@ -1119,7 +1136,7 @@ async function acquireDjSource({ allowTab = true } = {}) {
       // any other error → fall through to the chooser
     }
   }
-  return djChooserFlow({ allowTab });
+  return djChooserFlow({ allowTab, mobile });
 }
 
 async function takeDecks() {
@@ -1127,16 +1144,11 @@ async function takeDecks() {
   if (!active || active.key !== SOUND_ROOM_KEY) return false;
   const coarse = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
   const gdm = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
-  if (!gdm && coarse) {
-    // Phones really can't capture audio — keep the hard block, new copy.
-    const note = 'the decks need a desktop browser \u2014 phones are for listening \u{1F3A7}';
-    showUnlockToast([note]);
-    addSystemLine(note);
-    return false;
-  }
+  // Phones can't tab-share, but mic and audio files work fine — go straight
+  // to the chooser with only the phone-capable options. (build 15)
   let src = null;
   try {
-    src = await acquireDjSource({ allowTab: gdm });
+    src = await acquireDjSource({ allowTab: coarse ? false : gdm, mobile: coarse });
   } catch (e) {
     // User cancelled the system share picker — decks stay open, quiet.
     if (e && e.dismissed) addSystemLine('the decks stay open \u2014 screen share was dismissed');
@@ -3103,7 +3115,7 @@ window.__limbo = {
   galleryFiles: () => (worlds.soundroom && worlds.soundroom.gallery ? worlds.soundroom.gallery.slice() : []),
   takeDecks,
   stopDecks,
-  // DJ source fallback chain (build 14)
+  // DJ source fallback chain (build 14) + mobile decks (build 15)
   acquireDjSource: (o) => acquireDjSource(o || {}),
   djChooserOpen,
   djSource: () => ({ kind: dj.source, label: dj.sourceLabel }),

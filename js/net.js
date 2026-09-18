@@ -37,7 +37,7 @@ const DJ_CLAIM_INTERVAL_MS = 15000; // claim heartbeat while holding the decks
 const DJ_CLAIM_EXPIRE_MS = 45000;   // silent this long -> claim dropped
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '14';
+const BUILD = '15';
 
 /* No peers after this long -> switch signaling strategy (once). */
 const FALLBACK_AFTER_MS = 15000;
