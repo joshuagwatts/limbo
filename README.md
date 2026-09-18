@@ -466,3 +466,70 @@ also showing stale CSS — fixed with `css/style.css?v=29`).
   fits 390px wide without overlap or scroll.
 - The "it paints live for everyone in the sound room" hint stays,
   small, at the bottom inside the overlay.
+
+## Build 30 — iPhone Safari hardening + Android↔iPhone cross-device
+- Viewport: `viewport-fit=cover` added; `#paint-overlay` and `#start-overlay`
+  use `height: 100dvh` with `100vh` fallback (iOS Safari's 100vh reaches under
+  the toolbar); paint header/toolbars respect `env(safe-area-inset-*)` notches.
+- Touch: global `-webkit-tap-highlight-color: transparent` on buttons;
+  `touch-action: manipulation` on buttons, `touch-action: none` on the paint
+  canvas (no scroll / pull-to-refresh while drawing). Paint strokes already
+  use Pointer Events with pointer capture — no mouse-only paths.
+- Audio unlock: the drift tap now calls `AudioContext.resume()` inside the
+  gesture (the one call iOS honors); jam pad/note local triggers call
+  `audioEnsureRunning()` (they're gestures, so resume succeeds); best-effort
+  resume on `visibilitychange`.
+- New floating "🔇 tap for sound" pill (`#sound-pill`): iOS Safari rejects
+  programmatic `<audio>` playback with NotAllowedError when there's been no
+  recent gesture (e.g. a track starting on a remote peer's iPhone). The
+  media-element path now detects the rejection INSTANTLY and raises the pill
+  instead of waiting ~12s for the autoplay watchdog (which stays as backup);
+  the WebAudio path shows the pill if the context is still suspended after a
+  resume attempt. Tapping the pill resumes audio and starts the current track
+  at the room's wall-clock offset. Complements the in-panel "tap to join the
+  music" button — the pill is visible even with the jukebox closed.
+- "📱 play from my phone": file-input + `arrayBuffer()` + `decodeAudioData`
+  path verified — no iOS-only breakage, no new APIs beyond build 27.
+- Cross-device wall: stroke protocol is plain JSON (`{id, n, c, s, b, pts}`,
+  normalized coords) — nothing platform-specific in serialization; Trystero
+  WebRTC data channels work on iOS 14.1+. Real two-phone proof (Android +
+  iPhone in the same room, drawing + hearing the same jukebox track) still
+  needs humans with real phones.
+
+### Build 30b — P2P: parallel signaling + phone-visible status pill
+Real-world failure: Joshua (Android Chrome) + his homie (iPhone Safari) in
+the sound room at the same time got NO connection — no wisp, no name tags.
+Auditing the old 15s torrent→nostr once-only fallback against the actual
+Trystero 0.25.4 module sources found three fatal races:
+1. **Staggered-join deadlock** — A joins at t=0, falls back to nostr at t=15s;
+   B joins torrent at t=60s. One-shot fallback means they never share a
+   strategy again; both sit alone forever.
+2. **Mid-handshake kill** — the timer fired on `peers.size===0` even with a
+   handshake in progress (`onPeerJoin` only fires after the data channel
+   connects; ICE on mobile can take 10–30s). Leaving the room mid-handshake
+   destroyed connections that would have succeeded.
+3. **ICE-failure silence** — discovery working but ICE failing only recorded
+   `lastJoinError` for the keyboard debug HUD; nothing retried, nothing told
+   the user. Trystero only retries on passive re-announce (60s nostr /
+   120s torrent).
+Fix: **both strategies now run in parallel** on the same room key
+(`js/net.js` `_joinAll()`); peer sets merge by per-session `cid` injected
+into every payload, so callbacks see one human even when both of their
+connections are up. Broadcasts go out on both rooms; an 8s dedup filter
+drops the second delivery of each logical message (chat/jam notes/queue
+ops arrive exactly once). Targeted sends (file chunks) resolve the cid to
+a single connection and go out once. `onJoinError` with zero peers now
+schedules a visible retry — leave + rejoin both rooms for fresh
+RTCPeerConnections and immediate re-announce, backoff 10s→60s — instead of
+silence. iOS Safari + torrent: no iOS-specific breakage found in the 0.25.4
+strategy source (plain WSS JSON trackers + WebRTC data channels, both fine
+on iOS) and no documented issue, so no strategy reorder — with parallel
+rooms whichever path works wins anyway.
+New **net status pill** (`#net-pill`, touch devices only, `pointer-events:
+none`, created/updated by `net.js`): `○ offline` (modules failed to load),
+`○ net ready`, `○ finding others…`, `○ connecting…` (peer announced /
+handshaking), `○ couldn't connect · retrying…` (ICE failed, retry
+scheduled), `● N here`. Updates on join/leave/error/handshake + 2s poll —
+the next human test reports the pill text instead of "no connection".
+Debug HUD (settings panel) now shows per-strategy load/join/connection
+counts, ICE retry countdown, and cid.

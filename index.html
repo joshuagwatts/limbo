@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>LIMBO — a portal universe</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=29">
+<link rel="stylesheet" href="css/style.css?v=30">
 <script type="importmap">
 {
   "imports": {
@@ -102,6 +102,11 @@
   </div>
   <div class="paint-hint">it paints live for everyone in the sound room</div>
 </div>
+<!-- build 30: iOS Safari can lock audio until a user gesture. This one
+     floating pill covers both audio paths (WebAudio jam + jukebox media
+     element): the tap is a real gesture, so the context resumes and the
+     current track starts at the room's wall-clock offset. -->
+<button id="sound-pill" style="display:none">&#128263; tap for sound</button>
 <div id="jam-panel">
   <div class="jam-head"><span>&#127925; JAM ROOM</span><button id="jam-close" aria-label="close">&#10005;</button></div>
   <div class="jam-transport">
@@ -220,6 +225,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=29"></script>
+<script type="module" src="js/game.js?v=30"></script>
 </body>
 </html>
