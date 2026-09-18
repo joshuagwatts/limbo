@@ -15,9 +15,35 @@
  * we include STUN entries ourselves. The old fixed openrelayproject /
  * openrelayproject password pair is stale — do not use it.
  *
- * SIGNALING FALLBACK — torrent trackers first; if no peer shows up within
- * 15s we leave and rejoin the SAME room key via the Nostr strategy. Both
- * clients run identical logic, so they converge on the same strategy.
+ * SIGNALING — build 30 runs BOTH strategies (torrent trackers + nostr
+ * relays) IN PARALLEL on the same room key and merges the peer sets. This
+ * replaced the old 15s once-only fallback, which had three fatal races
+ * (found by reading the 0.25.4 module sources after a real two-phone test
+ * failed to connect at all):
+ *   1. Staggered-join deadlock: A joins at t=0, falls back to nostr at
+ *      t=15s; B joins torrent at t=60s. They never share a strategy again —
+ *      the fallback was one-shot, so both sit alone forever.
+ *   2. Mid-handshake kill: the 15s timer fired on peers.size===0 even when
+ *      a handshake was in progress (onPeerJoin only fires after the data
+ *      channel connects; ICE on mobile can take 10-30s). Leaving the room
+ *      mid-handshake destroyed handshakes that would have succeeded.
+ *   3. ICE-failure silence: discovery working but ICE failing only recorded
+ *      lastJoinError for the debug HUD — nothing retried, nothing told the
+ *      user; the client sat silent until the next passive re-announce
+ *      (60s nostr / 120s torrent).
+ * With parallel rooms there is no switching and no timer: whenever two
+ * clients share ANY working strategy they discover each other, no matter
+ * when they joined. A failed ICE path triggers a visible retry (leave +
+ * rejoin both rooms for fresh RTCPeerConnections and immediate
+ * re-announce, with backoff), never silence.
+ *
+ * DEDUP — the same human may connect twice (once per strategy). Every
+ * payload carries our per-session clientId (`cid`); callbacks receive the
+ * cid as the peer id, so game.js keys one wisp / one chat line / one queue
+ * entry per human with zero changes. A short-window dedup filter drops the
+ * second delivery of each logical broadcast (same cid+action+payload).
+ * Targeted sends (file chunks) resolve the cid to a single connection and
+ * go out once, on one room.
  */
 
 const APP_ID = 'limbo_by_holowatts';
@@ -34,12 +60,17 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '29';
+const BUILD = '30';
 
-/* No peers after this long -> switch signaling strategy (once). */
-const FALLBACK_AFTER_MS = 15000;
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
+/* Duplicate-delivery filter window: the same logical broadcast arrives once
+   per strategy room; the second copy inside this window is dropped. */
+const DEDUP_WINDOW_MS = 8000;
+/* ICE-failure retry: leave + rejoin both rooms (fresh peer connections +
+   immediate re-announce) with this backoff ladder, while we have no peers. */
+const ICE_RETRY_BASE_MS = 10000;
+const ICE_RETRY_MAX_MS = 60000;
 
 const STRATEGIES = [
   // Pinned to 0.25.4: unpinned esm.sh URLs resolve "latest", which could
@@ -59,6 +90,34 @@ const NOSTR_RELAYS = [
   'wss://relay02.lnfi.network',
   'wss://relay.sigit.io',
 ];
+
+/* action name -> LimboNet callback property. Broadcast actions go out on
+   every strategy room; targeted actions resolve the cid to one connection. */
+const ACTION_CBS = {
+  wisp: 'onWispCb',
+  chat: 'onChatCb',
+  jamClock: 'onJamClockCb',
+  jamNote: 'onJamNoteCb',
+  jamPad: 'onJamPadCb',
+  wallStroke: 'onWallStrokeCb',
+  wallSyncReq: 'onWallSyncReqCb',
+  wallSync: 'onWallSyncCb',
+  wallHello: 'onWallHelloCb',
+  wallUndo: 'onWallUndoCb',
+  jukeAdd: 'onJukeAddCb',
+  jukeRemove: 'onJukeRemoveCb',
+  jukePlay: 'onJukePlayCb',
+  jukeSkipVote: 'onJukeSkipVoteCb',
+  jukeStateReq: 'onJukeStateReqCb',
+  jukeState: 'onJukeStateCb',
+  jukeFileReq: 'onJukeFileReqCb',
+  jukeFileChunk: 'onJukeFileChunkCb',
+  jukeFileHave: 'onJukeFileHaveCb',
+};
+const BROADCAST_ACTIONS = Object.keys(ACTION_CBS).filter(
+  (n) => n !== 'jukeFileReq' && n !== 'jukeFileChunk'
+);
+const TARGETED_ACTIONS = ['jukeFileReq', 'jukeFileChunk'];
 
 /* OpenRelay static-auth (no signup): time-limited HMAC-SHA1 credentials. */
 const TURN_HOST = 'staticauth.openrelay.metered.ca';
@@ -105,50 +164,55 @@ function buildIceServers(creds) {
   ];
 }
 
+function cap(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
 export class LimboNet {
   constructor() {
     this.build = BUILD; // deploy stamp, shown in the debug HUD
     this.enabled = false;
-    this.mods = []; // lazy-loaded strategy modules, indexed like STRATEGIES
-    this.stratIdx = 0; // which signaling strategy is currently in use
+    this.mods = []; // strategy modules, indexed like STRATEGIES (null when failed)
+    this.selfIds = []; // per-strategy trystero selfId (null when not loaded)
+    this.selfId = null; // first loaded strategy's selfId (compat)
+    this.clientId = null; // per-session UUID; canonical peer identity across strategies
     this.rtcConfig = null;
     this.turnCreds = null;
-    this.selfId = null;
-    this.room = null;
+    /* Parallel rooms: [{si, name, mod, room, selfId, A}] where A maps
+       action name -> trystero action object. */
+    this.rooms = [];
     this.roomKey = null;
     this.joinedAt = 0; // discovery window start (drives the "finding others" UI)
-    this.peers = new Map(); // peerId -> true (presence in current room)
+    /* peers: canonicalId -> {conns: Map(connKey -> {si, peerId})}.
+       canonicalId is the sender's cid; before the first payload arrives a
+       connection sits under a provisional '~prov:' key. */
+    this.peers = new Map();
+    this._seen = new Map(); // dedupKey -> expiryMs
     this.name = 'drifter';
-    this.sendWisp = null;
-    this.sendChat = null;
     this.cosmetics = null; // () => ({s: skinId, h: hatId, t: trailStyle, c: trailHex6}) — set by game.js
-    this.onWispCb = null; // (peerId, {p:[x,y,z], n:name, s:skin, h:hat})
+    this.onWispCb = null; // (peerId, {p:[x,y,z], n:name, s:skin, h:hat, cid})
     this.onChatCb = null; // ({n:name, t:text}, peerId)
     this.onPeerLeaveCb = null; // (peerId)
     this.onQuietCb = null; // () — fired once per room visit when alone too long
     // --- lobby presence (build 11) ---
-    this.lobbyRoom = null;
+    this.lobbyRooms = []; // [{si, room, presenceAction}]
     this.sendPresence = null;
-    this.lobbyPeers = new Map(); // peerId -> {name, room, lastSeen}
+    this.lobbyPeers = new Map(); // cid -> {name, room, lastSeen}
     this.onPresenceCb = null; // () — lobby roster changed (heartbeat/expire)
     this.presenceName = 'drifter';
     this.presenceRoom = 'nexus';
     this._presenceTimer = null;
     this._sweepTimer = null;
     // --- jam room (build 13) ---
-    this.sendJamClock = null; // (data) — {bpm, startWall, by, t}, clock holder -> room
-    this.sendJamNote = null; // (data) — {n, midi, vel, beat, inst, drum, chord, w, c, r}, any jammer -> room
-    this.sendJamPad = null; // (data) — {n, pad, beat, lenBars}, any jammer -> room
     this.onJamClockCb = null; // (data, peerId)
     this.onJamNoteCb = null; // (data, peerId)
     this.onJamPadCb = null; // (data, peerId)
     // --- community wall (build 18) ---
-    this.sendWallStroke = null; // (data) — {n, c, s, pts}, any painter -> room
-    this.sendWallSyncReq = null; // (data) — {reqId}, late joiner -> room
-    this.sendWallSync = null; // (data) — {reqId, img}, peer with ink -> requester
     this.onWallStrokeCb = null; // (data, peerId)
     this.onWallSyncReqCb = null; // (data, peerId)
     this.onWallSyncCb = null; // (data, peerId)
+    this.onWallHelloCb = null; // (data, peerId)
+    this.onWallUndoCb = null; // (data, peerId)
     this.onJukeAddCb = null; // (data, peerId)
     this.onJukeRemoveCb = null; // (data, peerId)
     this.onJukePlayCb = null; // (data, peerId)
@@ -158,12 +222,16 @@ export class LimboNet {
     this.onJukeFileHaveCb = null; // (data, peerId)
     this.onJukeStateReqCb = null; // (data, peerId)
     this.onJukeStateCb = null; // (data, peerId)
-    this.fallbackTimer = null;
+    // send functions are installed by _joinAll(); null when no rooms
+    this._nullSends();
     this.quietTimer = null;
     this.quietFired = false;
-    this.lastJoinError = null; // {error, peerId, at} from trystero onJoinError
+    this.lastJoinError = null; // {error, peerId, strategy, at} from trystero onJoinError
+    // --- ICE-failure retry (build 30) ---
+    this._iceRetryTimer = null;
+    this._iceRetryN = 0;
     // --- handshake-stage diagnostics (debug HUD) ---
-    this.hsPeers = new Map(); // shortId -> {stage, firstSeen, lastSeen, sigIn, sigOut, initiator}
+    this.hsPeers = new Map(); // 'strategy:shortId' -> {stage, firstSeen, lastSeenMs, sigIn, sigOut, initiator}
     this.nostrFrames = []; // ring buffer of recent nostr EVENT frames (compact strings)
     this.relayHosts = NOSTR_RELAYS.map((u) => {
       try {
@@ -172,15 +240,19 @@ export class LimboNet {
         return u;
       }
     });
+    // --- phone-visible status pill (build 30; touch devices only) ---
+    this._pill = null;
+    this._pillTimer = null;
     this._installWsTap();
+  }
+
+  _nullSends() {
+    for (const n of BROADCAST_ACTIONS) this['send' + cap(n)] = null;
+    for (const n of TARGETED_ACTIONS) this['send' + cap(n)] = null;
   }
 
   cleanName(n) {
     return String(n || 'drifter').trim().slice(0, MAX_NAME) || 'drifter';
-  }
-
-  get mod() {
-    return this.mods[this.stratIdx];
   }
 
   /* One-time WebSocket wrapper that taps nostr signaling frames for the
@@ -262,18 +334,21 @@ export class LimboNet {
         }
       } catch (e) {}
     }
-    const now = new Date().toLocaleTimeString();
+    const now = Date.now();
     this.nostrFrames.push(
       `${dir}/${topicKind}${peerId ? '/' + peerId : ''}`
     );
     if (this.nostrFrames.length > 14) this.nostrFrames.shift();
     if (peerId && (topicKind === 'announce' || topicKind === 'signal')) {
-      const selfShort = this.selfId ? String(this.selfId).slice(0, 8) : null;
+      const nsi = STRATEGIES.findIndex((s) => s.name === 'nostr');
+      const selfShort =
+        nsi >= 0 && this.selfIds[nsi] ? String(this.selfIds[nsi]).slice(0, 8) : null;
       const isSelf = selfShort && peerId === selfShort;
-      const rec = this.hsPeers.get(peerId) || {
+      const key = `nostr:${peerId}`;
+      const rec = this.hsPeers.get(key) || {
         stage: 'seen',
-        firstSeen: now,
-        lastSeen: now,
+        firstSeen: new Date(now).toLocaleTimeString(),
+        lastSeenMs: now,
         sigIn: 0,
         sigOut: 0,
         initiator: null,
@@ -288,8 +363,8 @@ export class LimboNet {
         else rec.sigOut++;
         if (rec.stage === 'seen' || rec.stage === 'discovered') rec.stage = 'signaling';
       }
-      rec.lastSeen = now;
-      this.hsPeers.set(peerId, rec);
+      rec.lastSeenMs = now;
+      this.hsPeers.set(key, rec);
     }
   }
 
@@ -297,10 +372,11 @@ export class LimboNet {
      module's own exported getRelaySockets() (0.25.4 exports it) — no
      guessing at internals. NOTE: despite the name it returns a plain
      {url: WebSocket} object, not a Map (verified live). Returns null when
-     the nostr strategy isn't the active one. */
+     the nostr strategy isn't loaded. */
   _getRelayStatus() {
     try {
-      const mod = this.mod;
+      const nsi = STRATEGIES.findIndex((s) => s.name === 'nostr');
+      const mod = nsi >= 0 ? this.mods[nsi] : null;
       if (!mod || typeof mod.getRelaySockets !== 'function') return null;
       const m = mod.getRelaySockets();
       const entries =
@@ -314,34 +390,123 @@ export class LimboNet {
     }
   }
 
-  _hsTouch(id, stage) {
-    const now = new Date().toLocaleTimeString();
-    const rec = this.hsPeers.get(id) || {
-      stage,
-      firstSeen: now,
-      lastSeen: now,
+  _hsTouch(si, peerId, isInitiator) {
+    const id = String(peerId).slice(0, 8);
+    const key = `${STRATEGIES[si].name}:${id}`;
+    const now = Date.now();
+    const rec = this.hsPeers.get(key) || {
+      stage: 'handshaking',
+      firstSeen: new Date(now).toLocaleTimeString(),
+      lastSeenMs: now,
       sigIn: 0,
       sigOut: 0,
       initiator: null,
     };
-    rec.stage = stage;
-    rec.lastSeen = now;
-    this.hsPeers.set(id, rec);
+    rec.stage = 'handshaking';
+    rec.lastSeenMs = now;
+    if (typeof isInitiator === 'boolean') rec.initiator = isInitiator;
+    this.hsPeers.set(key, rec);
+    this._updatePill();
     return rec;
   }
 
-  /* Loads the first strategy + TURN credentials. Resolves true/false. */
+  /* Trystero fired onJoinError: SDP was exchanged but the peer connection
+     failed (ICE/TURN/etc). Record it for the HUD and — instead of sitting
+     silent — schedule a retry while we have no peers at all. */
+  _onJoinError(si, details) {
+    this.lastJoinError = {
+      error: String((details && details.error) || details || 'unknown'),
+      peerId: details && details.peerId ? String(details.peerId).slice(0, 8) : '?',
+      strategy: STRATEGIES[si] ? STRATEGIES[si].name : '?',
+      at: new Date().toLocaleTimeString(),
+    };
+    this._scheduleIceRetry();
+    this._updatePill();
+  }
+
+  /* Leave + rejoin every strategy room: fresh RTCPeerConnections and an
+     immediate re-announce on each strategy, with backoff. Only runs while
+     we have zero peers; any successful join resets the ladder. */
+  _scheduleIceRetry() {
+    if (this.peerCount() > 0) return;
+    if (this._iceRetryTimer) return;
+    if (!this.roomKey || !this.enabled) return;
+    const delay = Math.min(
+      ICE_RETRY_BASE_MS * Math.pow(2, this._iceRetryN),
+      ICE_RETRY_MAX_MS
+    );
+    this._iceRetryN++;
+    this._iceRetryAt = Date.now() + delay;
+    this._iceRetryTimer = setTimeout(() => {
+      this._iceRetryTimer = null;
+      if (this.peerCount() > 0 || !this.roomKey) return;
+      this._rejoinAll();
+      this._updatePill();
+    }, delay);
+    this._updatePill();
+  }
+
+  _clearIceRetry() {
+    if (this._iceRetryTimer) {
+      clearTimeout(this._iceRetryTimer);
+      this._iceRetryTimer = null;
+    }
+    this._iceRetryAt = 0;
+  }
+
+  _rejoinAll() {
+    for (const e of this.rooms) {
+      try {
+        e.room.leave();
+      } catch (err) {
+        /* ignore */
+      }
+    }
+    this.rooms = [];
+    this.peers.clear(); // we had no real peers — that's why we're retrying
+    this._nullSends();
+    this._joinAll();
+  }
+
+  _makeClientId() {
+    try {
+      if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+    } catch (e) {}
+    return (
+      'cid-' +
+      Date.now().toString(36) +
+      '-' +
+      Math.random().toString(36).slice(2, 10)
+    );
+  }
+
+  /* Loads all strategy modules (tolerating individual failures) + TURN
+     credentials. Resolves true when at least one strategy loaded. */
   async boot(name) {
     this.name = this.cleanName(name);
+    this.clientId = this._makeClientId();
     try {
       this.turnCreds = await makeTurnCreds();
       this.rtcConfig = { iceServers: buildIceServers(this.turnCreds) };
-      this.mods[0] = await import(STRATEGIES[0].url);
-      this.selfId = this.mods[0].selfId;
-      this.enabled = true;
     } catch (err) {
-      this.enabled = false; // offline / CDN blocked: single-player
+      this.enabled = false; // crypto unavailable: single-player
+      this._ensurePill();
+      this._updatePill();
+      return this.enabled;
     }
+    const loaded = await Promise.all(
+      STRATEGIES.map((s) =>
+        import(s.url)
+          .then((m) => m)
+          .catch(() => null)
+      )
+    );
+    this.mods = loaded;
+    this.selfIds = loaded.map((m) => (m ? m.selfId : null));
+    this.selfId = this.selfIds.find((id) => id) || null;
+    this.enabled = loaded.some(Boolean);
+    this._ensurePill();
+    this._updatePill();
     return this.enabled;
   }
 
@@ -354,13 +519,16 @@ export class LimboNet {
     }
   }
 
-  /* Leave the current room (if any) and join a new one. */
+  /* Leave the current room (if any) and join a new one — on every loaded
+     strategy at once. */
   async join(roomKey) {
     if (!this.enabled) return;
     this.leave();
     this.roomKey = roomKey;
     this.joinedAt = Date.now(); // discovery window start (drives the "finding others" UI)
     this.quietFired = false;
+    this.lastJoinError = null;
+    this._iceRetryN = 0;
     this.hsPeers.clear(); // fresh diagnostics per room visit
     this.nostrFrames.length = 0;
     try {
@@ -369,219 +537,230 @@ export class LimboNet {
       /* keep going with existing creds; worst case TURN rejects and we
          fall back to STUN-only behavior for this room */
     }
-    this._joinWithStrategy();
-    this._armFallbackTimer();
+    this._joinAll();
     this._armQuietTimer();
+    this._updatePill();
   }
 
-  _joinWithStrategy() {
-    try {
-      const isNostr = STRATEGIES[this.stratIdx].name === 'nostr';
-      const room = (this.room = this.mod.joinRoom(
-        {
-          appId: APP_ID,
-          rtcConfig: this.rtcConfig,
-          // Pin the 3 reliable nostr relays (verified config key in the
-          // 0.25.4 module source: getRelays uses config.relayConfig.urls).
-          ...(isNostr ? { relayConfig: { urls: NOSTR_RELAYS } } : {}),
-          // Trystero calls this when SDP was exchanged but the peer
-          // connection failed — carries the real reason (ICE/TURN/etc).
-          onJoinError: (details) => {
-            this.lastJoinError = {
-              error: String((details && details.error) || details || 'unknown'),
-              peerId: details && details.peerId ? String(details.peerId).slice(0, 8) : '?',
-              at: new Date().toLocaleTimeString(),
-            };
-          },
-          // Fires per peer during the WebRTC handshake, BEFORE onPeerJoin
-          // (which only fires after the data channel fully connects). The
-          // core composes this with its internal handshake handler, so
-          // observing here is safe. Lets the HUD tell "discovered but
-          // handshake stalled" apart from "never discovered".
-          onPeerHandshake: (peerId, _send, _receive, isInitiator) => {
-            const id = String(peerId).slice(0, 8);
-            const rec = this._hsTouch(id, 'handshaking');
-            rec.initiator = !!isInitiator;
-          },
-        },
-        this.roomKey
-      ));
-      // Trystero 0.25.x API: makeAction returns an action OBJECT (not a
-      // [send, receive] tuple), and room event handlers are property
-      // assignments (not method calls). The old call style throws.
-      const wispAction = room.makeAction('wisp');
-      const chatAction = room.makeAction('chat');
-      this.sendWisp = (data) => wispAction.send(data);
-      this.sendChat = (data) => chatAction.send(data);
-      wispAction.onMessage = (d, info) => {
-        if (this.onWispCb) this.onWispCb(info && info.peerId, d);
-      };
-      chatAction.onMessage = (d, info) => {
-        if (this.onChatCb) this.onChatCb(d, info && info.peerId);
-      };
-      /* Jam room (build 13): clock/note/pad events. Fire-and-forget —
-         every client synthesizes the sound locally, so these stay tiny.
-         Created on every room like the DJ actions (cheap); only the
-         sound room ever uses them. */
-      const jamClockAction = room.makeAction('jamClock');
-      const jamNoteAction = room.makeAction('jamNote');
-      const jamPadAction = room.makeAction('jamPad');
-      this.sendJamClock = (data) => jamClockAction.send(data);
-      this.sendJamNote = (data) => jamNoteAction.send(data);
-      this.sendJamPad = (data) => jamPadAction.send(data);
-      jamClockAction.onMessage = (d, info) => {
-        if (this.onJamClockCb) this.onJamClockCb(d, info && info.peerId);
-      };
-      jamNoteAction.onMessage = (d, info) => {
-        if (this.onJamNoteCb) this.onJamNoteCb(d, info && info.peerId);
-      };
-      jamPadAction.onMessage = (d, info) => {
-        if (this.onJamPadCb) this.onJamPadCb(d, info && info.peerId);
-      };
-      /* Community wall (build 18): shared paint canvas in the sound room.
-         Created on every room like the jam actions (cheap); only the
-         sound room ever uses them. */
-      const wallStrokeAction = room.makeAction('wallStroke');
-      const wallSyncReqAction = room.makeAction('wallSyncReq');
-      const wallSyncAction = room.makeAction('wallSync');
-      /* Build 26: wallHello {ts} — a newcomer announces its wall's version
-         time; peers whose wall is NEWER answer with the wallSync JPEG flow.
-         Last-writer-wins convergence, serverless. */
-      const wallHelloAction = room.makeAction('wallHello');
-      /* Build 26 (undo): wallUndo {id} — a peer undid one of their strokes;
-         every client drops that stroke id from its log and replays. */
-      const wallUndoAction = room.makeAction('wallUndo');
-      this.sendWallStroke = (data) => wallStrokeAction.send(data);
-      this.sendWallSyncReq = (data) => wallSyncReqAction.send(data);
-      this.sendWallSync = (data) => wallSyncAction.send(data);
-      this.sendWallHello = (data) => wallHelloAction.send(data);
-      this.sendWallUndo = (data) => wallUndoAction.send(data);
-      wallStrokeAction.onMessage = (d, info) => {
-        if (this.onWallStrokeCb) this.onWallStrokeCb(d, info && info.peerId);
-      };
-      wallSyncReqAction.onMessage = (d, info) => {
-        if (this.onWallSyncReqCb) this.onWallSyncReqCb(d, info && info.peerId);
-      };
-      wallSyncAction.onMessage = (d, info) => {
-        if (this.onWallSyncCb) this.onWallSyncCb(d, info && info.peerId);
-      };
-      wallHelloAction.onMessage = (d, info) => {
-        if (this.onWallHelloCb) this.onWallHelloCb(d, info && info.peerId);
-      };
-      wallUndoAction.onMessage = (d, info) => {
-        if (this.onWallUndoCb) this.onWallUndoCb(d, info && info.peerId);
-      };
-      /* Jukebox (build 21): synchronized queue playback in the sound room.
-         Everyone queues track links; every client plays the same track at
-         the same wall-clock offset through embedded players on their own
-         device — no audio relay, no DRM games. Created on every room like
-         the jam actions (cheap); only the sound room ever uses them. */
-      const jukeAddAction = room.makeAction('jukeAdd');
-      const jukeRemoveAction = room.makeAction('jukeRemove');
-      const jukePlayAction = room.makeAction('jukePlay');
-      const jukeSkipVoteAction = room.makeAction('jukeSkipVote');
-      const jukeStateReqAction = room.makeAction('jukeStateReq');
-      const jukeStateAction = room.makeAction('jukeState');
-      /* Phone files (build 27): song bytes travel peer-to-peer in 48KB
-         base64 chunks — no upload site, no expiring links. */
-      const jukeFileReqAction = room.makeAction('jukeFileReq');
-      const jukeFileChunkAction = room.makeAction('jukeFileChunk');
-      const jukeFileHaveAction = room.makeAction('jukeFileHave');
-      this.sendJukeAdd = (data) => jukeAddAction.send(data);
-      this.sendJukeRemove = (data) => jukeRemoveAction.send(data);
-      this.sendJukePlay = (data) => jukePlayAction.send(data);
-      this.sendJukeSkipVote = (data) => jukeSkipVoteAction.send(data);
-      this.sendJukeStateReq = (data) => jukeStateReqAction.send(data);
-      this.sendJukeState = (data) => jukeStateAction.send(data);
-      this.sendJukeFileReq = (data, target) => jukeFileReqAction.send(data, target);
-      this.sendJukeFileChunk = (data, target) => jukeFileChunkAction.send(data, target);
-      this.sendJukeFileHave = (data) => jukeFileHaveAction.send(data);
-      jukeAddAction.onMessage = (d, info) => {
-        if (this.onJukeAddCb) this.onJukeAddCb(d, info && info.peerId);
-      };
-      jukeRemoveAction.onMessage = (d, info) => {
-        if (this.onJukeRemoveCb) this.onJukeRemoveCb(d, info && info.peerId);
-      };
-      jukePlayAction.onMessage = (d, info) => {
-        if (this.onJukePlayCb) this.onJukePlayCb(d, info && info.peerId);
-      };
-      jukeSkipVoteAction.onMessage = (d, info) => {
-        if (this.onJukeSkipVoteCb) this.onJukeSkipVoteCb(d, info && info.peerId);
-      };
-      jukeStateReqAction.onMessage = (d, info) => {
-        if (this.onJukeStateReqCb) this.onJukeStateReqCb(d, info && info.peerId);
-      };
-      jukeStateAction.onMessage = (d, info) => {
-        if (this.onJukeStateCb) this.onJukeStateCb(d, info && info.peerId);
-      };
-      jukeFileReqAction.onMessage = (d, info) => {
-        if (this.onJukeFileReqCb) this.onJukeFileReqCb(d, info && info.peerId);
-      };
-      jukeFileChunkAction.onMessage = (d, info) => {
-        if (this.onJukeFileChunkCb) this.onJukeFileChunkCb(d, info && info.peerId);
-      };
-      jukeFileHaveAction.onMessage = (d, info) => {
-        if (this.onJukeFileHaveCb) this.onJukeFileHaveCb(d, info && info.peerId);
-      };
-      room.onPeerJoin = (id) => {
-        this.peers.set(id, true);
-        this._hsTouch(String(id).slice(0, 8), 'joined');
-        this._clearFallbackTimer(); // someone made it — signaling works
-      };
-      room.onPeerLeave = (id) => {
-        this.peers.delete(id);
-        if (this.onPeerLeaveCb) this.onPeerLeaveCb(id);
-      };
-    } catch (err) {
-      this.enabled = false;
-      this.room = null;
-    }
-  }
-
-  _clearFallbackTimer() {
-    if (this.fallbackTimer) {
-      clearTimeout(this.fallbackTimer);
-      this.fallbackTimer = null;
-    }
-  }
-
-  /* If nobody shows up on the current strategy, try the next one on the
-     same room key. Both clients run this, so they converge. One shot. */
-  _armFallbackTimer() {
-    this._clearFallbackTimer();
-    this.fallbackTimer = setTimeout(async () => {
-      this.fallbackTimer = null;
-      if (this.peers.size > 0) return;
-      if (this.stratIdx >= STRATEGIES.length - 1) return; // nowhere left
-      const next = this.stratIdx + 1;
+  /* Join the room on every loaded strategy module and wire all actions.
+     Trystero 0.25.x API: makeAction returns an action OBJECT (not a
+     [send, receive] tuple), and room event handlers are property
+     assignments (not method calls). The old call style throws. */
+  _joinAll() {
+    this.rooms = [];
+    for (let si = 0; si < STRATEGIES.length; si++) {
+      const mod = this.mods[si];
+      if (!mod) continue;
+      const name = STRATEGIES[si].name;
+      const isNostr = name === 'nostr';
+      let room;
       try {
-        if (!this.mods[next]) this.mods[next] = await import(STRATEGIES[next].url);
+        room = mod.joinRoom(
+          {
+            appId: APP_ID,
+            rtcConfig: this.rtcConfig,
+            // Pin the 3 reliable nostr relays (verified config key in the
+            // 0.25.4 module source: getRelays uses config.relayConfig.urls).
+            ...(isNostr ? { relayConfig: { urls: NOSTR_RELAYS } } : {}),
+            // Trystero calls this when SDP was exchanged but the peer
+            // connection failed — carries the real reason (ICE/TURN/etc).
+            onJoinError: (details) => this._onJoinError(si, details),
+            // Fires per peer during the WebRTC handshake, BEFORE onPeerJoin
+            // (which only fires after the data channel fully connects). The
+            // core composes this with its internal handshake handler, so
+            // observing here is safe. Lets the HUD tell "discovered but
+            // handshake stalled" apart from "never discovered".
+            onPeerHandshake: (peerId, _send, _receive, isInitiator) =>
+              this._hsTouch(si, peerId, isInitiator),
+          },
+          this.roomKey
+        );
       } catch (e) {
-        return; // new strategy unreachable — stay where we are
+        continue;
       }
-      this.stratIdx = next;
-      this.selfId = this.mods[next].selfId;
-      if (this.room) {
-        try {
-          this.room.leave();
-        } catch (e) {
-          /* ignore */
+      const entry = { si, name, mod, room, selfId: this.selfIds[si], A: {} };
+      this._wireRoom(entry);
+      this.rooms.push(entry);
+    }
+    if (this.rooms.length > 0) {
+      for (const n of BROADCAST_ACTIONS)
+        this['send' + cap(n)] = (data) => this._bcast(n, data);
+      for (const n of TARGETED_ACTIONS)
+        this['send' + cap(n)] = (data, target) => this._sendTo(n, data, target);
+    } else {
+      this._nullSends();
+    }
+  }
+
+  _wireRoom(entry) {
+    const si = entry.si;
+    const room = entry.room;
+    for (const name of Object.keys(ACTION_CBS)) {
+      const action = room.makeAction(name);
+      entry.A[name] = action;
+      const cbProp = ACTION_CBS[name];
+      action.onMessage = (d, info) =>
+        this._in(si, name, cbProp, d, info && info.peerId);
+    }
+    room.onPeerJoin = (id) => this._noteConn(si, id);
+    room.onPeerLeave = (id) => this._dropConn(si, id);
+  }
+
+  /* A data channel connected on strategy si to trystero peerId. We don't
+     know the human's cid until their first payload arrives, so park the
+     connection under a provisional key; _in() promotes it on first sight. */
+  _noteConn(si, peerId) {
+    const connKey = `${si}:${peerId}`;
+    const prov = `~prov:${connKey}`;
+    let rec = this.peers.get(prov);
+    if (!rec) {
+      rec = { conns: new Map() };
+      this.peers.set(prov, rec);
+    }
+    rec.conns.set(connKey, { si, peerId: String(peerId) });
+    // Someone made it — signaling works. Reset the ICE retry ladder.
+    this._iceRetryN = 0;
+    this._clearIceRetry();
+    this._updatePill();
+  }
+
+  _dropConn(si, peerId) {
+    const connKey = `${si}:${peerId}`;
+    for (const [canon, rec] of this.peers) {
+      if (rec.conns.delete(connKey)) {
+        if (rec.conns.size === 0) {
+          this.peers.delete(canon);
+          // Only real humans (cid keys) reach game.js; provisional keys
+          // never produced a visual.
+          if (!canon.startsWith('~prov:') && this.onPeerLeaveCb) {
+            try {
+              this.onPeerLeaveCb(canon);
+            } catch (e) {
+              /* game callbacks must never break networking */
+            }
+          }
         }
-        this.room = null;
+        break;
       }
-      this.peers.clear();
-      this.sendWisp = this.sendChat = null;
-      this.sendJamClock = this.sendJamNote = this.sendJamPad = null;
-      this.sendWallStroke = this.sendWallSyncReq = this.sendWallSync = null;
-      this._joinWithStrategy();
-      // Keep presence on the working strategy too: the lobby rejoins with
-      // the new selfId; stale entries are dropped by the rejoin.
-      if (this.lobbyRoom) {
-        this._leaveLobby();
-        this.joinLobby();
+    }
+    this._updatePill();
+  }
+
+  /* Promote a provisional connection to its cid on first payload, merging
+     with the same human's connection from the other strategy (if any). */
+  _promoteConn(si, peerId, cid) {
+    const connKey = `${si}:${peerId}`;
+    const prov = `~prov:${connKey}`;
+    const c = { si, peerId: String(peerId) };
+    let rec = this.peers.get(cid);
+    if (!rec) {
+      rec = { conns: new Map() };
+      this.peers.set(cid, rec);
+    }
+    rec.conns.set(connKey, c);
+    const old = this.peers.get(prov);
+    if (old && old !== rec) {
+      for (const [k, v] of old.conns) if (k !== connKey) rec.conns.set(k, v);
+      this.peers.delete(prov);
+    }
+  }
+
+  /* Incoming action payload on strategy si. Canonical peer id is the
+     sender's cid (injected by _bcast/_sendTo on every payload we emit);
+     the '~prov:' fallback only matters for mixed-version rooms. */
+  _in(si, actionName, cbProp, d, peerId) {
+    let cid = null;
+    try {
+      cid =
+        d && typeof d.cid === 'string' && d.cid.length < 64 && d.cid
+          ? d.cid
+          : null;
+    } catch (e) {}
+    if (!cid) cid = `~prov:${si}:${peerId}`;
+    else this._promoteConn(si, peerId, cid);
+    // Duplicate-delivery filter: the same logical broadcast arrives once
+    // per strategy room; drop the second copy.
+    const now = Date.now();
+    const key = `${cid}|${actionName}|${this._fp(d)}`;
+    const exp = this._seen.get(key);
+    if (exp && exp > now) return;
+    this._seen.set(key, now + DEDUP_WINDOW_MS);
+    if (this._seen.size > 600) {
+      for (const [k, x] of this._seen) {
+        if (x <= now) this._seen.delete(k);
+        if (this._seen.size <= 400) break;
       }
-      // no re-arm: single fallback, both sides converge identically
-    }, FALLBACK_AFTER_MS);
+    }
+    const cb = this[cbProp];
+    if (cb) {
+      try {
+        cb(cid, d); // (peerId, data) — matches the game.js handler contract
+      } catch (e) {
+        /* game callbacks must never break networking */
+      }
+    }
+  }
+
+  /* Payload fingerprint for the dedup filter. Long strings (wall JPEGs,
+     file chunks) are truncated — same logical message still collides,
+     different ones still differ. */
+  _fp(d) {
+    try {
+      return JSON.stringify(d, (k, v) =>
+        typeof v === 'string' && v.length > 256
+          ? v.slice(0, 64) + '…' + v.length
+          : v
+      );
+    } catch (e) {
+      return '?';
+    }
+  }
+
+  /* Broadcast an action on every strategy room. The cid lets receivers
+     merge our two connections into one human. */
+  _bcast(actionName, data) {
+    if (!this.enabled || this.rooms.length === 0) return;
+    let out;
+    try {
+      out = Object.assign({ cid: this.clientId }, data);
+    } catch (e) {
+      out = { cid: this.clientId };
+    }
+    for (const e of this.rooms) {
+      try {
+        e.A[actionName].send(out);
+      } catch (err) {
+        /* best effort per room */
+      }
+    }
+  }
+
+  /* Resolve a canonical cid to one concrete (room, peerId) and send once. */
+  _pickConn(canon) {
+    const rec = this.peers.get(canon);
+    if (!rec) return null;
+    for (const [, c] of rec.conns) {
+      const entry = this.rooms[c.si];
+      if (entry) return { entry, peerId: c.peerId };
+    }
+    return null;
+  }
+
+  _sendTo(actionName, data, target) {
+    if (!this.enabled || target == null) return;
+    const c = this._pickConn(String(target));
+    if (!c) return;
+    let out;
+    try {
+      out = Object.assign({ cid: this.clientId }, data);
+    } catch (e) {
+      out = { cid: this.clientId };
+    }
+    try {
+      c.entry.A[actionName].send(out, c.peerId);
+    } catch (e) {
+      /* ignore */
+    }
   }
 
   /* Suggest the Nexus when a player sits alone in a realm room. */
@@ -591,7 +770,7 @@ export class LimboNet {
       this.quietTimer = null;
       if (
         !this.quietFired &&
-        this.peers.size === 0 &&
+        this.peerCount() === 0 &&
         this.roomKey &&
         this.roomKey !== NEXUS_ROOM &&
         this.onQuietCb
@@ -603,42 +782,28 @@ export class LimboNet {
   }
 
   leave() {
-    this._clearFallbackTimer();
+    this._clearIceRetry();
     if (this.quietTimer) {
       clearTimeout(this.quietTimer);
       this.quietTimer = null;
     }
-    if (this.room) {
+    for (const e of this.rooms) {
       try {
-        this.room.leave();
-      } catch (e) {
+        e.room.leave();
+      } catch (err) {
         /* ignore */
       }
-      this.room = null;
     }
+    this.rooms = [];
     this.peers.clear();
-    this.sendWisp = null;
-    this.sendChat = null;
-    this.sendJamClock = null;
-    this.sendJamNote = null;
-    this.sendJamPad = null;
-    this.sendWallStroke = null;
-    this.sendWallSyncReq = null;
-    this.sendWallSync = null;
-    this.sendJukeAdd = null;
-    this.sendJukeRemove = null;
-    this.sendJukePlay = null;
-    this.sendJukeSkipVote = null;
-    this.sendJukeStateReq = null;
-    this.sendJukeState = null;
-    this.sendJukeFileReq = null;
-    this.sendJukeFileChunk = null;
-    this.sendJukeFileHave = null;
+    this._nullSends();
+    this._updatePill();
   }
 
   /* ---------------- lobby presence (build 11) ----------------
-     A second room joined once at boot. Heartbeats carry {n, r, t} only.
-     leave()/join() never touch it — it survives realm hops. */
+     Rooms joined once at boot, one per strategy. Heartbeats carry
+     {n, r, t, cid}. leave()/join() never touch them — they survive realm
+     hops. */
 
   /* Update what our heartbeat says, and re-broadcast immediately.
      No-op until the lobby is joined. game.js calls this on boot,
@@ -650,8 +815,7 @@ export class LimboNet {
   }
 
   _presencePayload() {
-    const p = { n: this.presenceName, r: this.presenceRoom, t: Date.now() };
-    return p;
+    return { n: this.presenceName, r: this.presenceRoom, t: Date.now() };
   }
 
   _presenceTick() {
@@ -663,14 +827,15 @@ export class LimboNet {
     }
   }
 
-  _notePresence(peerId, data) {
+  _notePresence(data) {
     try {
-      if (!data || !peerId) return;
-      if (String(peerId) === String(this.selfId)) return; // never list ourselves
+      if (!data) return;
+      const cid = typeof data.cid === 'string' && data.cid ? data.cid : null;
+      if (!cid || cid === this.clientId) return; // never list ourselves
       const name = this.cleanName(data.n);
       const room = String(data.r || 'nexus').slice(0, 16);
       const dj = typeof data.dj === 'string' && data.dj ? String(data.dj).slice(0, 16) : null;
-      this.lobbyPeers.set(String(peerId), { name, room, dj, lastSeen: Date.now() });
+      this.lobbyPeers.set(cid, { name, room, dj, lastSeen: Date.now() });
       if (this.onPresenceCb) this.onPresenceCb();
     } catch (e) {
       /* ignore */
@@ -692,33 +857,51 @@ export class LimboNet {
   }
 
   joinLobby() {
-    if (!this.enabled || this.lobbyRoom) return;
-    try {
-      const isNostr = STRATEGIES[this.stratIdx].name === 'nostr';
-      const room = (this.lobbyRoom = this.mod.joinRoom(
-        {
-          appId: APP_ID,
-          rtcConfig: this.rtcConfig,
-          ...(isNostr ? { relayConfig: { urls: NOSTR_RELAYS } } : {}),
-        },
-        LOBBY_ROOM
-      ));
-      const presenceAction = room.makeAction('presence');
-      this.sendPresence = (data) => presenceAction.send(data);
-      presenceAction.onMessage = (d, info) =>
-        this._notePresence(info && info.peerId, d);
-      // A newcomer joining mid-session gets our heartbeat right away.
-      room.onPeerJoin = () => this._presenceTick();
-      this._presenceTick(); // announce ourselves on entry
-      this._presenceTimer = setInterval(
-        () => this._presenceTick(),
-        PRESENCE_INTERVAL_MS
-      );
-      this._sweepTimer = setInterval(() => this._sweepLobby(), PRESENCE_SWEEP_MS);
-    } catch (e) {
-      this.lobbyRoom = null;
-      this.sendPresence = null;
+    if (!this.enabled || this.lobbyRooms.length) return;
+    for (let si = 0; si < STRATEGIES.length; si++) {
+      const mod = this.mods[si];
+      if (!mod) continue;
+      const isNostr = STRATEGIES[si].name === 'nostr';
+      try {
+        const room = mod.joinRoom(
+          {
+            appId: APP_ID,
+            rtcConfig: this.rtcConfig,
+            ...(isNostr ? { relayConfig: { urls: NOSTR_RELAYS } } : {}),
+          },
+          LOBBY_ROOM
+        );
+        const presenceAction = room.makeAction('presence');
+        presenceAction.onMessage = (d) => this._notePresence(d);
+        // A newcomer joining mid-session gets our heartbeat right away.
+        room.onPeerJoin = () => this._presenceTick();
+        this.lobbyRooms.push({ si, room, presenceAction });
+      } catch (e) {
+        /* ignore */
+      }
     }
+    if (!this.lobbyRooms.length) return;
+    this.sendPresence = (data) => {
+      let out;
+      try {
+        out = Object.assign({ cid: this.clientId }, data);
+      } catch (e) {
+        out = { cid: this.clientId };
+      }
+      for (const l of this.lobbyRooms) {
+        try {
+          l.presenceAction.send(out);
+        } catch (e) {
+          /* ignore */
+        }
+      }
+    };
+    this._presenceTick(); // announce ourselves on entry
+    this._presenceTimer = setInterval(
+      () => this._presenceTick(),
+      PRESENCE_INTERVAL_MS
+    );
+    this._sweepTimer = setInterval(() => this._sweepLobby(), PRESENCE_SWEEP_MS);
   }
 
   _leaveLobby() {
@@ -730,14 +913,14 @@ export class LimboNet {
       clearInterval(this._sweepTimer);
       this._sweepTimer = null;
     }
-    if (this.lobbyRoom) {
+    for (const l of this.lobbyRooms) {
       try {
-        this.lobbyRoom.leave();
+        l.room.leave();
       } catch (e) {
         /* ignore */
       }
-      this.lobbyRoom = null;
     }
+    this.lobbyRooms = [];
     this.sendPresence = null;
     this.lobbyPeers.clear();
   }
@@ -780,18 +963,89 @@ export class LimboNet {
     }
   }
 
+  /* Unique humans currently connected (both of a human's strategy
+     connections collapse to their cid). */
   peerCount() {
-    return this.peers.size;
+    let n = 0;
+    for (const k of this.peers.keys()) if (!k.startsWith('~prov:')) n++;
+    return n;
   }
 
-  /* Raw RTCPeerConnections keyed by peerId (trystero's getPeers() returns
-     a plain object: peerId -> RTCPeerConnection). Empty when signaling has
-     found nobody — which is itself diagnostic. */
+  /* Raw RTCPeerConnections across all strategy rooms, keyed
+     'strategy:peerId'. Empty when signaling has found nobody — which is
+     itself diagnostic. */
   getPeerConnections() {
+    const out = {};
     try {
-      return this.room ? this.room.getPeers() : {};
+      for (const e of this.rooms) {
+        let pcs = {};
+        try {
+          pcs = e.room.getPeers() || {};
+        } catch (err) {}
+        for (const [id, pc] of Object.entries(pcs)) out[`${e.name}:${id}`] = pc;
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  /* ---------------- phone-visible status pill (build 30) ----------------
+     The debug HUD needs a keyboard (press D) — useless on phones. This
+     small always-visible pill shows live net state for touch devices:
+       ○ offline              strategy modules failed to load (single-player)
+       ○ net ready            loaded, no room joined yet
+       ○ finding others…      in a room, no peers, no handshake activity
+       ○ connecting…          peer announced / handshaking, no data channel yet
+       ○ couldn't connect · retrying…   ICE failed (onJoinError), retry scheduled
+       ● N here               N humans connected
+     Updates on join/leave/error/handshake plus a 2s poll for stage changes.
+     pointer-events:none so it never eats game touches. */
+
+  _ensurePill() {
+    if (this._pill || typeof document === 'undefined') return;
+    try {
+      const touch =
+        (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ||
+        'ontouchstart' in window;
+      if (!touch) return;
+      const el = document.createElement('div');
+      el.id = 'net-pill';
+      el.setAttribute('aria-live', 'polite');
+      document.body.appendChild(el);
+      this._pill = el;
+      this._updatePill();
+      if (!this._pillTimer)
+        this._pillTimer = setInterval(() => this._updatePill(), 2000);
     } catch (e) {
-      return {};
+      /* pill is optional */
+    }
+  }
+
+  _netState() {
+    if (!this.enabled) return { cls: 'off', text: '○ offline' };
+    if (!this.roomKey) return { cls: 'mid', text: '○ net ready' };
+    const n = this.peerCount();
+    if (n > 0) return { cls: 'on', text: `● ${n} here` };
+    if (this.lastJoinError) return { cls: 'warn', text: "○ couldn't connect · retrying…" };
+    const now = Date.now();
+    for (const [, r] of this.hsPeers) {
+      if (
+        now - (r.lastSeenMs || 0) < 30000 &&
+        (r.stage === 'discovered' || r.stage === 'signaling' || r.stage === 'handshaking')
+      ) {
+        return { cls: 'mid', text: '○ connecting…' };
+      }
+    }
+    return { cls: 'mid', text: '○ finding others…' };
+  }
+
+  _updatePill() {
+    if (!this._pill) return;
+    try {
+      const s = this._netState();
+      if (this._pill.textContent !== s.text) this._pill.textContent = s.text;
+      if (this._pill.dataset.cls !== s.cls) this._pill.dataset.cls = s.cls;
+    } catch (e) {
+      /* never break networking for a label */
     }
   }
 
@@ -803,7 +1057,7 @@ export class LimboNet {
     const peers = [];
     for (const [id, pc] of Object.entries(pcs)) {
       const info = {
-        id: String(id).slice(0, 8),
+        id: String(id).slice(0, 24),
         ice: '?',
         gathering: '?',
         conn: '?',
@@ -835,15 +1089,31 @@ export class LimboNet {
       }
       peers.push(info);
     }
+    const strats = STRATEGIES.map((s, si) => {
+      const entry = this.rooms.find((e) => e.si === si);
+      let conns = 0;
+      for (const [, rec] of this.peers)
+        for (const [, c] of rec.conns) if (c.si === si) conns++;
+      return {
+        name: s.name,
+        loaded: !!this.mods[si],
+        joined: !!entry,
+        conns,
+      };
+    });
     return {
       build: this.build,
       enabled: this.enabled,
-      strategy: STRATEGIES[this.stratIdx] ? STRATEGIES[this.stratIdx].name : '?',
+      strategies: strats,
       roomKey: this.roomKey || '(none)',
-      peerCount: this.peers.size,
+      peerCount: this.peerCount(),
       peers,
       lastJoinError: this.lastJoinError,
+      iceRetry: this._iceRetryTimer
+        ? { inMs: Math.max(0, (this._iceRetryAt || 0) - Date.now()), attempt: this._iceRetryN }
+        : null,
       turnUser: this.turnCreds ? this.turnCreds.username : '(none)',
+      clientId: this.clientId ? String(this.clientId).slice(0, 8) : '(none)',
       // Handshake-stage diagnostics: relay socket state, per-peer
       // discovery/handshake stage, recent nostr wire frames.
       relays: this._getRelayStatus(),
@@ -853,7 +1123,7 @@ export class LimboNet {
         sigIn: r.sigIn,
         sigOut: r.sigOut,
         initiator: r.initiator,
-        lastSeen: r.lastSeen,
+        lastSeenMs: r.lastSeenMs,
       })),
       frames: this.nostrFrames.slice(),
     };

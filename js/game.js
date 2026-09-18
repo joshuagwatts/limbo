@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=29';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=29';
+import { LimboNet } from './net.js?v=30';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=30';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -819,6 +819,13 @@ function audioEnsureRunning() {
   return !!(audio.ctx && audio.master);
 }
 
+/* iOS Safari can re-suspend the AudioContext when the tab is backgrounded.
+   Best-effort resume on return; if the OS still says no, the next audio
+   need raises the "tap for sound" pill — the honest path back in. */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') audioEnsureRunning();
+});
+
 /* ---------------- jam room (build 13) ----------------
    The sound room becomes a jam space. THE CORE TRICK: instrument audio
    is never streamed — the internet can't do real-time jam latency
@@ -1306,6 +1313,7 @@ function jamBroadcastNote(payload) {
 }
 
 function jamPlayLocal(midi, vel = 0.9) {
+  audioEnsureRunning(); // pad taps are gestures — iOS resumes the context here
   const ctx = audio.ctx;
   jamRenderNote(midi, vel, ctx ? ctx.currentTime + 0.01 : 0, null);
   const beatNow = jamBeatNow();
@@ -1319,6 +1327,7 @@ function jamPlayLocal(midi, vel = 0.9) {
 }
 
 function jamPlayBassLocal(midi, vel = 0.9) {
+  audioEnsureRunning(); // pad taps are gestures — iOS resumes the context here
   const ctx = audio.ctx;
   jamRenderBass(midi, vel, ctx ? ctx.currentTime + 0.01 : 0);
   const beatNow = jamBeatNow();
@@ -1329,6 +1338,7 @@ function jamPlayBassLocal(midi, vel = 0.9) {
 }
 
 function jamHitDrumLocal(drum, vel = 0.95) {
+  audioEnsureRunning(); // pad taps are gestures — iOS resumes the context here
   if (!JAM_DRUMS.includes(drum)) return;
   const ctx = audio.ctx;
   jamRenderDrum(drum, vel, ctx ? ctx.currentTime + 0.01 : 0);
@@ -1341,6 +1351,7 @@ function jamHitDrumLocal(drum, vel = 0.95) {
 
 /* Chord stabs quantize to the bar — changes land like an arrangement. */
 function jamHitChordLocal(chord, vel = 0.85) {
+  audioEnsureRunning(); // pad taps are gestures — iOS resumes the context here
   chord = Math.max(0, Math.min(JAM_CHORDS.length - 1, chord | 0));
   const ctx = audio.ctx;
   jamRenderChord(chord, vel, ctx ? ctx.currentTime + 0.01 : 0);
@@ -1408,7 +1419,7 @@ function handleJamPad(d, peerId) {
    from a deposed DJ are ignored — the new DJ's grid takes over. */
 function handleJamClock(d, peerId) {
   if (!d || !Number.isFinite(Number(d.bpm)) || !Number.isFinite(Number(d.startWall))) return;
-  if (peerId && net.selfId && String(peerId) === String(net.selfId)) return; // never follow our own echo
+  if (peerId && net.clientId && String(peerId) === String(net.clientId)) return; // never follow our own echo
   const t = Number(d.t) || 0;
   if (jam.startWall != null && t < (jam.clockMsgT || 0)) return; // stale: a newer grid already won
   jam.bpm = Math.max(60, Math.min(200, Number(d.bpm)));
@@ -3134,6 +3145,7 @@ function jukeStartPlayback(d) {
   jukeStopPlayer();
   juke.joinWaiting = false;
   juke.playerErrored = false;
+  soundPillHide(); // fresh track, fresh state — the track's own path re-shows it if blocked
   const offset = jukeOffsetFor(d);
   if (d.provider === 'youtube') jukePlayYT(d, offset);
   else if (d.provider === 'soundcloud') jukePlaySC(d, offset);
@@ -3236,6 +3248,32 @@ function jukeJoinTap() {
   } catch (e) {}
   juke.joinWaiting = false;
   renderJuke();
+}
+
+/* ---------- sound unlock pill (build 30) ----------
+   iOS Safari locks audio until a real user gesture. The drift tap unlocks
+   it, but a remote-triggered track (or an OS-suspended context) can still
+   hit a block. This one floating pill covers both audio paths: the tap IS
+   a gesture, so audioEnsureRunning() resumes the context here, then the
+   join-tap path seeks to the wall-clock offset and plays. */
+const soundPillEl = document.getElementById('sound-pill');
+function soundPillShow() {
+  if (soundPillEl) soundPillEl.style.display = '';
+}
+function soundPillHide() {
+  if (soundPillEl) soundPillEl.style.display = 'none';
+}
+function soundPillBlockedErr(e) {
+  const n = (e && e.name) || '';
+  return n === 'NotAllowedError' || n === 'SecurityError' || n === 'NotSupportedError';
+}
+function soundPillTap() {
+  audioEnsureRunning(); // real gesture: iOS lets the context resume here
+  jukeJoinTap();        // seek to the room's wall-clock offset + play
+  soundPillHide();
+}
+if (soundPillEl) {
+  soundPillEl.addEventListener('click', () => { soundPillTap(); soundPillEl.blur(); });
 }
 
 /* ---------- invisible players (build 25) ----------
@@ -3761,6 +3799,16 @@ function jukeDirectStartBuffer(st, offsetSec) {
     if (juke.now && juke.now.id === st.d.id) { st.playing = false; jukeOnPlayerEnded(); }
   };
   try { src.start(st.startCtx, off); } catch (e) { jukeOnTrackError(); }
+  // WebAudio path: a suspended AudioContext (iOS backgrounding) schedules
+  // silence with no error. Try to resume; if the OS still says no, the
+  // pill is the honest path back in.
+  if (ctx.state === 'suspended') {
+    try {
+      const pr = ctx.resume();
+      if (pr && pr.then) pr.then(() => { if (ctx.state === 'suspended') soundPillShow(); });
+      else if (ctx.state === 'suspended') soundPillShow();
+    } catch (e) { soundPillShow(); }
+  }
 }
 
 function jukeDirectPlay(st) {
@@ -3768,7 +3816,12 @@ function jukeDirectPlay(st) {
   if (st.mode === 'webaudio' && st.buffer) {
     if (st.paused) jukeDirectStartBuffer(st, st.pauseOff || 0);
   } else if (st.el) {
-    try { st.el.play().catch(() => {}); } catch (e) {}
+    // Programmatic play (resume / join tap): if iOS still refuses, the
+    // global pill is the honest path back in.
+    try {
+      const pr = st.el.play();
+      if (pr && pr.catch) pr.catch((e) => { if (soundPillBlockedErr(e)) soundPillShow(); });
+    } catch (e) {}
     st.playing = true; st.paused = false;
   }
 }
@@ -3856,7 +3909,10 @@ function jukeDirectLoadElement(st) {
       el.onended = () => { if (alive() && !st.paused) { st.playing = false; jukeOnPlayerEnded(); } };
       try {
         const pr = el.play();
-        if (pr && pr.catch) pr.catch(() => { /* autoplay watchdog raises tap-to-join */ });
+        // iOS Safari rejects instantly (NotAllowedError) when there's been
+        // no recent gesture — raise the global pill NOW instead of waiting
+        // ~12s for the autoplay watchdog. The watchdog stays as backup.
+        if (pr && pr.catch) pr.catch((e) => { if (soundPillBlockedErr(e)) soundPillShow(); });
         st.playing = true; st.paused = false;
       } catch (e) { /* watchdog handles it */ }
     };
@@ -5862,8 +5918,16 @@ async function updateDebugHud() {
   }
   const L = [];
   L.push(`LIMBO net debug · build ${s.build} · ${s.enabled ? 'online' : 'OFFLINE (single-player)'}`);
-  L.push(`strategy: ${s.strategy} · room: ${s.roomKey}`);
-  L.push(`peers: ${s.peerCount} · turn user: ${s.turnUser}`);
+  // (build 30) parallel strategies: torrent + nostr rooms at once, peer sets merged
+  if (s.strategies) {
+    L.push('paths: ' + s.strategies.map((p) =>
+      `${p.name}${p.loaded ? '✓' : '✗'}${p.joined ? ` room(${p.conns})` : ''}`
+    ).join(' · ') + ` · room: ${s.roomKey}`);
+  }
+  L.push(`peers: ${s.peerCount} · turn user: ${s.turnUser} · cid: ${s.clientId || '?'}`);
+  if (s.iceRetry) {
+    L.push(`ice retry: attempt ${s.iceRetry.attempt} in ${(s.iceRetry.inMs / 1000).toFixed(0)}s`);
+  }
   // (a) relay websocket connectivity — open vs shut per pinned relay
   if (s.relays) {
     L.push('relays: ' + s.relays.map((r) => `${r.host}${r.open ? '✓' : '✗'}`).join(' '));
@@ -5907,6 +5971,9 @@ driftBtn.addEventListener('click', () => {
   myName = raw;
   try { localStorage.setItem('limbo_name', raw); } catch (e) { /* ignore */ }
   audio.init(active ? active.root : NEXUS_DEF.root);
+  // iOS Safari may still park the fresh context in 'suspended' — resume()
+  // inside THIS gesture is the one call iOS reliably honors.
+  try { if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume(); } catch (e) {}
   try { if (localStorage.getItem('limbo_muted')) setMuted(audio.toggleMute()); } catch (e) { /* ignore */ }
   // Build 25: the tap is a user gesture — warm the jukebox provider players
   // now so the first queued track starts fast.
