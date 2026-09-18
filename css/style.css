@@ -943,7 +943,7 @@ html, body {
 }
 #jam-panel.onbeat #jam-beat-dots span.on { transform: scale(1.35); }
 
-/* ---------- community wall paint mode (build 18) ---------- */
+/* ---------- community wall paint mode (build 29: full-screen phone-first redo) ---------- */
 #paint-btn {
   position: fixed; bottom: 224px; left: 50%; transform: translateX(-50%);
   z-index: 48;
@@ -957,75 +957,79 @@ html, body {
 #paint-btn:active { background: rgba(255, 122, 217, 0.25); }
 #paint-overlay {
   position: fixed; inset: 0; z-index: 55;
-  background: rgba(2, 4, 10, 0.94);
+  background: #05060d; /* fully opaque: the game scene never shows through */
   display: flex; flex-direction: column;
-  padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+  padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
   user-select: none; -webkit-user-select: none;
 }
 .paint-head {
-  display: flex; justify-content: space-between; align-items: center;
-  letter-spacing: 0.3em; font-size: 12px; color: #ffc4ec;
-  margin-bottom: 10px;
+  flex: 0 0 auto;
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  margin-bottom: 8px;
 }
-.paint-head-btns { display: flex; gap: 8px; }
+.paint-head > span {
+  letter-spacing: 0.22em; font-size: 12px; color: #ffc4ec;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.paint-head-btns { display: flex; gap: 8px; flex-shrink: 0; }
 .paint-head-btns button {
   background: rgba(255, 122, 217, 0.10);
   border: 1px solid rgba(255, 122, 217, 0.5); border-radius: 999px;
   color: #ffc4ec; font-family: inherit; font-size: 11px;
-  letter-spacing: 0.18em; text-transform: uppercase;
-  padding: 10px 18px; min-height: 44px;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  padding: 10px 16px; min-height: 44px;
   cursor: pointer; touch-action: manipulation;
 }
 #paint-wrap {
-  flex: 1; min-height: 0;
-  display: flex; align-items: center; justify-content: center;
+  flex: 1 1 auto; min-height: 0; width: 100%;
+  display: flex; align-items: stretch; justify-content: stretch;
 }
 #paint-canvas {
-  max-width: 100%; max-height: 100%;
-  aspect-ratio: 2 / 1;
-  width: min(100%, calc((100vh - 260px) * 2));
+  width: 100%; height: 100%;
+  object-fit: contain; /* 2:1 wall canvas letterboxes, never distorts */
   border: 1px solid rgba(255, 122, 217, 0.4); border-radius: 8px;
   background: #0b0b13;
   touch-action: none; cursor: crosshair;
 }
-.paint-tools {
-  display: flex; justify-content: space-between; align-items: center;
-  gap: 10px; margin-top: 10px;
+#paint-palette {
+  flex: 0 0 auto;
+  display: flex; flex-direction: row; gap: 10px;
+  overflow-x: auto; overflow-y: hidden;
+  padding: 10px 2px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
 }
-#paint-palette { display: flex; gap: 8px; flex-wrap: wrap; }
+#paint-palette::-webkit-scrollbar { display: none; }
 .paint-swatch {
-  width: 40px; height: 40px; border-radius: 50%;
+  flex: 0 0 auto;
+  width: 44px; height: 44px; border-radius: 50%;
   border: 2px solid rgba(255, 255, 255, 0.25);
   cursor: pointer; touch-action: manipulation; padding: 0;
 }
 .paint-swatch.sel { border-color: #fff; box-shadow: 0 0 10px rgba(255, 255, 255, 0.5); }
-#paint-eraser {
-  flex-shrink: 0; height: 44px; border-radius: 999px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px dashed rgba(255, 255, 255, 0.45);
-  color: #e8e8f2; font-family: inherit; font-size: 12px; letter-spacing: 0.08em;
-  padding: 0 16px; cursor: pointer; touch-action: manipulation;
+.paint-tools {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  gap: 6px; padding-top: 2px;
 }
-#paint-eraser.sel { border-style: solid; border-color: #fff; background: rgba(255, 255, 255, 0.14); }
-#paint-blend {
-  flex-shrink: 0; height: 44px; border-radius: 999px;
+.paint-tools > button {
+  flex: 0 1 auto; min-height: 44px;
+  border-radius: 999px;
   background: rgba(255, 255, 255, 0.05);
-  border: 1px dashed rgba(255, 255, 255, 0.45);
-  color: #e8e8f2; font-family: inherit; font-size: 12px; letter-spacing: 0.08em;
-  padding: 0 16px; cursor: pointer; touch-action: manipulation;
+  color: #e8e8f2; font-family: inherit; font-size: 11px; letter-spacing: 0.06em;
+  padding: 0 10px; white-space: nowrap;
+  cursor: pointer; touch-action: manipulation;
 }
-#paint-blend.sel { border-style: solid; border-color: #fff; background: rgba(255, 255, 255, 0.14); }
-#paint-undo {
-  flex-shrink: 0; height: 44px; border-radius: 999px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.45);
-  color: #e8e8f2; font-family: inherit; font-size: 12px; letter-spacing: 0.08em;
-  padding: 0 16px; cursor: pointer; touch-action: manipulation;
+#paint-eraser, #paint-blend { border: 1px dashed rgba(255, 255, 255, 0.45); }
+#paint-undo { border: 1px solid rgba(255, 255, 255, 0.45); }
+#paint-eraser.sel, #paint-blend.sel {
+  border-style: solid; border-color: #fff; background: rgba(255, 255, 255, 0.14);
 }
 #paint-undo:active { background: rgba(255, 255, 255, 0.16); }
-#paint-sizes { display: flex; gap: 8px; }
+#paint-sizes { display: flex; gap: 6px; flex-shrink: 0; }
 #paint-sizes button {
-  width: 44px; height: 44px; border-radius: 50%;
+  width: 42px; height: 44px; border-radius: 50%;
   background: rgba(255, 122, 217, 0.08);
   border: 1px solid rgba(255, 122, 217, 0.4);
   color: #ffc4ec; font-family: inherit; font-size: 12px;
@@ -1033,8 +1037,9 @@ html, body {
 }
 #paint-sizes button.sel { background: rgba(255, 122, 217, 0.3); border-color: #ffc4ec; }
 .paint-hint {
-  margin-top: 8px; text-align: center;
-  font-size: 11px; letter-spacing: 0.12em; color: var(--ink-faint);
+  flex: 0 0 auto;
+  margin-top: 6px; text-align: center;
+  font-size: 10px; letter-spacing: 0.12em; color: var(--ink-faint);
 }
 
 /* ---------- jukebox: button + panel (build 21) ---------- */
