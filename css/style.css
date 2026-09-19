@@ -1085,6 +1085,34 @@ html, body {
   cursor: pointer; touch-action: manipulation;
 }
 #juke-btn:active { background: rgba(141, 255, 122, 0.25); }
+
+/* ---------- journey room: like + follow pill (build 33) ---------- */
+#juke-social-pill {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: 356px; z-index: 48;
+  display: flex; gap: 10px; align-items: center;
+}
+#juke-social-pill button {
+  background: rgba(4, 10, 20, 0.82);
+  border: 1px solid rgba(122, 242, 255, 0.5); border-radius: 999px;
+  color: #d2f6ff; font-family: inherit; font-size: 14px;
+  padding: 10px 18px; min-height: 44px;
+  cursor: pointer; touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+#juke-social-pill button.liked { border-color: #ff6b9d; color: #ffb3cb; }
+#juke-follow-menu {
+  position: absolute; top: calc(100% + 8px); right: 0;
+  background: rgba(4, 10, 20, 0.96);
+  border: 1px solid rgba(122, 242, 255, 0.4); border-radius: 12px;
+  padding: 6px; min-width: 180px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+#juke-follow-menu a {
+  color: #d2f6ff; text-decoration: none; font-size: 14px;
+  padding: 10px 14px; border-radius: 8px;
+}
+#juke-follow-menu a:active { background: rgba(122, 242, 255, 0.15); }
 #juke-panel {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
   max-height: 72vh; overflow-y: auto;
