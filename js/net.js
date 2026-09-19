@@ -76,7 +76,7 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '32';
+const BUILD = '33';
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
@@ -133,6 +133,7 @@ const ACTION_CBS = {
   jukeFileReq: 'onJukeFileReqCb',
   jukeFileChunk: 'onJukeFileChunkCb',
   jukeFileHave: 'onJukeFileHaveCb',
+  jukeLike: 'onJukeLikeCb', // build 33: P2P likes for the jukebox track
 };
 const BROADCAST_ACTIONS = Object.keys(ACTION_CBS).filter(
   (n) => n !== 'jukeFileReq' && n !== 'jukeFileChunk'

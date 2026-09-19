@@ -10,8 +10,9 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=32';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=32';
+import { LimboNet } from './net.js?v=33';
+import { computeFlocks, FLOCK_R } from './flock.js?v=33';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=33';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -63,6 +64,11 @@ const TOTAL_ECHOES = REALM_DEFS.length * ECHOES_PER_REALM;
    REALM_DEFS-based math (echo totals, unlock thresholds, prints) moves. */
 const SOUND_DEF = { key: 'soundroom', name: 'SOUND ROOM', accent: 0xffc24d, root: 98.0 };
 const SOUND_ROOM_KEY = SOUND_DEF.key; // world key used by goTo()
+/* The endless journey (build 33): album-release room. Endless forward
+   flight through cycling procedural biomes; orbs that bunch up fall into a
+   bird-flock V and slipstream faster. Its own P2P room, like the sound room. */
+const JOURNEY_DEF = { key: 'journey', name: 'ENDLESS JOURNEY', accent: 0x7af2ff, root: 110.0 };
+const JOURNEY_ROOM_KEY = JOURNEY_DEF.key;
 const NEXUS_BOUND = 40;       // horizontal leash in the hub
 const PORTAL_TRIGGER = 3.0;   // wisp-to-portal distance that teleports
 const ECHO_TRIGGER = 2.6;     // wisp-to-echo distance that collects
@@ -113,6 +119,12 @@ const paintSizesEl    = document.getElementById('paint-sizes');
 const paintDoneBtn    = document.getElementById('paint-done');
 const jukeBtn         = document.getElementById('juke-btn');
 const jukePanel       = document.getElementById('juke-panel');
+// Journey room: like the jukebox track + follow Holowatts (build 33).
+const jukeSocialPill  = document.getElementById('juke-social-pill');
+const jukeLikeBtn     = document.getElementById('juke-like-btn');
+const jukeLikeCount   = document.getElementById('juke-like-count');
+const jukeFollowBtn   = document.getElementById('juke-follow-btn');
+const jukeFollowMenu  = document.getElementById('juke-follow-menu');
 const paintEraserBtn  = document.getElementById('paint-eraser');
 const paintUndoBtn    = document.getElementById('paint-undo');
 const paintBlendBtn   = document.getElementById('paint-blend');
@@ -133,6 +145,7 @@ if (nameInput && myName !== 'drifter') nameInput.value = myName;
 function roomKeyFor(worldKey) {
   if (worldKey === 'nexus') return 'limbo-nexus';
   if (worldKey === SOUND_ROOM_KEY) return 'limbo-realm-5';
+  if (worldKey === JOURNEY_ROOM_KEY) return 'limbo-realm-6';
   return 'limbo-realm-' + worldKey.replace('realm', '');
 }
 
@@ -724,6 +737,7 @@ function livePresenceFor(name) {
 function realmDisplayName(key) {
   if (key === 'nexus') return NEXUS_DEF.name;
   if (key === SOUND_ROOM_KEY) return SOUND_DEF.name;
+  if (key === JOURNEY_ROOM_KEY) return JOURNEY_DEF.name;
   const d = REALM_DEFS.find((r) => r.key === key);
   return d ? d.name : String(key || '').toUpperCase();
 }
@@ -798,15 +812,21 @@ function roomAnalyserGet(create) {
   return roomAnalyser;
 }
 
-/* Sound-room chrome: show/hide the room's buttons when we drift between
-   rooms. (Build 28: the DJ HUD line and go-live button are gone.) */
+/* Room chrome: show/hide each room's buttons when we drift between
+   rooms. (Build 28: the DJ HUD line and go-live button are gone.)
+   Build 33: the jukebox also plays in the endless journey — each music
+   room gets its own listening party. Jam + paint stay sound-room only. */
+function inMusicRoom() {
+  return !!(active && (active.key === SOUND_ROOM_KEY || active.key === JOURNEY_ROOM_KEY));
+}
 function renderRoomChrome() {
-  const inRoom = !!(active && active.key === SOUND_ROOM_KEY);
-  if (jamBtn) jamBtn.style.display = inRoom ? '' : 'none';
-  if (paintBtn) paintBtn.style.display = inRoom ? '' : 'none';
-  if (jukeBtn) jukeBtn.style.display = inRoom ? '' : 'none';
-  if (!inRoom && paint.open) setPaintOpen(false); // paint mode can't leave the room
-  if (!inRoom) jukeLeaveRoom(); // the jukebox only plays in the sound room
+  const inSound = !!(active && active.key === SOUND_ROOM_KEY);
+  const inMusic = inMusicRoom();
+  if (jamBtn) jamBtn.style.display = inSound ? '' : 'none';
+  if (paintBtn) paintBtn.style.display = inSound ? '' : 'none';
+  if (jukeBtn) jukeBtn.style.display = inMusic ? '' : 'none';
+  if (!inSound && paint.open) setPaintOpen(false); // paint mode can't leave the room
+  if (!inMusic) jukeLeaveRoom(); // the jukebox only plays in the music rooms
 }
 
 /* Make sure the WebAudio engine is up and running. The drift tap calls
@@ -4100,6 +4120,17 @@ function handleJukeState(d, peerId) {
   } else renderJuke();
 }
 
+/* ---------- journey room: like + follow (build 33) ---------- */
+if (jukeLikeBtn) jukeLikeBtn.addEventListener('click', () => { jukeSendLike(); jukeLikeBtn.blur(); });
+if (jukeFollowBtn) jukeFollowBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (jukeFollowMenu) jukeFollowMenu.style.display = jukeFollowMenu.style.display === 'none' ? '' : 'none';
+  jukeFollowBtn.blur();
+});
+document.addEventListener('click', () => {
+  if (jukeFollowMenu && jukeFollowMenu.style.display !== 'none') jukeFollowMenu.style.display = 'none';
+});
+
 /* ---------- leaving the room ---------- */
 
 function jukeLeaveRoom() {
@@ -4897,6 +4928,44 @@ function makeSoundTexture() {
   return tex;
 }
 
+/* Procedural portal art for the journey room: a migrating-bird V of
+   chevrons on deep blue — the flock, heading somewhere. */
+function makeJourneyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#040a18';
+  g.fillRect(0, 0, 256, 256);
+  const rnd = mulberry32(777);
+  // faint stars
+  g.fillStyle = '#bfe2ff';
+  for (let i = 0; i < 40; i++) {
+    g.globalAlpha = 0.25 + rnd() * 0.5;
+    g.fillRect(rnd() * 256, rnd() * 256, 2, 2);
+  }
+  g.globalAlpha = 1;
+  // bird chevrons in a V, leader at the apex
+  g.strokeStyle = '#7af2ff';
+  g.lineWidth = 5;
+  g.lineCap = 'round';
+  const bird = (x, y, s, a) => {
+    g.globalAlpha = a;
+    g.beginPath();
+    g.moveTo(x - s, y);
+    g.quadraticCurveTo(x - s * 0.3, y - s * 0.5, x, y);
+    g.quadraticCurveTo(x + s * 0.3, y - s * 0.5, x + s, y);
+    g.stroke();
+  };
+  bird(128, 70, 26, 1);
+  bird(88, 110, 20, 0.85); bird(168, 110, 20, 0.85);
+  bird(56, 148, 15, 0.7); bird(200, 148, 15, 0.7);
+  bird(96, 150, 15, 0.7); bird(160, 150, 15, 0.7);
+  g.globalAlpha = 1;
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 /* ---------------- the sound room (build 12) ----------------
    A 5th portal off the Nexus: a social listening space with a DJ booth
    and the four realm artworks hanging as a gallery. No echoes, no
@@ -5076,6 +5145,606 @@ function buildSoundRoom(textures) {
   };
 }
 
+/* ================= the endless journey (build 33) =================
+   Album-release room: orbs auto-fly an endless -Z route through cycling
+   procedural biomes (mountain -> city -> desert -> digital -> …) while
+   music plays. Orbs that bunch up fall into a migrating-bird V — the
+   furthest-forward orb is the leader at the apex — and the whole flock
+   slipstreams 1.35x faster.
+
+   Music priority: live jukebox > hosted album (assets/album/) > generative
+   ambient. The biome shift is derived from the wall clock + the leader's z,
+   so every client renders the same world without a leader election. */
+
+const J_BASE_SPEED = 14;      // auto-flight speed, units/s
+const J_SLIPSTREAM = 1.35;    // flock speed multiplier — the whole V surges
+const J_STEER_SPEED = 17;     // lateral/vertical steer speed
+const J_BOUND_X = 34, J_MIN_Y = 2.5, J_MAX_Y = 44;
+const J_CHUNK_LEN = 160, J_AHEAD = 5, J_BEHIND = 1, J_PER_BIOME = 4;
+const J_BIOMES = ['mountain', 'city', 'desert', 'digital'];
+const J_BIOME_STYLE = {
+  mountain: { bg: 0x0d1330, fog: 0x1a2456, fogD: 0.010 },
+  city:     { bg: 0x05060f, fog: 0x0a0d1f, fogD: 0.014 },
+  desert:   { bg: 0x201009, fog: 0x33200f, fogD: 0.010 },
+  digital:  { bg: 0x020208, fog: 0x0a0618, fogD: 0.013 },
+};
+const J_HINT = 'DRAG — STEER · FLY CLOSE TO FLOCK + GO FASTER · GATE AHEAD RETURNS TO THE NEXUS';
+
+/* Shared materials — built once, never per chunk. Geometries are per-chunk
+   (small) and disposed on recycle. */
+const _jm = {};
+function journeyMats() {
+  if (_jm.done) return _jm;
+  _jm.terrainMtn = new THREE.MeshLambertMaterial({ color: 0x5a6da8, flatShading: true, emissive: 0x11162e });
+  _jm.terrainDst = new THREE.MeshLambertMaterial({ color: 0xc08a4a, flatShading: true, emissive: 0x1a0e04 });
+  _jm.peak = new THREE.MeshLambertMaterial({ color: 0x2a3560, flatShading: true, emissive: 0x0a0e22 });
+  _jm.cityGround = new THREE.MeshLambertMaterial({ color: 0x07080f });
+  _jm.rock = new THREE.MeshLambertMaterial({ color: 0x7a5a38, flatShading: true });
+  _jm.digitalGround = new THREE.MeshBasicMaterial({ color: 0x020208 });
+  _jm.digitalGrid = new THREE.LineBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.32 });
+  _jm.floater = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  // City windows: one shared emissive texture for every building.
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  const g = c.getContext('2d');
+  g.fillStyle = '#05060a'; g.fillRect(0, 0, 64, 64);
+  const rnd = mulberry32(99);
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+    g.fillStyle = rnd() < 0.45 ? '#ffd27a' : '#101320';
+    g.globalAlpha = rnd() < 0.45 ? 0.95 : 1;
+    g.fillRect(4 + x * 7, 4 + y * 7, 4, 4);
+  }
+  g.globalAlpha = 1;
+  const wtex = new THREE.CanvasTexture(c);
+  wtex.colorSpace = THREE.SRGBColorSpace;
+  _jm.city = new THREE.MeshLambertMaterial({
+    color: 0x11141f, emissive: 0xffffff, emissiveMap: wtex, emissiveIntensity: 0.85,
+  });
+  _jm.done = true;
+  return _jm;
+}
+
+let _jdummyObj = null; // lazy Object3D for instanced chunk matrices
+function _jDummy() {
+  if (!_jdummyObj) _jdummyObj = new THREE.Object3D();
+  return _jdummyObj;
+}
+
+function journeyDisplace(geo, fn) {
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    p.setY(i, fn(p.getX(i), p.getZ(i)));
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function buildJourneyChunk(i, biome) {
+  const M = journeyMats();
+  const group = new THREE.Group();
+  const zc = -(i + 0.5) * J_CHUNK_LEN; // chunk center
+  group.position.z = zc;
+  const rnd = mulberry32(i * 7919 + 11);
+  const L = J_CHUNK_LEN + 80;
+  const dummy = _jDummy();
+
+  if (biome === 'mountain') {
+    const g = journeyDisplace(
+      new THREE.PlaneGeometry(280, L, 22, 12).rotateX(-Math.PI / 2),
+      (x, z) => {
+        const corridor = Math.min(1, Math.abs(x) / 55);
+        const k = corridor * corridor; // flat flyable corridor at x=0
+        return k * (Math.sin(x * 0.045 + i * 1.3) * Math.cos(z * 0.05 + i * 2.3) * 16
+          + Math.sin(x * 0.11 + i * 1.1) * Math.sin(z * 0.09 + i * 0.7) * 7
+          + Math.sin(x * 0.23 + i * 3.7) * 2.5);
+      });
+    group.add(new THREE.Mesh(g, M.terrainMtn));
+    for (let pI = 0; pI < 3; pI++) {
+      const peak = new THREE.Mesh(new THREE.ConeGeometry(26 + rnd() * 22, 70 + rnd() * 60, 5), M.peak);
+      peak.position.set((rnd() < 0.5 ? -1 : 1) * (95 + rnd() * 40), 18, (rnd() - 0.5) * L * 0.8);
+      group.add(peak);
+    }
+  } else if (biome === 'city') {
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(280, L).rotateX(-Math.PI / 2), M.cityGround);
+    ground.position.y = -0.5;
+    group.add(ground);
+    const N = 40;
+    const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), M.city, N);
+    for (let b = 0; b < N; b++) {
+      const w = 6 + rnd() * 9, dpt = 6 + rnd() * 9, h = 10 + rnd() * 36;
+      const side = rnd() < 0.5 ? -1 : 1;
+      dummy.position.set(side * (26 + rnd() * 95), h / 2 - 0.5, (rnd() - 0.5) * L * 0.9);
+      dummy.scale.set(w, h, dpt);
+      dummy.rotation.set(0, 0, 0);
+      dummy.updateMatrix();
+      inst.setMatrixAt(b, dummy.matrix);
+    }
+    inst.instanceMatrix.needsUpdate = true;
+    group.add(inst);
+  } else if (biome === 'desert') {
+    const g = journeyDisplace(
+      new THREE.PlaneGeometry(280, L, 20, 10).rotateX(-Math.PI / 2),
+      (x, z) => {
+        const k = 0.25 + 0.75 * Math.min(1, Math.abs(x) / 45);
+        return k * (Math.sin(x * 0.03 + i * 1.7) * Math.sin(z * 0.028 + i * 0.4) * 8
+          + Math.sin(x * 0.08 + i * 2.9) * 2.6);
+      });
+    group.add(new THREE.Mesh(g, M.terrainDst));
+    const rocks = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1.4), M.rock, 12);
+    for (let rI = 0; rI < 12; rI++) {
+      const s = 0.8 + rnd() * 3;
+      dummy.position.set((rnd() - 0.5) * 220, s * 0.4, (rnd() - 0.5) * L * 0.9);
+      dummy.scale.set(s, s * 0.7, s);
+      dummy.rotation.set(rnd() * 3, rnd() * 3, 0);
+      dummy.updateMatrix();
+      rocks.setMatrixAt(rI, dummy.matrix);
+    }
+    rocks.instanceMatrix.needsUpdate = true;
+    group.add(rocks);
+  } else { // digital realm
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(280, L).rotateX(-Math.PI / 2), M.digitalGround);
+    group.add(ground);
+    const gridGeo = new THREE.WireframeGeometry(new THREE.PlaneGeometry(280, L, 28, 16));
+    gridGeo.rotateX(-Math.PI / 2);
+    const grid = new THREE.LineSegments(gridGeo, M.digitalGrid);
+    grid.position.y = 0.3;
+    group.add(grid);
+    const N = 14;
+    const fl = new THREE.InstancedMesh(new THREE.OctahedronGeometry(2.4), M.floater, N);
+    const cols = [new THREE.Color(0x00e5ff), new THREE.Color(0xff4fd8), new THREE.Color(0x7a5cff)];
+    for (let fI = 0; fI < N; fI++) {
+      dummy.position.set((rnd() - 0.5) * 200, 6 + rnd() * 26, (rnd() - 0.5) * L * 0.9);
+      dummy.scale.setScalar(0.6 + rnd() * 1.6);
+      dummy.rotation.set(0, 0, 0);
+      dummy.updateMatrix();
+      fl.setMatrixAt(fI, dummy.matrix);
+      fl.setColorAt(fI, cols[fI % 3]);
+    }
+    fl.instanceMatrix.needsUpdate = true;
+    if (fl.instanceColor) fl.instanceColor.needsUpdate = true;
+    group.add(fl);
+  }
+  return { group, biome, index: i };
+}
+
+function disposeJourneyChunk(c) {
+  c.group.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    // materials are shared/cached — never disposed here
+  });
+}
+
+/* ---------------- journey state ---------------- */
+
+const journey = {
+  chunks: new Map(),   // index -> chunk
+  appliedShift: -1,
+  pinShift: null,      // test seam: force the biome shift
+  assign: null,        // flock hysteresis, fed back into computeFlocks
+  inFlock: false,
+  myFlockSize: 1,
+  mySlot: null,    // my V-slot target (null when I'm the leader)
+  flockT: 0, musicT: 0,
+  lastSpeed: 0, // current forward speed (test seam reads the slipstream)
+  steer: { id: null, lx: 0, ly: 0, x: 0, y: 0 },
+  speedLines: null, speedPos: null,
+  gate: null,
+  gateZ: -350, // world-anchored: the gate stays put so you can catch it
+  stars: null,
+  regening: false,
+  lastJukeId: null,
+  hintPrev: '',
+};
+const _jTmpA = new THREE.Vector3();
+const _jTmpB = new THREE.Vector3();
+const _jBgT = new THREE.Color();
+const _jFogT = new THREE.Color();
+
+function journeyCurChunk() {
+  return Math.max(0, Math.floor(-wisp.position.z / J_CHUNK_LEN));
+}
+function journeyChunkBiome(i, shift) {
+  return J_BIOMES[(((Math.floor(i / J_PER_BIOME) + shift) % 4) + 4) % 4];
+}
+function journeyLeaderZ() {
+  let z = wisp.position.z;
+  for (const v of peerPositions.values()) if (v.z < z) z = v.z;
+  return z;
+}
+/* Wall-clock deterministic: every client derives the same shift, so the
+   whole flock sees the same world. Track changes (album or jukebox) turn
+   the world; distance keeps it turning on long stretches. */
+function journeyShiftNow() {
+  if (journey.pinShift != null) return journey.pinShift;
+  const t = Date.now();
+  let s;
+  if (juke.now && !juke.now.stopped) s = Math.floor((t - (juke.nowStartedAt || t)) / 90000);
+  else {
+    const an = albumNow();
+    s = an ? an.count : Math.floor(t / 150000);
+  }
+  s += Math.floor(Math.max(0, -journeyLeaderZ()) / 1400);
+  return s;
+}
+
+function journeyEnsureChunks(scene) {
+  const cur = journeyCurChunk();
+  const shift = journey.appliedShift;
+  for (let i = cur - J_BEHIND; i <= cur + J_AHEAD; i++) {
+    if (i < 0 || journey.chunks.has(i)) continue;
+    const c = buildJourneyChunk(i, journeyChunkBiome(i, shift));
+    journey.chunks.set(i, c);
+    scene.add(c.group);
+  }
+  for (const [i, c] of journey.chunks) {
+    if (i < cur - J_BEHIND - 2 || i > cur + J_AHEAD + 3) {
+      scene.remove(c.group);
+      disposeJourneyChunk(c);
+      journey.chunks.delete(i);
+    }
+  }
+}
+
+function journeyApplyShift(scene) {
+  const shift = journeyShiftNow();
+  if (shift === journey.appliedShift || journey.regening) return;
+  if (journey.appliedShift < 0) { // first build — no fade needed
+    journey.appliedShift = shift;
+    journeyEnsureChunks(scene);
+    return;
+  }
+  journey.regening = true;
+  journey.appliedShift = shift;
+  try { fadeEl.classList.add('on'); } catch (e) {}
+  setTimeout(() => {
+    try {
+      for (const [, c] of journey.chunks) { scene.remove(c.group); disposeJourneyChunk(c); }
+      journey.chunks.clear();
+      journeyEnsureChunks(scene);
+    } catch (e) {}
+    try { fadeEl.classList.remove('on'); } catch (e) {}
+    journey.regening = false;
+  }, 340);
+}
+
+/* ---------------- hosted album (build 33) ----------------
+   assets/album/album.json: { title, tracks: [{file, title}] }.
+   Files sit next to it: assets/album/01-into-the-drift.mp3 …
+   The album loops forever on a fixed epoch, so every client plays the
+   same track at the same offset — a shared listening party with no
+   leader election. Empty/missing folder -> state 'none', fallbacks cover. */
+const ALBUM_EPOCH = Date.UTC(2026, 0, 1);
+const album = {
+  state: 'idle', // idle|loading|ready|none
+  title: '', tracks: [], totalMs: 0, el: null, trackIdx: -1, retryT: 0,
+};
+function albumProbeDuration(url) {
+  return new Promise((resolve, reject) => {
+    try {
+      const a = new Audio();
+      a.preload = 'metadata';
+      const to = setTimeout(() => { try { a.src = ''; } catch (e) {} reject(new Error('timeout')); }, 8000);
+      a.onloadedmetadata = () => { clearTimeout(to); resolve(a.duration || 0); };
+      a.onerror = () => { clearTimeout(to); reject(new Error('bad file')); };
+      a.src = url;
+    } catch (e) { reject(e); }
+  });
+}
+async function albumEnsure() {
+  if (album.state !== 'idle') return;
+  album.state = 'loading';
+  try {
+    const r = await fetch('assets/album/album.json', { cache: 'no-store' });
+    if (!r.ok) throw new Error('no album.json');
+    const m = await r.json();
+    const listed = (m && Array.isArray(m.tracks) ? m.tracks : []).filter((t) => t && t.file).slice(0, 32);
+    if (!listed.length) throw new Error('no tracks listed');
+    album.title = String(m.title || 'the album');
+    const probed = await Promise.all(listed.map(async (t) => {
+      const secs = await albumProbeDuration('assets/album/' + t.file).catch(() => 0);
+      return { file: String(t.file), title: String(t.title || t.file), durationMs: Math.round(secs * 1000) };
+    }));
+    album.tracks = probed.filter((t) => t.durationMs > 0);
+    if (!album.tracks.length) throw new Error('no playable tracks');
+    album.totalMs = album.tracks.reduce((s, t) => s + t.durationMs, 0);
+    album.el = new Audio();
+    album.el.preload = 'auto';
+    album.el.volume = 0.85;
+    album.state = 'ready';
+  } catch (e) { album.state = 'none'; }
+}
+/* -> {idx, offsetMs, count} or null. count = absolute track number across loops. */
+function albumNow() {
+  if (album.state !== 'ready' || !album.totalMs) return null;
+  const el = Date.now() - ALBUM_EPOCH;
+  const pos = ((el % album.totalMs) + album.totalMs) % album.totalMs;
+  const loops = Math.floor(el / album.totalMs);
+  let acc = 0;
+  for (let i = 0; i < album.tracks.length; i++) {
+    const d = album.tracks[i].durationMs;
+    if (pos < acc + d) return { idx: i, offsetMs: pos - acc, count: loops * album.tracks.length + i };
+    acc += d;
+  }
+  return { idx: 0, offsetMs: 0, count: loops * album.tracks.length };
+}
+function albumPause() {
+  try { if (album.el && !album.el.paused) album.el.pause(); } catch (e) {}
+}
+function albumPlayTrack(idx, offsetMs) {
+  const tr = album.tracks[idx];
+  const el = album.el;
+  if (!tr || !el) return;
+  const same = !!el.src && el.src.endsWith('/' + tr.file);
+  const go = () => {
+    try { el.currentTime = Math.max(0, offsetMs / 1000); } catch (e) {}
+    try {
+      const p = el.play();
+      if (p && p.catch) p.catch(() => { album.retryT = 5; }); // iOS gesture block: retry soon
+    } catch (e) { album.retryT = 5; }
+  };
+  if (!same) {
+    el.src = 'assets/album/' + tr.file;
+    el.oncanplay = () => { el.oncanplay = null; go(); };
+    try { el.load(); } catch (e) {}
+  } else go();
+}
+
+/* Music priority: live jukebox > hosted album > generative ambient. */
+function journeyMusicTick() {
+  const jukeOn = !!(juke.now && !juke.now.stopped);
+  if (jukeOn) {
+    albumPause();
+    audio.setAuraDucked(true);
+    return;
+  }
+  const an = albumNow();
+  if (an && album.el) {
+    audio.setAuraDucked(true);
+    const el = album.el;
+    if (album.trackIdx !== an.idx || el.paused) {
+      album.trackIdx = an.idx;
+      albumPlayTrack(an.idx, an.offsetMs);
+    } else {
+      // drift correction: if we're >4s off the wall clock, re-seek
+      try {
+        const off = el.currentTime * 1000;
+        if (Math.abs(off - an.offsetMs) > 4000 && an.offsetMs < album.tracks[an.idx].durationMs - 2000) {
+          el.currentTime = an.offsetMs / 1000;
+        }
+      } catch (e) {}
+    }
+    if (album.retryT > 0 && el.paused) {
+      album.retryT -= 0.5;
+      if (album.retryT <= 0) albumPlayTrack(album.trackIdx, (albumNow() || an).offsetMs);
+    }
+    return;
+  }
+  albumPause();
+  audio.setAuraDucked(false); // generative ambient carries the room
+}
+
+/* ---------------- like / follow (build 33) ----------------
+   P2P likes for the jukebox track, live counts, no persistence.
+   The pill only shows while a jukebox track is playing. */
+const jukeLikes = new Map(); // trackId -> Set(names)
+let jukeLikedNow = null;     // trackId this client liked
+function handleJukeLike(cid, d) {
+  if (!d || typeof d.trackId !== 'string' || !d.trackId) return;
+  const name = String(d.by || 'drifter').slice(0, 16) || 'drifter';
+  let s = jukeLikes.get(d.trackId);
+  if (!s) { s = new Set(); jukeLikes.set(d.trackId, s); }
+  s.add(name);
+  if (juke.now && juke.now.id === d.trackId) renderJukeSocial();
+}
+function jukeSendLike() {
+  if (!juke.now || juke.now.stopped) return;
+  const id = juke.now.id;
+  if (jukeLikedNow === id) return; // one like per track per drifter
+  jukeLikedNow = id;
+  handleJukeLike(net.clientId || 'self', { trackId: id, by: myName });
+  try { if (net.sendJukeLike) net.sendJukeLike({ trackId: id, by: myName }); } catch (e) {}
+}
+function renderJukeSocial() {
+  if (!jukeSocialPill) return;
+  const show = !!(active && active.key === JOURNEY_ROOM_KEY && juke.now && !juke.now.stopped);
+  jukeSocialPill.style.display = show ? '' : 'none';
+  if (!show) return;
+  const id = juke.now.id;
+  const n = (jukeLikes.get(id) || new Set()).size;
+  if (jukeLikeCount) jukeLikeCount.textContent = String(n);
+  if (jukeLikeBtn) {
+    const liked = jukeLikedNow === id;
+    jukeLikeBtn.classList.toggle('liked', liked);
+    const tn = jukeLikeBtn.firstChild;
+    if (tn) tn.textContent = liked ? '♥ ' : '♡ ';
+  }
+}
+
+/* ---------------- journey room world ---------------- */
+
+function makeSpeedLines() {
+  const N = 120;
+  const pos = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    pos[i * 3] = (Math.random() - 0.5) * 44;
+    pos[i * 3 + 1] = 8 + (Math.random() - 0.5) * 30;
+    pos[i * 3 + 2] = -Math.random() * 100;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const pts = new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0xbfefff, size: 0.4, transparent: true, opacity: 0.75,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  pts.visible = false;
+  pts.frustumCulled = false;
+  return pts;
+}
+
+function buildJourneyRoom() {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d1330);
+  scene.fog = new THREE.FogExp2(0x1a2456, 0.010);
+  scene.add(new THREE.HemisphereLight(0x9db4ff, 0x11122a, 1.25));
+  const sun = new THREE.DirectionalLight(0xfff2dd, 0.9);
+  sun.position.set(30, 60, 20);
+  scene.add(sun);
+  const stars = makeStars(500, 120, 260, 1.8, 0xcfe0ff);
+  scene.add(stars);
+  // The gate home: hovers ahead of the wisp — fly through it to return.
+  const { group, ring } = makePortal(makeJourneyTexture(), JOURNEY_DEF.accent, 'NEXUS', 2.4, 0.18);
+  scene.add(group);
+  const portals = [{ group, ring, pos: group.position.clone(), target: 'nexus', phase: 0, baseY: 0 }];
+  const speedLines = makeSpeedLines();
+  scene.add(speedLines);
+  journey.speedLines = speedLines;
+  journey.stars = stars;
+  journey.gate = portals[0];
+  return {
+    key: JOURNEY_ROOM_KEY, name: JOURNEY_DEF.name, root: JOURNEY_DEF.root,
+    scene, portals, echoes: [],
+    spawn: new THREE.Vector3(0, 8, 0), spawnYaw: 0, // face -Z, the endless route
+    bound: 'journey',
+    anim: { stars, speedLines },
+    attunedShown: true, // n/a: no echoes here
+    update(dt, t) { updateJourney(dt, t); },
+  };
+}
+
+function journeyOnEnter() {
+  // Fresh sky: drop any chunks from a previous visit.
+  for (const [, c] of journey.chunks) { try { active.scene.remove(c.group); } catch (e) {} disposeJourneyChunk(c); }
+  journey.chunks.clear();
+  journey.appliedShift = -1;
+  journey.assign = null;
+  journey.inFlock = false;
+  journey.myFlockSize = 1;
+  journey.regening = false;
+  journey.steer.x = 0; journey.steer.y = 0; journey.steer.id = null;
+  journey.gateZ = -350; // first gate home, 350 down the route
+  journey.lastJukeId = null;
+  journey.hintPrev = hintEl ? hintEl.textContent : '';
+  if (hintEl) hintEl.textContent = J_HINT;
+  albumEnsure(); // hosted album, if Joshua has sent tracks
+  if (journey.speedLines) journey.speedLines.visible = false;
+}
+
+function journeyOnLeave() {
+  albumPause();
+  for (const [, c] of journey.chunks) { try { active.scene.remove(c.group); } catch (e) {} disposeJourneyChunk(c); }
+  journey.chunks.clear();
+  journey.inFlock = false;
+  journey.steer.id = null; journey.steer.x = 0; journey.steer.y = 0;
+  try { wispGlow.scale.set(3.2, 3.2, 1); } catch (e) {}
+  try { wispCore.rotation.z = 0; } catch (e) {}
+  if (hintEl && journey.hintPrev) hintEl.textContent = journey.hintPrev;
+  if (jukeSocialPill) jukeSocialPill.style.display = 'none';
+  if (jukeFollowMenu) jukeFollowMenu.style.display = 'none';
+}
+
+/* The per-frame journey update: flight, steering, flocking, chunks, gate. */
+function updateJourney(dt, t) {
+  const scene = active.scene;
+  // --- flock (10Hz is plenty; positions broadcast at 12Hz) ---
+  journey.flockT += dt;
+  if (journey.flockT >= 0.1) {
+    journey.flockT = 0;
+    const members = [{ cid: net.clientId || 'self', x: wisp.position.x, y: wisp.position.y, z: wisp.position.z }];
+    for (const [cid, v] of peerPositions) members.push({ cid, x: v.x, y: v.y, z: v.z });
+    const r = computeFlocks(members, journey.assign);
+    journey.assign = r.assign;
+    const selfCid = net.clientId || 'self';
+    const mine = r.flocks.find((f) => f.slots.has(selfCid) || f.leaderCid === selfCid) || null;
+    journey.inFlock = !!mine;
+    journey.myFlockSize = mine ? mine.order.length + 1 : 1;
+    journey.mySlot = mine ? mine.slots.get(selfCid) || null : null; // leader: no slot
+  }
+  // --- flight: endless forward, slipstream when flocked ---
+  const speed = J_BASE_SPEED * (journey.inFlock ? J_SLIPSTREAM : 1);
+  journey.lastSpeed = speed;
+  // gentle pull into the V slot (damped — never snaps, never oscillates)
+  if (journey.mySlot) {
+    _jTmpA.set(journey.mySlot.x, journey.mySlot.y, journey.mySlot.z);
+    wisp.position.lerp(_jTmpA, 1 - Math.exp(-2.2 * dt));
+  }
+  // steering: touch drag + keys
+  let sx = journey.steer.x, sy = journey.steer.y;
+  if (!chatFocused) {
+    if (keys.ArrowLeft || keys.KeyA) sx -= 1;
+    if (keys.ArrowRight || keys.KeyD) sx += 1;
+    if (keys.ArrowUp || keys.KeyW) sy += 1;
+    if (keys.ArrowDown || keys.KeyS) sy -= 1;
+  }
+  sx = Math.max(-1, Math.min(1, sx));
+  sy = Math.max(-1, Math.min(1, sy));
+  wisp.position.x = Math.max(-J_BOUND_X, Math.min(J_BOUND_X, wisp.position.x + sx * J_STEER_SPEED * dt));
+  wisp.position.y = Math.max(J_MIN_Y, Math.min(J_MAX_Y, wisp.position.y + sy * J_STEER_SPEED * dt));
+  wisp.position.z -= speed * dt;
+  journey.steer.x *= Math.exp(-3 * dt); // drag stick relaxes
+  journey.steer.y *= Math.exp(-3 * dt);
+  // banking into the turn
+  try { wispCore.rotation.z += ((-sx * 0.4) - wispCore.rotation.z) * Math.min(1, dt * 6); } catch (e) {}
+  // camera basis for the shared follow-cam below
+  _fwd.set(0, 0, -1);
+  // --- world: biomes, chunks, atmosphere ---
+  journeyApplyShift(scene);
+  journeyEnsureChunks(scene);
+  const cur = journeyCurChunk();
+  const style = J_BIOME_STYLE[journeyChunkBiome(cur, journey.appliedShift)] || J_BIOME_STYLE.mountain;
+  const kk = 1 - Math.exp(-1.5 * dt);
+  scene.background.lerp(_jBgT.setHex(style.bg), kk);
+  scene.fog.color.lerp(_jFogT.setHex(style.fog), kk);
+  scene.fog.density += (style.fogD - scene.fog.density) * kk;
+  if (journey.stars) journey.stars.position.z = wisp.position.z - 120;
+  // --- the gate home is world-anchored ahead; fly through it to return ---
+  if (journey.gate) {
+    const gp = journey.gate.group.position;
+    const gx = wisp.position.x * 0.85; // drifts toward your line, stays catchable
+    gp.x += (gx - gp.x) * Math.min(1, dt * 2.5);
+    gp.y = Math.max(J_MIN_Y + 1, Math.min(J_MAX_Y - 2, wisp.position.y + 1.5 + Math.sin(t * 0.9) * 0.6));
+    gp.z = journey.gateZ; // fixed in the world — fly through the ring
+    journey.gate.ring.rotation.z += dt * 0.5;
+    journey.gate.pos.copy(gp);
+    // Flew past it (or around it): lay the next gate further down the route.
+    if (wisp.position.z < journey.gateZ - 25) journey.gateZ -= 600;
+  }
+  // --- slipstream visuals: speed lines + brighter trail ---
+  const sl = journey.speedLines;
+  if (sl) {
+    sl.visible = journey.inFlock;
+    if (sl.visible) {
+      const p = sl.geometry.attributes.position;
+      const arr = p.array;
+      for (let i = 0; i < arr.length; i += 3) {
+        arr[i + 2] += 90 * dt;
+        if (arr[i + 2] > wisp.position.z + 12) {
+          arr[i] = wisp.position.x + (Math.random() - 0.5) * 44;
+          arr[i + 1] = wisp.position.y + (Math.random() - 0.5) * 30;
+          arr[i + 2] = wisp.position.z - 90 - Math.random() * 20;
+        }
+      }
+      p.needsUpdate = true;
+      sl.material.opacity = 0.55 + Math.sin(t * 9) * 0.2;
+    }
+  }
+  try {
+    const gs = journey.inFlock ? 5.4 : 3.2;
+    const s = wispGlow.scale.x + (gs - wispGlow.scale.x) * Math.min(1, dt * 5);
+    wispGlow.scale.set(s, s, 1);
+  } catch (e) {}
+  // --- music + social, throttled ---
+  journey.musicT += dt;
+  if (journey.musicT >= 0.5) {
+    journey.musicT = 0;
+    journeyMusicTick();
+    if (juke.now && !juke.now.stopped && juke.now.id !== journey.lastJukeId) {
+      journey.lastJukeId = juke.now.id;
+      jukeLikedNow = null; // fresh track, fresh likes
+    }
+    renderJukeSocial();
+  }
+}
+
 function buildNexus(textures) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x020204);
@@ -5088,12 +5757,16 @@ function buildNexus(textures) {
   scene.add(starsFar, starsNear, dust.pts);
 
   const portals = [];
-  // The 4 realm portals + the sound room portal (build 12).
+  // The 4 realm portals + the sound room portal (build 12) + the endless
+  // journey portal (build 33).
   const portalDefs = REALM_DEFS.map((def) => ({
     key: def.key, name: def.name, accent: def.accent, tex: textures[def.key],
   })).concat([{
     key: SOUND_DEF.key, name: SOUND_DEF.name, accent: SOUND_DEF.accent,
     tex: makeSoundTexture(),
+  }, {
+    key: JOURNEY_DEF.key, name: JOURNEY_DEF.name, accent: JOURNEY_DEF.accent,
+    tex: makeJourneyTexture(),
   }]);
   portalDefs.forEach((def, i) => {
     const a = (i / portalDefs.length) * Math.PI * 2;
@@ -5291,6 +5964,7 @@ function finishBoot() {
     worlds.nexus = buildNexus(textures);
     for (const def of REALM_DEFS) worlds[def.key] = buildRealm(def, textures[def.key]);
     worlds[SOUND_DEF.key] = buildSoundRoom(textures);
+    worlds[JOURNEY_DEF.key] = buildJourneyRoom();
   } catch (err) {
     // Last resort: say so on screen instead of a dead "loading…" hang.
     loadingEl.firstElementChild.textContent = 'limbo failed to wake — reload to try again';
@@ -5509,6 +6183,14 @@ const joy = { id: null, ax: 0, ay: 0, x: 0, y: 0 };   // move stick, -1..1
 const look = { id: null, lx: 0, ly: 0 };              // look drag
 canvas.addEventListener('touchstart', (e) => {
   for (const t of e.changedTouches) {
+    if (active && active.key === JOURNEY_ROOM_KEY) {
+      // Endless journey: drag anywhere to steer the orb (no look-drag here).
+      if (journey.steer.id === null) {
+        journey.steer.id = t.identifier;
+        journey.steer.lx = t.clientX; journey.steer.ly = t.clientY;
+      }
+      continue;
+    }
     if (t.clientX < window.innerWidth / 2 && joy.id === null) {
       joy.id = t.identifier; joy.ax = t.clientX; joy.ay = t.clientY; joy.x = 0; joy.y = 0;
       joyBase.style.display = 'block';
@@ -5532,6 +6214,11 @@ canvas.addEventListener('touchmove', (e) => {
       pitch -= (t.clientY - look.ly) * 0.0042;
       pitch = Math.max(-1.45, Math.min(1.45, pitch));
       look.lx = t.clientX; look.ly = t.clientY;
+    } else if (active && active.key === JOURNEY_ROOM_KEY && t.identifier === journey.steer.id) {
+      // Journey steering: relative drag, up = climb.
+      journey.steer.x = Math.max(-1, Math.min(1, journey.steer.x + (t.clientX - journey.steer.lx) * 0.012));
+      journey.steer.y = Math.max(-1, Math.min(1, journey.steer.y - (t.clientY - journey.steer.ly) * 0.012));
+      journey.steer.lx = t.clientX; journey.steer.ly = t.clientY;
     }
   }
   e.preventDefault();
@@ -5540,6 +6227,7 @@ function endTouch(e) {
   for (const t of e.changedTouches) {
     if (t.identifier === joy.id) { joy.id = null; joy.x = 0; joy.y = 0; joyBase.style.display = 'none'; }
     if (t.identifier === look.id) look.id = null;
+    if (t.identifier === journey.steer.id) journey.steer.id = null;
   }
 }
 canvas.addEventListener('touchend', endTouch);
@@ -5560,6 +6248,8 @@ function goTo(key) {
   if (transitioning || !worlds[key]) return;
   // Leaving the sound room: stop the live relay + the mic automatically.
   if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) { jamMicOff(); }
+  // Leaving the journey: park the album, drop chunks, restore the wisp.
+  if (active && active.key === JOURNEY_ROOM_KEY && key !== JOURNEY_ROOM_KEY) { journeyOnLeave(); }
   transitioning = true;
   fadeEl.classList.add('on');
   setTimeout(() => {
@@ -5580,11 +6270,16 @@ function goTo(key) {
     // jukebox and metronome all ride the game master and are unaffected).
     audio.setAuraDucked(key === SOUND_ROOM_KEY);
     showTitleCard(active.name);
-    renderRoomChrome(); // show/hide the sound-room buttons for this room
+    renderRoomChrome(); // show/hide each room's buttons for this room
+    // Build 33: entering the journey resets the sky and starts the album
+    // probe; each music room gets a fresh listening party.
+    const musicRoom = key === SOUND_ROOM_KEY || key === JOURNEY_ROOM_KEY;
+    if (musicRoom) jukeLeaveRoom(); // fresh party per room — no stale queue
+    if (key === JOURNEY_ROOM_KEY) journeyOnEnter();
     // Community wall (build 18): late joiner asks the room for the current
     // canvas. Delayed so the data channel has a moment to connect; peers
     // with ink answer once per reqId (see handleWallSyncReq).
-    if (key === SOUND_ROOM_KEY && net.enabled && net.sendWallSyncReq) {
+    if (musicRoom && net.enabled && (net.sendWallSyncReq || net.sendJukeStateReq)) {
       const reqId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
       setTimeout(() => {
         if (active && active.key === SOUND_ROOM_KEY) {
@@ -5597,7 +6292,8 @@ function goTo(key) {
         }
         // Jukebox (build 21): same late-joiner pattern — ask the room for
         // the current queue + now-playing so we land in sync mid-track.
-        if (active && active.key === SOUND_ROOM_KEY && net.sendJukeStateReq) {
+        // Build 33: the journey room joins the party the same way.
+        if (active && inMusicRoom() && net.sendJukeStateReq) {
           try { net.sendJukeStateReq({ reqId: reqId + '-juke' }); } catch (e) { /* best effort */ }
         }
       }, 2000);
@@ -5792,6 +6488,7 @@ function handlePeerLeave(id) {
 
 // Wire the net callbacks once; rooms are (re)joined on start + portal hops.
 net.onWispCb = handleWisp;
+net.onJukeLikeCb = (cid, d) => handleJukeLike(cid, d); // build 33: track likes
 net.onPeerLeaveCb = handlePeerLeave;
 net.onChatCb = (d, peerId) => {
   if (!d) return;
@@ -6113,9 +6810,10 @@ function loop() {
     wall.texDirty = false;
   }
 
-  updatePlayer(dt);
-  checkPortals();
-  checkEchoes();
+  // The journey room drives its own flight model through active.update
+  // (build 33); every other room uses the free-fly wisp.
+  if (active.key !== JOURNEY_ROOM_KEY) updatePlayer(dt);
+  checkPortals();  checkEchoes();
 
   // Multiplayer: broadcast our wisp, ease remote wisps toward their targets.
   if (started) {
@@ -6204,6 +6902,10 @@ window.__limbo = {
   renderFriendsSection,
   goTo,
   activeKey: () => (active ? active.key : null),
+  journeyGateZ: () => (journey.gate ? +journey.gate.group.position.z.toFixed(1) : null),
+  journeySpeed: () => +journey.lastSpeed.toFixed(2),
+  /* build 33 test seam: drop the gate `d` units ahead (default 10) */
+  journeyDropGate: (d) => { journey.gateZ = wisp.position.z - (d || 10); },
   setPresence: (n, r) => net.setPresence(n, r),
   presencePayload: () => net._presencePayload(),
   lobbyPeers: () => [...net.lobbyPeers.entries()].map(([id, p]) => ({ id, ...p })),
@@ -6213,6 +6915,35 @@ window.__limbo = {
   joinLobby: () => net.joinLobby(),
   // sound room (build 12)
   SOUND_DEF,
+  // endless journey (build 33)
+  JOURNEY_DEF,
+  JOURNEY_ROOM_KEY,
+  journeyState: () => ({
+    key: active ? active.key : null,
+    x: +wisp.position.x.toFixed(2),
+    y: +wisp.position.y.toFixed(2),
+    z: +wisp.position.z.toFixed(2),
+    chunks: journey.chunks.size,
+    biome: journeyChunkBiome(journeyCurChunk(), journey.appliedShift),
+    shift: journey.appliedShift,
+    inFlock: journey.inFlock,
+    flockSize: journey.myFlockSize,
+    album: album.state,
+    albumTracks: album.tracks.length,
+    speedLines: !!(journey.speedLines && journey.speedLines.visible),
+    likePill: !!(jukeSocialPill && jukeSocialPill.style.display !== 'none'),
+  }),
+  journeyPinShift: (n) => { journey.pinShift = n; },
+  albumState: () => ({ state: album.state, tracks: album.tracks.map((t) => t.title) }),
+  jukeLikeCount: (id) => (jukeLikes.get(id) || new Set()).size,
+  /* build 33 test seam: fake a live jukebox track to drive the like pill */
+  jukeFakePlaying: (id) => {
+    juke.now = { id: String(id), stopped: false, title: 'test track' };
+    juke.nowStartedAt = Date.now();
+    journey.lastJukeId = null;
+    renderJukeSocial();
+  },
+  jukeClearFake: () => { juke.now = null; jukeLikedNow = null; renderJukeSocial(); },
   worldKeys: () => Object.keys(worlds),
   nexusPortals: () => (worlds.nexus ? worlds.nexus.portals.map((p) => p.target) : []),
   galleryFiles: () => (worlds.soundroom && worlds.soundroom.gallery ? worlds.soundroom.gallery.slice() : []),
