@@ -4,13 +4,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>LIMBO — a portal universe</title>
+<meta name="theme-color" content="#020204">
+<link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=33">
+<link rel="stylesheet" href="css/style.css?v=34">
 <script type="importmap">
 {
   "imports": {
     "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
   }
+}
+</script>
+<!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
+     Local files, not a CDN — the couch co-op ceremony must work offline. -->
+<script src="js/vendor/qrcode.js?v=34"></script>
+<script src="js/vendor/jsqr.js?v=34"></script>
+<!-- build 34: offline-first PWA — after one online visit the whole game
+     (including three.js) is cached and boots with zero bars. -->
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('sw.js').catch(function () {});
+  });
 }
 </script>
 </head>
@@ -206,6 +221,15 @@
     <button id="friend-add-btn">add</button>
   </div>
   <div id="friends-list"></div>
+  <!-- build 34: couch co-op (offline LAN multiplayer) lives next to the
+       friends list — the other multiplayer UI. -->
+  <div class="set-debug-head">COUCH CO-OP <span class="set-tiny">offline</span></div>
+  <div class="set-tiny">thanksgiving mode — no internet, just one android hotspot</div>
+  <div id="couch-set-row" class="couch-set-row">
+    <button id="set-couch-host">&#128225; host</button>
+    <button id="set-couch-join">&#128247; join</button>
+  </div>
+  <div id="couch-set-status" class="set-tiny" style="display:none"></div>
   <div class="set-debug-head">NET DEBUG</div>
   <div id="settings-debug"></div>
 </div>
@@ -217,6 +241,60 @@
   <div id="chat-row">
     <input id="chat-input" maxlength="140" enterkeyhint="send" placeholder="say something to the drifters here…" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="chat-send" aria-label="send">&#10148;</button>
+  </div>
+</div>
+
+<!-- build 34: couch co-op (offline LAN multiplayer) ceremony panel.
+     Host: shows an offer QR, then scans each guest's answer QR.
+     Guest: scans the host's offer QR, then shows their answer QR. -->
+<div id="couch-panel" style="display:none">
+  <div class="couch-head"><span>&#128715;&#65039; COUCH CO-OP</span><button id="couch-close" aria-label="close">&#10005;</button></div>
+
+  <div id="couch-home" class="couch-screen">
+    <p class="couch-blurb">no internet? no problem. one android hotspot becomes the whole network.</p>
+    <button id="couch-host-btn" class="couch-big-btn">&#128225; host a couch game</button>
+    <button id="couch-join-btn" class="couch-big-btn">&#128247; join a couch game</button>
+    <p class="couch-tiny">host from an android — iphones can join, but can't host.</p>
+  </div>
+
+  <div id="couch-host" class="couch-screen" style="display:none">
+    <ol class="couch-steps">
+      <li>on your <b>android</b>, turn on the <b>hotspot</b> in settings — no data needed</li>
+      <li>everyone joins that wifi</li>
+      <li>they open limbo &rarr; <b>join a couch game</b> &rarr; scan this code</li>
+    </ol>
+    <canvas id="couch-host-qr" class="couch-qr"></canvas>
+    <div id="couch-host-status" class="couch-status">making your code&hellip;</div>
+    <button id="couch-host-scan-btn" class="couch-big-btn">&#128247; scan guest's code</button>
+    <div class="couch-sub">PAIRED DRIFTERS</div>
+    <div id="couch-roster" class="couch-roster"><div class="couch-empty">nobody yet — show them your code</div></div>
+    <button id="couch-host-stop" class="couch-quiet-btn">stop hosting</button>
+  </div>
+
+  <div id="couch-host-scan" class="couch-screen" style="display:none">
+    <p class="couch-blurb">have the guest show you <b>their</b> code — point the camera at it</p>
+    <div class="couch-view"><video id="couch-host-video" playsinline muted></video><div class="couch-frame"></div></div>
+    <div id="couch-host-scan-status" class="couch-status">scanning&hellip;</div>
+    <button id="couch-host-scan-back" class="couch-quiet-btn">back</button>
+  </div>
+
+  <div id="couch-join" class="couch-screen" style="display:none">
+    <p class="couch-blurb">join the host's wifi first, then <b>scan their code</b></p>
+    <div class="couch-view"><video id="couch-join-video" playsinline muted></video><div class="couch-frame"></div></div>
+    <div id="couch-join-status" class="couch-status">scanning for the host's code&hellip;</div>
+    <button id="couch-join-manual-btn" class="couch-quiet-btn">type code instead</button>
+    <div id="couch-join-manual" style="display:none">
+      <textarea id="couch-join-code" rows="3" placeholder="paste the host's code&hellip;" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+      <button id="couch-join-code-btn" class="couch-big-btn">link</button>
+    </div>
+    <button id="couch-join-back" class="couch-quiet-btn">back</button>
+  </div>
+
+  <div id="couch-join-show" class="couch-screen" style="display:none">
+    <p class="couch-blurb"><b>show this code to the host</b> — they scan it, and you're in</p>
+    <canvas id="couch-join-qr" class="couch-qr"></canvas>
+    <div id="couch-join-show-status" class="couch-status">waiting for the host to scan&hellip;</div>
+    <button id="couch-join-cancel" class="couch-quiet-btn">cancel</button>
   </div>
 </div>
 
@@ -235,6 +313,6 @@
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=33"></script>
+<script type="module" src="js/game.js?v=34"></script>
 </body>
 </html>

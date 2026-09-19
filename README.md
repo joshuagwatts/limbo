@@ -621,3 +621,54 @@ hot loop except the flock tick's small arrays at 10Hz. The album probe
 fetches `album.json` with `cache: no-store`; durations are probed once via
 metadata preload (8s timeout each). iOS may block `Audio.play()` without a
 gesture — the player retries every 5s until it starts.
+
+## Build 34 — couch co-op (offline LAN multiplayer)
+
+Joshua's scenario: Thanksgiving, bad internet, everybody's phones charged,
+everyone hanging out in the same room. "How can we get it local? ... not
+through the house's wifi ... not through the phone's data. So like what's
+another way we can connect everything?"
+
+**The answer: one phone becomes the network.** An Android hotspot is a
+network even with no data — the phones just talk to each other over the
+radio. One Android hosts the hotspot (iPhones can JOIN a hotspot fine but
+can't HOST one — Apple gates Personal Hotspot on cellular, so the UI says
+"host from an Android"). Everyone joins that WiFi, opens LIMBO, and links
+up with QR codes. No STUN/TURN (it's a LAN — host candidates are enough),
+no signaling server, no room keys, no accounts.
+
+**Offline-first PWA.** After ONE online visit, a service worker (`sw.js`,
+cache `limbo-v34`) has the whole game — pages, scripts, CSS, realm art,
+the vendored QR libs, even three.js from the CDN — so LIMBO boots with the
+network fully blocked. `manifest.webmanifest` makes it installable
+(fullscreen, `#020204` theme). Without this, a data-less hotspot couldn't
+even load the page.
+
+**The ceremony (js/couch.js).** Host taps Settings → COUCH CO-OP → host:
+an SDP offer (host candidates only, SDP stripped of extmap/msid/ssrc to
+fit) is encoded as `LIMBO1:O:<base64url>` and drawn as a QR with the
+vendored `qrcode-generator`. Guest taps join, scans it with the camera
+(vendored `jsQR`), mints an answer (`LIMBO1:A:…`), shows their QR; the host
+scans it and the WebRTC data channel opens. ~10–15s per guest. The host's
+offer auto-refreshes after each pairing (strictly one offer per guest —
+WebRTC-correct). A "type code instead" fallback exists on the join screen.
+
+**The transport speaks the same game protocol.** `CouchNet` mirrors the
+`LimboNet` interface (same callbacks, same `send*` names, same
+`{cid, …data}` payloads); game.js talks to whichever transport is active
+through a dispatcher proxy, so realms, jukebox (including play-from-phone
+file chunks), paint wall, chat, jam and flocking all work unchanged.
+Online and couch are never bridged — entering couch mode leaves the online
+rooms and lobby; leaving restores them.
+
+**Topology: star.** Guests connect only to the host; the host relays
+broadcasts to the other guests and routes targeted messages (file chunks)
+by cid, and announces roster join/leave so every phone's drifter count is
+right. Online mode has one room per realm; couch mode has one LAN room for
+everybody, so every broadcast carries the sender's current room and the
+transport drops room-scoped actions from drifters in other realms.
+
+**Known limits.** iPhone hosts are impossible (Apple). The game must be
+opened once online before the offline night. A guest who joins mid-party
+syncs the wall/jukebox state on their next room hop (same late-joiner
+pattern as online). Keep the game in the foreground.
