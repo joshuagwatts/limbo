@@ -557,3 +557,16 @@ completes (`relay` present = TURN alive; host+srflx only = TURN dead),
 join errors, ICE retry countdowns, watchdog triggers. Zero UI change
 without the param. The 2s tick now runs on every platform (pill stays
 touch-only) so the watchdog protects desktop too.
+
+## Build 32 — paint touch-offset fix
+Joshua's paint test: "the line appears away from my finger". Cause:
+`#paint-canvas` was `width:100%; height:100%` with `object-fit: contain`
+letterboxing the 2:1 (1024×512) wall buffer inside a tall element box, but
+`paintUvFromEvent` in `js/game.js` maps touches with
+`getBoundingClientRect()` — the ELEMENT box, not the letterboxed content
+box — so vertical touches mapped to the wrong v. Fix is CSS-only:
+`#paint-canvas` is now `width:100%; aspect-ratio: 2 / 1; height:auto;`
+(no more `object-fit`), so the element box IS the content box and the rect
+math is exact; `#paint-wrap` changed `align-items: stretch` →
+`center` so the canvas centers vertically in the leftover space. game.js
+input math untouched (already correct), WALL_W/WALL_H unchanged.
