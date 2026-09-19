@@ -10,9 +10,10 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=33';
-import { computeFlocks, FLOCK_R } from './flock.js?v=33';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=33';
+import { LimboNet } from './net.js?v=34';
+import { CouchNet } from './couch.js?v=34';
+import { computeFlocks, FLOCK_R } from './flock.js?v=34';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=34';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -111,6 +112,38 @@ const friendsListEl   = document.getElementById('friends-list');
 const friendsLiveEl   = document.getElementById('friends-live');
 const friendAddInput  = document.getElementById('friend-add-input');
 const friendAddBtn    = document.getElementById('friend-add-btn');
+// Couch co-op (build 34): offline LAN multiplayer ceremony UI.
+const couchPanel      = document.getElementById('couch-panel');
+const couchCloseBtn   = document.getElementById('couch-close');
+const couchHome       = document.getElementById('couch-home');
+const couchHostScreen = document.getElementById('couch-host');
+const couchHostScanScreen = document.getElementById('couch-host-scan');
+const couchJoinScreen = document.getElementById('couch-join');
+const couchJoinShowScreen = document.getElementById('couch-join-show');
+const couchHostBtn    = document.getElementById('couch-host-btn');
+const couchJoinBtn    = document.getElementById('couch-join-btn');
+const couchHostQr     = document.getElementById('couch-host-qr');
+const couchHostStatus = document.getElementById('couch-host-status');
+const couchHostScanBtn = document.getElementById('couch-host-scan-btn');
+const couchHostVideo  = document.getElementById('couch-host-video');
+const couchHostScanStatus = document.getElementById('couch-host-scan-status');
+const couchHostScanBack = document.getElementById('couch-host-scan-back');
+const couchRosterEl   = document.getElementById('couch-roster');
+const couchHostStop   = document.getElementById('couch-host-stop');
+const couchJoinVideo  = document.getElementById('couch-join-video');
+const couchJoinStatus = document.getElementById('couch-join-status');
+const couchJoinManualBtn = document.getElementById('couch-join-manual-btn');
+const couchJoinManual = document.getElementById('couch-join-manual');
+const couchJoinCode   = document.getElementById('couch-join-code');
+const couchJoinCodeBtn = document.getElementById('couch-join-code-btn');
+const couchJoinBack   = document.getElementById('couch-join-back');
+const couchJoinQr     = document.getElementById('couch-join-qr');
+const couchJoinShowStatus = document.getElementById('couch-join-show-status');
+const couchJoinCancel = document.getElementById('couch-join-cancel');
+const setCouchHostBtn = document.getElementById('set-couch-host');
+const setCouchJoinBtn = document.getElementById('set-couch-join');
+const couchSetRow     = document.getElementById('couch-set-row');
+const couchSetStatus  = document.getElementById('couch-set-status');
 const paintBtn        = document.getElementById('paint-btn');
 const paintOverlay    = document.getElementById('paint-overlay');
 const paintCanvas     = document.getElementById('paint-canvas');
@@ -132,7 +165,29 @@ const paintSaveBtn    = document.getElementById('paint-save');
 
 /* ---------------- multiplayer state ---------------- */
 
-const net = new LimboNet();
+/* Build 34: two transports, one `net`. Online P2P (Trystero) stays exactly
+   as it was; couch co-op (offline LAN, CouchNet) is selected from the
+   Nexus and never bridged with online. The dispatcher proxy forwards
+   READS to the active transport (binding methods) and WRITES (callback
+   wiring like net.onWispCb = ...) to BOTH, so every handler the game
+   installs once works over either transport with zero call-site changes.
+   A drifter is either online OR couch — enterCouchMode()/exitCouchMode()
+   flip `couchActive` and tear down the other side. */
+const onlineNet = new LimboNet();
+const couchNet = new CouchNet();
+let couchActive = false;
+const net = new Proxy(onlineNet, {
+  get(t, p) {
+    const a = couchActive ? couchNet : onlineNet;
+    const v = a[p];
+    return typeof v === 'function' ? v.bind(a) : v;
+  },
+  set(t, p, v) {
+    onlineNet[p] = v;
+    couchNet[p] = v;
+    return true;
+  },
+});
 const peerLayer = new THREE.Group(); // remote wisps, re-parented per scene
 const peerVisuals = new Map();       // peerId -> {group, bob, tag, target, name, phase}
 let myName = 'drifter';
@@ -6013,6 +6068,293 @@ window.addEventListener('keydown', (e) => {
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
+/* ---------------- couch co-op (build 34) ----------------
+   Offline LAN multiplayer for the no-internet hangout: one Android
+   hotspot is the whole network. Ceremony:
+     host:  "host a couch game" -> offer QR on screen
+     guest: "join a couch game" -> scans it -> answer QR on screen
+     host:  "scan guest's code" -> scans the answer -> linked
+   Either transport speaks the same game protocol, so realms, jukebox,
+   paint, chat and flocking all work unchanged. Online and couch are
+   never bridged — entering couch mode leaves the online rooms. */
+
+let couchScanStop = null; // active camera scan session, if any
+function couchStopScan() {
+  if (couchScanStop) {
+    try { couchScanStop(); } catch (e) { /* ignore */ }
+    couchScanStop = null;
+  }
+}
+function couchShowScreen(el) {
+  couchStopScan();
+  for (const s of [couchHome, couchHostScreen, couchHostScanScreen, couchJoinScreen, couchJoinShowScreen]) {
+    if (s) s.style.display = (s === el) ? '' : 'none';
+  }
+  couchPanel.style.display = 'block';
+}
+function setNetPillVisible(v) {
+  const pill = document.getElementById('net-pill');
+  if (pill) pill.style.display = v ? '' : 'none';
+}
+function couchWaitFor(fn, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      let v = false;
+      try { v = !!fn(); } catch (e) { /* ignore */ }
+      if (v) return resolve(true);
+      if (Date.now() - t0 > timeoutMs) return resolve(false);
+      setTimeout(tick, 500);
+    };
+    tick();
+  });
+}
+
+async function enterCouchMode() {
+  if (!couchActive) {
+    try { onlineNet.leave(); } catch (e) { /* ignore */ }
+    try { onlineNet._leaveLobby(); } catch (e) { /* ignore */ }
+    couchActive = true;
+    setNetPillVisible(false); // the online pill would lie about couch state
+    clearPeerVisuals();
+    peerPositions.clear();
+    await couchNet.boot(myName);
+    addSystemLine('couch mode — offline LAN. the internet drifters are out of reach for now.');
+  }
+  couchNet.join(roomKeyFor(active.key)); // tag the current room for filtering
+  updatePeerCount();
+  renderCouchSection();
+}
+
+async function exitCouchMode() {
+  if (!couchActive) return;
+  couchStopScan();
+  couchPanel.style.display = 'none';
+  couchNet.shutdown();
+  couchActive = false;
+  setNetPillVisible(true);
+  clearPeerVisuals();
+  peerPositions.clear();
+  renderCouchSection();
+  addSystemLine('back online.');
+  try {
+    const ok = await onlineNet.boot(myName);
+    if (ok) {
+      onlineNet.setPresence(myName, active.key);
+      onlineNet.joinLobby();
+      onlineNet.join(roomKeyFor(active.key));
+    }
+  } catch (e) { /* best effort — offline here just means solo */ }
+  updatePeerCount();
+}
+
+function renderCouchRoster() {
+  const entries = [...couchNet.roster.entries()];
+  couchRosterEl.innerHTML = '';
+  if (!entries.length) {
+    const d = document.createElement('div');
+    d.className = 'couch-empty';
+    d.textContent = 'nobody yet — show them your code';
+    couchRosterEl.appendChild(d);
+    return;
+  }
+  for (const [, p] of entries) {
+    const d = document.createElement('div');
+    d.className = 'couch-peer';
+    d.textContent = '✦ ' + p.name;
+    couchRosterEl.appendChild(d);
+  }
+}
+
+function renderCouchSection() {
+  if (couchActive) {
+    couchSetRow.style.display = 'none';
+    couchSetStatus.style.display = '';
+    couchSetStatus.innerHTML = '';
+    const n = couchNet.peerCount();
+    const t = document.createElement('div');
+    t.textContent = `couch mode · ${couchNet.isHost ? 'hosting' : 'linked'} · ${n} drifter${n === 1 ? '' : 's'}`;
+    const b = document.createElement('button');
+    b.textContent = 'leave couch mode';
+    b.onclick = () => { exitCouchMode(); };
+    couchSetStatus.appendChild(t);
+    couchSetStatus.appendChild(b);
+  } else {
+    couchSetRow.style.display = '';
+    couchSetStatus.style.display = 'none';
+    couchSetStatus.innerHTML = '';
+  }
+}
+
+// Roster changes (pair/leave) refresh the host screen, settings, HUD.
+couchNet.onRosterCb = () => {
+  renderCouchRoster();
+  renderCouchSection();
+  updatePeerCount();
+};
+// The star died with the host — fall back to whatever net exists.
+couchNet.onHostGoneCb = () => {
+  addSystemLine('the host drifted away — couch over');
+  exitCouchMode();
+};
+
+async function couchMintOffer() {
+  couchHostStatus.textContent = 'making your code…';
+  try {
+    const payload = await couchNet.createHostOffer();
+    CouchNet.qrToCanvas(couchHostQr, payload, 240);
+    couchHostStatus.textContent = 'show this code — guests scan it to join';
+  } catch (e) {
+    couchHostStatus.textContent = "couldn't make a code: " + ((e && e.message) || e);
+  }
+  renderCouchRoster();
+}
+
+async function couchStartHost() {
+  await enterCouchMode();
+  couchShowScreen(couchHostScreen);
+  // Don't mint over an offer that's already up (reopening the panel).
+  if (!couchNet._awaitingAnswer) await couchMintOffer();
+  else renderCouchRoster();
+}
+
+async function couchHostScan() {
+  couchShowScreen(couchHostScanScreen);
+  couchHostScanStatus.textContent = 'scanning…';
+  try {
+    const sess = await CouchNet.startScan(couchHostVideo, (payload) => {
+      couchAcceptAnswer(payload);
+    });
+    couchScanStop = sess.stop;
+  } catch (e) {
+    couchHostScanStatus.textContent = 'camera blocked — check the browser permission';
+  }
+}
+
+async function couchAcceptAnswer(payload) {
+  const dec = CouchNet.decodePayload(payload);
+  if (!dec || dec.kind !== 'A') {
+    // Not a guest answer — keep the camera up for another try.
+    couchHostScanStatus.textContent = "that's not a guest code — try again";
+    couchHostScan();
+    return;
+  }
+  couchHostScanStatus.textContent = 'linking…';
+  try {
+    await couchNet.acceptGuestAnswer(payload);
+  } catch (e) {
+    couchShowScreen(couchHostScreen);
+    couchHostStatus.textContent = "hmm, that code didn't work — " + ((e && e.message) || e);
+    return;
+  }
+  const before = couchNet.peerCount();
+  couchShowScreen(couchHostScreen);
+  couchHostStatus.textContent = 'linking…';
+  const ok = await couchWaitFor(() => couchNet.peerCount() > before, 20000);
+  if (ok) {
+    const names = [...couchNet.roster.values()].map((p) => p.name);
+    const nm = names[names.length - 1] || 'drifter';
+    addSystemLine(`✦ ${nm} joined the couch`);
+    couchHostStatus.textContent = `✦ ${nm} joined — fresh code below for the next guest`;
+    await couchMintOffer(); // strictly one offer per guest; auto-refresh
+  } else {
+    couchNet.cancelPendingOffer();
+    couchHostStatus.textContent = "the link didn't complete — fresh code below, have them re-scan";
+    await couchMintOffer();
+  }
+  updatePeerCount();
+}
+
+async function couchStartJoin() {
+  await enterCouchMode();
+  couchShowScreen(couchJoinScreen);
+  couchJoinManual.style.display = 'none';
+  couchJoinCode.value = '';
+  couchJoinStatus.textContent = "scanning for the host's code…";
+  try {
+    const sess = await CouchNet.startScan(couchJoinVideo, (payload) => {
+      couchAcceptOffer(payload);
+    });
+    couchScanStop = sess.stop;
+  } catch (e) {
+    couchJoinStatus.textContent = 'camera blocked — check the permission, or type the code instead';
+    couchJoinManual.style.display = '';
+  }
+}
+
+async function couchAcceptOffer(payload) {
+  const dec = CouchNet.decodePayload(payload);
+  if (!dec || dec.kind !== 'O') {
+    couchJoinStatus.textContent = "that's not a host code — keep scanning";
+    couchStartJoin();
+    return;
+  }
+  couchJoinStatus.textContent = 'linking…';
+  let answer;
+  try {
+    answer = await couchNet.acceptHostOffer(payload);
+  } catch (e) {
+    couchShowScreen(couchJoinScreen);
+    couchJoinStatus.textContent = 'hmm — ' + ((e && e.message) || e);
+    return;
+  }
+  try {
+    CouchNet.qrToCanvas(couchJoinQr, answer, 240);
+  } catch (e) {
+    couchShowScreen(couchJoinScreen);
+    couchJoinStatus.textContent = "couldn't draw the code — " + ((e && e.message) || e);
+    return;
+  }
+  couchShowScreen(couchJoinShowScreen);
+  couchJoinShowStatus.textContent = 'waiting for the host to scan…';
+  const ok = await couchWaitFor(() => couchNet.peerCount() > 0, 45000);
+  if (ok) {
+    couchJoinShowStatus.textContent = "you're in! ✦";
+    addSystemLine('you joined the couch — drift together');
+    updatePeerCount();
+    setTimeout(() => { couchPanel.style.display = 'none'; }, 1600);
+  } else {
+    couchJoinShowStatus.textContent = "the host hasn't scanned yet — still waiting…";
+  }
+}
+
+// --- couch panel wiring ---
+couchCloseBtn.addEventListener('click', () => {
+  couchStopScan();
+  couchPanel.style.display = 'none'; // hosting/linking continues in the background
+});
+couchHostBtn.addEventListener('click', () => { couchStartHost(); });
+couchJoinBtn.addEventListener('click', () => { couchStartJoin(); });
+couchHostScanBtn.addEventListener('click', () => {
+  if (!couchNet._awaitingAnswer) {
+    couchHostStatus.textContent = 'your code is above — guests scan it first';
+    return;
+  }
+  couchHostScan();
+});
+couchHostScanBack.addEventListener('click', () => { couchShowScreen(couchHostScreen); });
+couchHostStop.addEventListener('click', () => { exitCouchMode(); });
+couchJoinBack.addEventListener('click', () => { couchShowScreen(couchHome); });
+couchJoinCancel.addEventListener('click', () => {
+  // Linked already? Just close — the link lives on. Otherwise back out.
+  if (couchNet.peerCount() > 0) { couchStopScan(); couchPanel.style.display = 'none'; }
+  else couchShowScreen(couchJoinScreen);
+});
+couchJoinManualBtn.addEventListener('click', () => {
+  const open = couchJoinManual.style.display !== 'none';
+  couchJoinManual.style.display = open ? 'none' : '';
+  if (!open) { couchStopScan(); couchJoinStatus.textContent = "paste the host's code below"; }
+});
+couchJoinCodeBtn.addEventListener('click', () => {
+  const code = (couchJoinCode.value || '').trim();
+  if (!code) return;
+  couchAcceptOffer(code);
+});
+// Settings panel entry points (next to the friends list).
+setCouchHostBtn.addEventListener('click', () => { setSettings(false); couchStartHost(); });
+setCouchJoinBtn.addEventListener('click', () => { setSettings(false); couchStartJoin(); });
+renderCouchSection(); // initial paint of the settings row
+
 /* ---------------- chat ----------------
    Room-local text chat. Messages only *display* for peers within
    PROXIMITY_R meters (receiver-side filter on the last-known wisp
@@ -6430,7 +6772,16 @@ const DISCOVERY_WINDOW_MS = 45000;
 function updatePeerCount() {
   const n = net.peerCount() + 1;
   let cls = '', suffix = '';
-  if (net.enabled && net.peerCount() === 0) {
+  if (net.couchMode) {
+    // Build 34: couch mode has no discovery window — the host's QR is the
+    // discovery. Keep the label honest about what's happening.
+    if (net.peerCount() === 0) {
+      cls = 'searching';
+      suffix = net.isHost ? ' \u00B7 show your code to the room' : ' \u00B7 linking\u2026';
+    } else {
+      suffix = ' \u00B7 couch';
+    }
+  } else if (net.enabled && net.peerCount() === 0) {
     const elapsed = Date.now() - (net.joinedAt || Date.now());
     if (elapsed < DISCOVERY_WINDOW_MS) { cls = 'searching'; suffix = ' \u00B7 finding others'; }
     else { cls = 'settled'; suffix = ' \u00B7 just you in this realm'; }
@@ -6614,7 +6965,18 @@ async function updateDebugHud() {
     return;
   }
   const L = [];
-  L.push(`LIMBO net debug · build ${s.build} · ${s.enabled ? 'online' : 'OFFLINE (single-player)'}`);
+  // Build 34: the snapshot may come from the couch (offline LAN) transport.
+  L.push(`LIMBO net debug · build ${s.build} · ${s.couch ? 'COUCH (offline LAN)' : (s.enabled ? 'online' : 'OFFLINE (single-player)')}`);
+  if (s.couch) {
+    L.push(`couch: ${s.isHost ? 'HOST' : 'guest'} · room: ${s.roomKey}`);
+    if (s.roster && s.roster.length) {
+      L.push('roster: ' + s.roster.map((r) => r.name).join(', '));
+    }
+    if (s.log && s.log.length) {
+      L.push('couch log:');
+      for (const line of s.log.slice(-6)) L.push('  ' + line);
+    }
+  }
   // (build 30) parallel strategies: torrent + nostr rooms at once, peer sets merged
   if (s.strategies) {
     L.push('paths: ' + s.strategies.map((p) =>
@@ -6913,6 +7275,20 @@ window.__limbo = {
   notePresence: (id, d) => net._notePresence(id, d),
   sweepLobby: (now) => net._sweepLobby(now),
   joinLobby: () => net.joinLobby(),
+  // couch co-op (build 34): offline LAN transport + ceremony
+  couchNet, // direct handle (bypasses the dispatcher proxy)
+  couchActive: () => couchActive,
+  onlineNet, // direct handle to the online transport
+  enterCouchMode,
+  exitCouchMode,
+  couchStartHost,
+  couchStartJoin,
+  couchAcceptOffer, // (payload) -> guest side of the ceremony
+  couchAcceptAnswer, // (payload) -> host side of the ceremony
+  couchMintOffer,
+  couchPeerCount: () => couchNet.peerCount(),
+  couchRoster: () => [...couchNet.roster.entries()].map(([cid, p]) => ({ cid, name: p.name })),
+  couchSnapshot: () => couchNet.getDebugSnapshot(),
   // sound room (build 12)
   SOUND_DEF,
   // endless journey (build 33)
