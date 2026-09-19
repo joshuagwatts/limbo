@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>LIMBO — a portal universe</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=32">
+<link rel="stylesheet" href="css/style.css?v=33">
 <script type="importmap">
 {
   "imports": {
@@ -101,6 +101,16 @@
     </div>
   </div>
   <div class="paint-hint">it paints live for everyone in the sound room</div>
+</div>
+<!-- build 33: journey room — like the jukebox track + follow Holowatts.
+     Only visible while a jukebox track is playing in the endless journey. -->
+<div id="juke-social-pill" style="display:none">
+  <button id="juke-like-btn" aria-label="like this track">&#9825; <span id="juke-like-count">0</span></button>
+  <button id="juke-follow-btn">follow</button>
+  <div id="juke-follow-menu" style="display:none">
+    <a href="https://soundcloud.com/joshua-watts-4" target="_blank" rel="noopener">&#9729; SoundCloud</a>
+    <a href="https://www.instagram.com/holowatts_music" target="_blank" rel="noopener">&#128247; Instagram</a>
+  </div>
 </div>
 <!-- build 30: iOS Safari can lock audio until a user gesture. This one
      floating pill covers both audio paths (WebAudio jam + jukebox media
@@ -219,12 +229,12 @@
   <!-- loading indicator while art textures download: in the overlay's column
        (under the button) so it can never overlap the title/subtitle -->
   <div id="loading"><span>summoning limbo</span></div>
-  <p class="tiny">headphones recommended · 4 realms + sound room · 20 echoes</p>
+  <p class="tiny">headphones recommended · 4 realms + sound room + endless journey · 20 echoes</p>
 </div>
 
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=32"></script>
+<script type="module" src="js/game.js?v=33"></script>
 </body>
 </html>

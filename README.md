@@ -570,3 +570,54 @@ box — so vertical touches mapped to the wrong v. Fix is CSS-only:
 math is exact; `#paint-wrap` changed `align-items: stretch` →
 `center` so the canvas centers vertically in the leftover space. game.js
 input math untouched (already correct), WALL_W/WALL_H unchanged.
+
+## Build 33 — the endless journey (album-release room)
+Joshua's vision: "endless navigating. Your orb can just fly through an
+infinite mountain, city, desert, and digital realm scape while listening to
+the songs I upload to you for my album release!" Plus: orbs that travel
+close together go faster, "like a set of birds flocking together", the
+jukebox works over there, and a like/follow option.
+
+**The room.** A 5th Nexus portal (bird-V portal art) opens `limbo-realm-6`,
+the ENDLESS JOURNEY. Your orb auto-flies an endless -Z route at 14 u/s;
+drag anywhere to steer (no look-drag in this room), arrow keys work too.
+Four procedural biomes cycle mountain -> city -> desert -> digital, 4
+chunks (160u) each, recycled ahead/behind with dense fog hiding the pop-in.
+Everything is instanced/low-poly; materials are shared and chunk
+geometries disposed on recycle. A NEXUS gate is world-anchored ~350u ahead
+(drifting toward your line, never receding) — fly through the ring to come
+home; miss it and the next gate is laid 600u further on.
+
+**Flocking.** Every 0.1s the room runs deterministic flock math
+(`js/flock.js`, pure + unit-tested): orbs within 14u cluster transitively,
+the furthest-forward orb is the leader at the V apex, everyone else gets a
+V slot alternating left/right and widening by rank, and positions lerp
+toward slots (damped, never snaps). The whole V slipstreams at 1.35x
+(18.9 u/s) with speed lines + a brighter trail while flocked. Hysteresis:
+join at 14u, leave at 19u.
+
+**Music priority: jukebox > album > generative.** The jukebox plays in the
+journey room exactly like the sound room (48KB chunks, queue, anyone can
+skip, wall-clock sync, per-room party). Next: the hosted album —
+`assets/album/album.json` (`{title, tracks:[{file,title}]}`) with numbered
+mp3s next to it; the album loops forever on a fixed epoch (2026-01-01 UTC)
+so every drifter hears the same track at the same offset with no leader
+election. Ship no `album.json` and the room silently falls back to the
+generative ambient — the room works fully today with an empty folder.
+Biome shifts land on track changes (album or jukebox) and every 1400u of
+leader distance, all derived from the wall clock so every client renders
+the same world.
+
+**Like / follow.** While a jukebox track plays in the journey room, a pill
+offers ♡ Like (P2P live count, one per drifter per track, no persistence)
+and follow (menu linking Joshua's SoundCloud
+https://soundcloud.com/joshua-watts-4 and
+https://www.instagram.com/holowatts_music).
+
+**Perf notes / cut corners.** Chunk terrain is 20x10-22x12 segments;
+biome art is deliberately simple (cones, instanced boxes/octahedrons,
+wireframe grid) to hold 60fps on phones. No per-frame allocations in the
+hot loop except the flock tick's small arrays at 10Hz. The album probe
+fetches `album.json` with `cache: no-store`; durations are probed once via
+metadata preload (8s timeout each). iOS may block `Audio.play()` without a
+gesture — the player retries every 5s until it starts.
