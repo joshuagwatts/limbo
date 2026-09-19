@@ -990,11 +990,12 @@ html, body {
 }
 #paint-wrap {
   flex: 1 1 auto; min-height: 0; width: 100%;
-  display: flex; align-items: stretch; justify-content: stretch;
+  display: flex; align-items: center; justify-content: stretch;
 }
 #paint-canvas {
-  width: 100%; height: 100%;
-  object-fit: contain; /* 2:1 wall canvas letterboxes, never distorts */
+  /* Element box == 2:1 content box: paintUvFromEvent's getBoundingClientRect
+     math is exact, so strokes land exactly under the finger (build 32). */
+  width: 100%; aspect-ratio: 2 / 1; height: auto;
   border: 1px solid rgba(255, 122, 217, 0.4); border-radius: 8px;
   background: #0b0b13;
   touch-action: none; cursor: crosshair;
