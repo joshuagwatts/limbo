@@ -1295,3 +1295,109 @@ html, body {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ---------------- couch co-op (build 34) ----------------
+   Offline LAN multiplayer ceremony: fullscreen modal, phone-first. */
+#couch-panel {
+  position: fixed; z-index: 60;
+  left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(390px, 94vw); max-height: 88vh; overflow-y: auto;
+  background: rgba(4, 8, 18, 0.97);
+  border: 1px solid rgba(150, 220, 255, 0.35);
+  border-radius: 16px;
+  padding: 14px 18px 20px;
+  font-weight: 300; color: var(--ink);
+  box-shadow: 0 12px 60px rgba(0, 0, 0, 0.7);
+  -webkit-overflow-scrolling: touch;
+}
+.couch-head {
+  display: flex; justify-content: space-between; align-items: center;
+  letter-spacing: 0.35em; font-size: 12px; color: var(--ink-dim);
+  margin-bottom: 10px;
+}
+#couch-close {
+  background: none; border: none; color: var(--ink-dim);
+  font-size: 16px; cursor: pointer; padding: 6px 8px;
+  touch-action: manipulation;
+}
+.couch-screen { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.couch-blurb {
+  text-align: center; font-size: 14px; line-height: 1.5;
+  color: var(--ink-dim); margin: 2px 0 4px; max-width: 300px;
+}
+.couch-blurb b { color: var(--ink); font-weight: 600; }
+.couch-tiny { font-size: 11px; color: var(--ink-dim); opacity: 0.75; text-align: center; }
+.couch-big-btn {
+  width: 100%; padding: 13px 10px; font-size: 15px;
+  background: rgba(150, 220, 255, 0.10);
+  border: 1px solid rgba(150, 220, 255, 0.45); border-radius: 10px;
+  color: var(--ink); cursor: pointer; touch-action: manipulation;
+}
+.couch-big-btn:active { background: rgba(150, 220, 255, 0.22); }
+.couch-quiet-btn {
+  padding: 9px 14px; font-size: 13px;
+  background: none; border: 1px solid rgba(235, 240, 255, 0.18);
+  border-radius: 8px; color: var(--ink-dim);
+  cursor: pointer; touch-action: manipulation;
+}
+.couch-steps {
+  margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.65;
+  color: var(--ink-dim); align-self: stretch;
+}
+.couch-steps b { color: var(--ink); }
+.couch-qr {
+  background: #fff; border-radius: 10px; padding: 0;
+  image-rendering: pixelated;
+  box-shadow: 0 0 0 6px #fff, 0 4px 24px rgba(150, 220, 255, 0.25);
+  margin: 6px 0;
+}
+.couch-status {
+  font-size: 13px; color: var(--ink-dim); text-align: center;
+  min-height: 20px;
+}
+.couch-sub {
+  font-size: 10px; letter-spacing: 0.3em; color: var(--ink-dim);
+  opacity: 0.7; margin-top: 4px; align-self: flex-start;
+}
+.couch-roster { align-self: stretch; display: flex; flex-direction: column; gap: 6px; }
+.couch-peer {
+  font-size: 14px; padding: 8px 12px;
+  background: rgba(150, 220, 255, 0.07);
+  border: 1px solid rgba(150, 220, 255, 0.2); border-radius: 8px;
+}
+.couch-empty { font-size: 13px; color: var(--ink-dim); opacity: 0.7; }
+/* camera viewfinder with a corner scan frame */
+.couch-view {
+  position: relative; width: 100%; aspect-ratio: 4 / 3;
+  border-radius: 12px; overflow: hidden; background: #000;
+}
+.couch-view video { width: 100%; height: 100%; object-fit: cover; }
+.couch-frame {
+  position: absolute; inset: 18%;
+  border: 2px solid rgba(150, 220, 255, 0.85); border-radius: 12px;
+  box-shadow: 0 0 0 400px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+#couch-join-code {
+  width: 100%; box-sizing: border-box;
+  background: rgba(235, 240, 255, 0.05); color: var(--ink);
+  border: 1px solid rgba(235, 240, 255, 0.2); border-radius: 8px;
+  font-size: 11px; font-family: monospace; padding: 8px;
+  word-break: break-all;
+}
+#couch-join-manual { width: 100%; display: flex; flex-direction: column; gap: 8px; }
+/* settings panel entry row */
+.couch-set-row { display: flex; gap: 8px; margin: 8px 0 4px; }
+.couch-set-row button {
+  flex: 1; padding: 10px 6px; font-size: 13px;
+  background: rgba(150, 220, 255, 0.08);
+  border: 1px solid rgba(150, 220, 255, 0.35); border-radius: 8px;
+  color: var(--ink); cursor: pointer; touch-action: manipulation;
+}
+#couch-set-status { margin: 6px 0; }
+#couch-set-status button {
+  margin-top: 6px; padding: 8px 12px; font-size: 12px;
+  background: none; border: 1px solid rgba(235, 240, 255, 0.25);
+  border-radius: 8px; color: var(--ink-dim); cursor: pointer;
+  touch-action: manipulation;
+}
