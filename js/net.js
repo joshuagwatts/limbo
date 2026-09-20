@@ -76,7 +76,7 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '34';
+const BUILD = '36';
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
@@ -1026,10 +1026,12 @@ export class LimboNet {
     this.lobbyPeers.clear();
   }
 
-  /* Broadcast our wisp position + name + equipped look (~12Hz from the
-     game loop). game.js sets this.cosmetics so peers can render our skin,
-     hat, and trail; short string ids keep the payload tiny. */
-  broadcast(pos) {
+  /* Broadcast our wisp position + heading + name + equipped look (~12Hz
+     from the game loop). game.js sets this.cosmetics so peers can render
+     our skin, hat, and trail; short string ids keep the payload tiny.
+     `fwd` (optional THREE-like {x,y,z}) is our forward vector — the
+     journey room's flock math uses it to pick the V leader (build 36). */
+  broadcast(pos, fwd) {
     if (!this.enabled || !this.sendWisp) return;
     let s = 'drifter', h = 'none', t = 'ribbon', c = 'bfe2ff';
     try {
@@ -1042,14 +1044,16 @@ export class LimboNet {
       }
     } catch (e) { /* ignore */ }
     try {
-      this.sendWisp({
+      const wisp = {
         p: [r1(pos.x), r1(pos.y), r1(pos.z)],
         n: this.name,
         s,
         h,
         t,
         c,
-      });
+      };
+      if (fwd && typeof fwd.x === 'number') wisp.f = [r1(fwd.x), r1(fwd.y), r1(fwd.z)];
+      this.sendWisp(wisp);
     } catch (e) {
       /* ignore */
     }

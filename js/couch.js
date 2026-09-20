@@ -533,7 +533,7 @@ export class CouchNet {
   sendJukeFileReq(d, target) { this._sendTo('jukeFileReq', d, target); }
   sendJukeFileChunk(d, target) { this._sendTo('jukeFileChunk', d, target); }
 
-  broadcast(pos) {
+  broadcast(pos, fwd) {
     if (!this.enabled) return;
     let s = 'drifter', h = 'none', t = 'ribbon', c = 'bfe2ff';
     try {
@@ -546,7 +546,9 @@ export class CouchNet {
       }
     } catch (e) { /* ignore */ }
     try {
-      this.sendWisp({ p: [r1(pos.x), r1(pos.y), r1(pos.z)], n: this.name, s, h, t, c });
+      const wisp = { p: [r1(pos.x), r1(pos.y), r1(pos.z)], n: this.name, s, h, t, c };
+      if (fwd && typeof fwd.x === 'number') wisp.f = [r1(fwd.x), r1(fwd.y), r1(fwd.z)];
+      this.sendWisp(wisp);
     } catch (e) { /* ignore */ }
   }
 

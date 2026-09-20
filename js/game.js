@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=35';
-import { LimboNet } from './net.js?v=35';
-import { CouchNet } from './couch.js?v=35';
-import { computeFlocks, FLOCK_R } from './flock.js?v=35';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=35';
+import { AudioEngine } from './audio.js?v=36';
+import { LimboNet } from './net.js?v=36';
+import { CouchNet } from './couch.js?v=36';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=36';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=36';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -65,9 +65,10 @@ const TOTAL_ECHOES = REALM_DEFS.length * ECHOES_PER_REALM;
    REALM_DEFS-based math (echo totals, unlock thresholds, prints) moves. */
 const SOUND_DEF = { key: 'soundroom', name: 'SOUND ROOM', accent: 0xffc24d, root: 98.0 };
 const SOUND_ROOM_KEY = SOUND_DEF.key; // world key used by goTo()
-/* The endless journey (build 33): album-release room. Endless forward
-   flight through cycling procedural biomes; orbs that bunch up fall into a
-   bird-flock V and slipstream faster. Its own P2P room, like the sound room. */
+/* The endless journey (build 33; open field in 36): album-release room.
+   Free flight like the Nexus across one big open field holding four
+   environment zones; orbs that bunch up fall into a bird-flock V and
+   slipstream faster. Its own P2P room, like the sound room. */
 const JOURNEY_DEF = { key: 'journey', name: 'ENDLESS JOURNEY', accent: 0x7af2ff, root: 110.0 };
 const JOURNEY_ROOM_KEY = JOURNEY_DEF.key;
 const NEXUS_BOUND = 40;       // horizontal leash in the hub
@@ -152,7 +153,9 @@ const paintSizesEl    = document.getElementById('paint-sizes');
 const paintDoneBtn    = document.getElementById('paint-done');
 const jukeBtn         = document.getElementById('juke-btn');
 const jukePanel       = document.getElementById('juke-panel');
-// Journey room: like the jukebox track + follow Holowatts (build 33).
+// Journey room: like the jukebox track + follow Holowatts (build 33);
+// the zone banner names the land you're flying through (build 36).
+const zoneNameEl      = document.getElementById('zone-name');
 const jukeSocialPill  = document.getElementById('juke-social-pill');
 const jukeLikeBtn     = document.getElementById('juke-like-btn');
 const jukeLikeCount   = document.getElementById('juke-like-count');
@@ -5200,33 +5203,44 @@ function buildSoundRoom(textures) {
   };
 }
 
-/* ================= the endless journey (build 33) =================
-   Album-release room: orbs auto-fly an endless -Z route through cycling
-   procedural biomes (mountain -> city -> desert -> digital -> …) while
-   music plays. Orbs that bunch up fall into a migrating-bird V — the
-   furthest-forward orb is the leader at the apex — and the whole flock
-   slipstreams 1.35x faster.
+/* ================= the endless journey (build 33; open field in 36) =================
+   Album-release room: free flight like the Nexus across one big open field
+   holding four environment zones (mountain, city, desert, digital as regions
+   of a single map, not a corridor). Orbs that bunch up fall into a
+   migrating-bird V — the furthest-forward orb along the flock's heading
+   is the leader at the apex — and the whole flock slipstreams 1.35x faster.
 
    Music priority: live jukebox > hosted album (assets/album/) > generative
-   ambient. The biome shift is derived from the wall clock + the leader's z,
-   so every client renders the same world without a leader election. */
+   ambient. Entering a zone cross-fades the scenery, fog and the ambient
+   pad's root — drifting into a new land, never a loading screen. */
 
-const J_BASE_SPEED = 14;      // auto-flight speed, units/s
 const J_SLIPSTREAM = 1.35;    // flock speed multiplier — the whole V surges
-const J_STEER_SPEED = 17;     // lateral/vertical steer speed
-const J_BOUND_X = 34, J_MIN_Y = 2.5, J_MAX_Y = 44;
-const J_CHUNK_LEN = 160, J_AHEAD = 5, J_BEHIND = 1, J_PER_BIOME = 4;
-const J_BIOMES = ['mountain', 'city', 'desert', 'digital'];
-const J_BIOME_STYLE = {
-  mountain: { bg: 0x0d1330, fog: 0x1a2456, fogD: 0.010 },
-  city:     { bg: 0x05060f, fog: 0x0a0d1f, fogD: 0.014 },
-  desert:   { bg: 0x201009, fog: 0x33200f, fogD: 0.010 },
-  digital:  { bg: 0x020208, fog: 0x0a0618, fogD: 0.013 },
+const J_CRUISE = 34;          // constant forward drift accel (~14 u/s terminal, like the old rail)
+const J_MIN_Y = 2.5, J_MAX_Y = 60;
+const J_FIELD_R = 560;        // hard edge of the open field (safety clamp)
+const J_FIELD_SOFT = 440;     // soft push-back begins here — fog wall, never a hard stop
+const J_ZONE_BAND = 25;       // hysteresis half-width around zone borders (no flicker)
+/* The field is one 1120x1120 map; each quadrant is a zone.
+   x<0,z<0 spires · x>0,z<0 city · x<0,z>0 dunes · x>0,z>0 grid */
+const J_ZONES = ['spires', 'city', 'dunes', 'grid'];
+const J_ZONE_NAME = {
+  spires: 'THE SPIRES',
+  city: 'THE SLEEPING CITY',
+  dunes: 'THE LONG DUNES',
+  grid: 'THE GRID',
 };
-const J_HINT = 'DRAG — STEER · FLY CLOSE TO FLOCK + GO FASTER · GATE AHEAD RETURNS TO THE NEXUS';
+const J_ZONE_ROOT = { spires: 110.0, city: 98.0, dunes: 123.47, grid: 87.31 }; // ambient pad retunes per zone
+const J_ZONE_STYLE = {
+  spires: { bg: 0x0d1330, fog: 0x1a2456, fogD: 0.010 },
+  city:   { bg: 0x05060f, fog: 0x0a0d1f, fogD: 0.014 },
+  dunes:  { bg: 0x201009, fog: 0x33200f, fogD: 0.010 },
+  grid:   { bg: 0x020208, fog: 0x0a0618, fogD: 0.013 },
+};
+const J_HINT = 'DRAG \u2014 STEER \u00b7 LEFT SIDE \u2014 FLY \u00b7 FLY CLOSE, FLOCK FASTER \u00b7 THE GATE AT THE CROSSROADS FLIES YOU HOME';
+const J_SPAWN = { x: -60, y: 10, z: 140 }; // dunes, facing the crossroads gate
 
-/* Shared materials — built once, never per chunk. Geometries are per-chunk
-   (small) and disposed on recycle. */
+/* Shared materials — built once when the field is built. */
+
 const _jm = {};
 function journeyMats() {
   if (_jm.done) return _jm;
@@ -5274,61 +5288,94 @@ function journeyDisplace(geo, fn) {
   return geo;
 }
 
-function buildJourneyChunk(i, biome) {
-  const M = journeyMats();
-  const group = new THREE.Group();
-  const zc = -(i + 0.5) * J_CHUNK_LEN; // chunk center
-  group.position.z = zc;
-  const rnd = mulberry32(i * 7919 + 11);
-  const L = J_CHUNK_LEN + 80;
-  const dummy = _jDummy();
+/* ---------------- the open field (build 36) ----------------
+   One 1120x1120 map, built once when the room is entered. The four zones
+   share the journeyMats() materials; terrain tapers flat at the quadrant
+   borders (natural valley passes between the lands) and at the map edge. */
 
-  if (biome === 'mountain') {
+function sstep01(x) {
+  const t = Math.max(0, Math.min(1, x));
+  return t * t * (3 - 2 * t);
+}
+/* 0 at the quadrant borders and the map edge, 1 deep inside a zone. */
+function fieldTaper(x, z) {
+  const axis = sstep01(Math.min(Math.abs(x), Math.abs(z)) / 110);
+  const edge = 1 - sstep01((Math.hypot(x, z) - 430) / 160);
+  return axis * edge;
+}
+
+function buildJourneyField() {
+  const M = journeyMats();
+  const dummy = _jDummy();
+  const group = new THREE.Group();
+  const Q = 280; // quadrant half-size: 560x560 per zone, map spans ±560
+
+  // --- THE SPIRES (x<0, z<0): rolling peaks ---
+  {
+    const cx = -Q, cz = -Q;
+    const rnd = mulberry32(1101);
     const g = journeyDisplace(
-      new THREE.PlaneGeometry(280, L, 22, 12).rotateX(-Math.PI / 2),
-      (x, z) => {
-        const corridor = Math.min(1, Math.abs(x) / 55);
-        const k = corridor * corridor; // flat flyable corridor at x=0
-        return k * (Math.sin(x * 0.045 + i * 1.3) * Math.cos(z * 0.05 + i * 2.3) * 16
-          + Math.sin(x * 0.11 + i * 1.1) * Math.sin(z * 0.09 + i * 0.7) * 7
-          + Math.sin(x * 0.23 + i * 3.7) * 2.5);
-      });
-    group.add(new THREE.Mesh(g, M.terrainMtn));
-    for (let pI = 0; pI < 3; pI++) {
-      const peak = new THREE.Mesh(new THREE.ConeGeometry(26 + rnd() * 22, 70 + rnd() * 60, 5), M.peak);
-      peak.position.set((rnd() < 0.5 ? -1 : 1) * (95 + rnd() * 40), 18, (rnd() - 0.5) * L * 0.8);
+      new THREE.PlaneGeometry(Q * 2, Q * 2, 44, 44).rotateX(-Math.PI / 2),
+      (x, z) => fieldTaper(cx + x, cz + z) * (
+        Math.sin(x * 0.045 + 1.3) * Math.cos(z * 0.05 + 2.3) * 16
+        + Math.sin(x * 0.11 + 1.1) * Math.sin(z * 0.09 + 0.7) * 7
+        + Math.sin(x * 0.23 + 3.7) * 2.5));
+    const m = new THREE.Mesh(g, M.terrainMtn);
+    m.position.set(cx, 0, cz);
+    group.add(m);
+    for (let pI = 0; pI < 10; pI++) {
+      const peak = new THREE.Mesh(new THREE.ConeGeometry(20 + rnd() * 22, 60 + rnd() * 70, 5), M.peak);
+      peak.position.set(
+        cx + (rnd() < 0.5 ? -1 : 1) * (90 + rnd() * 160),
+        24,
+        cz + (rnd() < 0.5 ? -1 : 1) * (90 + rnd() * 160));
       group.add(peak);
     }
-  } else if (biome === 'city') {
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(280, L).rotateX(-Math.PI / 2), M.cityGround);
-    ground.position.y = -0.5;
+  }
+
+  // --- THE SLEEPING CITY (x>0, z<0): towers with lit windows ---
+  {
+    const cx = Q, cz = -Q;
+    const rnd = mulberry32(2202);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(Q * 2, Q * 2).rotateX(-Math.PI / 2), M.cityGround);
+    ground.position.set(cx, -0.5, cz);
     group.add(ground);
-    const N = 40;
+    const N = 110;
     const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), M.city, N);
-    for (let b = 0; b < N; b++) {
-      const w = 6 + rnd() * 9, dpt = 6 + rnd() * 9, h = 10 + rnd() * 36;
-      const side = rnd() < 0.5 ? -1 : 1;
-      dummy.position.set(side * (26 + rnd() * 95), h / 2 - 0.5, (rnd() - 0.5) * L * 0.9);
+    let placed = 0, guard = 0;
+    while (placed < N && guard++ < 1200) {
+      const bx = 40 + rnd() * 480;
+      const bz = -(40 + rnd() * 480);
+      if (Math.hypot(bx, bz) < 110) continue; // crossroads clearing
+      const w = 8 + rnd() * 10, dpt = 8 + rnd() * 10, h = 12 + rnd() * 38;
+      dummy.position.set(bx, h / 2 - 0.5, bz);
       dummy.scale.set(w, h, dpt);
       dummy.rotation.set(0, 0, 0);
       dummy.updateMatrix();
-      inst.setMatrixAt(b, dummy.matrix);
+      inst.setMatrixAt(placed, dummy.matrix);
+      placed++;
     }
+    inst.count = placed;
     inst.instanceMatrix.needsUpdate = true;
     group.add(inst);
-  } else if (biome === 'desert') {
+  }
+
+  // --- THE LONG DUNES (x<0, z>0): wind-shaped sand ---
+  {
+    const cx = -Q, cz = Q;
+    const rnd = mulberry32(3303);
     const g = journeyDisplace(
-      new THREE.PlaneGeometry(280, L, 20, 10).rotateX(-Math.PI / 2),
-      (x, z) => {
-        const k = 0.25 + 0.75 * Math.min(1, Math.abs(x) / 45);
-        return k * (Math.sin(x * 0.03 + i * 1.7) * Math.sin(z * 0.028 + i * 0.4) * 8
-          + Math.sin(x * 0.08 + i * 2.9) * 2.6);
-      });
-    group.add(new THREE.Mesh(g, M.terrainDst));
-    const rocks = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1.4), M.rock, 12);
-    for (let rI = 0; rI < 12; rI++) {
+      new THREE.PlaneGeometry(Q * 2, Q * 2, 40, 40).rotateX(-Math.PI / 2),
+      (x, z) => fieldTaper(cx + x, cz + z) * (
+        Math.sin(x * 0.03 + 1.7) * Math.sin(z * 0.028 + 0.4) * 8
+        + Math.sin(x * 0.08 + 2.9) * 2.6));
+    const m = new THREE.Mesh(g, M.terrainDst);
+    m.position.set(cx, 0, cz);
+    group.add(m);
+    const rocks = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1.4), M.rock, 26);
+    for (let rI = 0; rI < 26; rI++) {
       const s = 0.8 + rnd() * 3;
-      dummy.position.set((rnd() - 0.5) * 220, s * 0.4, (rnd() - 0.5) * L * 0.9);
+      dummy.position.set(-(50 + rnd() * 460), s * 0.4, 50 + rnd() * 460);
       dummy.scale.set(s, s * 0.7, s);
       dummy.rotation.set(rnd() * 3, rnd() * 3, 0);
       dummy.updateMatrix();
@@ -5336,19 +5383,25 @@ function buildJourneyChunk(i, biome) {
     }
     rocks.instanceMatrix.needsUpdate = true;
     group.add(rocks);
-  } else { // digital realm
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(280, L).rotateX(-Math.PI / 2), M.digitalGround);
+  }
+
+  // --- THE GRID (x>0, z>0): neon lattice on black glass ---
+  {
+    const cx = Q, cz = Q;
+    const rnd = mulberry32(4404);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(Q * 2, Q * 2).rotateX(-Math.PI / 2), M.digitalGround);
+    ground.position.set(cx, 0, cz);
     group.add(ground);
-    const gridGeo = new THREE.WireframeGeometry(new THREE.PlaneGeometry(280, L, 28, 16));
+    const gridGeo = new THREE.WireframeGeometry(new THREE.PlaneGeometry(Q * 2, Q * 2, 28, 28));
     gridGeo.rotateX(-Math.PI / 2);
     const grid = new THREE.LineSegments(gridGeo, M.digitalGrid);
-    grid.position.y = 0.3;
+    grid.position.set(cx, 0.3, cz);
     group.add(grid);
-    const N = 14;
+    const N = 34;
     const fl = new THREE.InstancedMesh(new THREE.OctahedronGeometry(2.4), M.floater, N);
     const cols = [new THREE.Color(0x00e5ff), new THREE.Color(0xff4fd8), new THREE.Color(0x7a5cff)];
     for (let fI = 0; fI < N; fI++) {
-      dummy.position.set((rnd() - 0.5) * 200, 6 + rnd() * 26, (rnd() - 0.5) * L * 0.9);
+      dummy.position.set(50 + rnd() * 460, 6 + rnd() * 26, 50 + rnd() * 460);
       dummy.scale.setScalar(0.6 + rnd() * 1.6);
       dummy.rotation.set(0, 0, 0);
       dummy.updateMatrix();
@@ -5358,35 +5411,27 @@ function buildJourneyChunk(i, biome) {
     fl.instanceMatrix.needsUpdate = true;
     if (fl.instanceColor) fl.instanceColor.needsUpdate = true;
     group.add(fl);
+    journey.floaters = fl; // gentle bob in updateJourney
   }
-  return { group, biome, index: i };
-}
-
-function disposeJourneyChunk(c) {
-  c.group.traverse((o) => {
-    if (o.geometry) o.geometry.dispose();
-    // materials are shared/cached — never disposed here
-  });
+  return group;
 }
 
 /* ---------------- journey state ---------------- */
 
 const journey = {
-  chunks: new Map(),   // index -> chunk
-  appliedShift: -1,
-  pinShift: null,      // test seam: force the biome shift
-  assign: null,        // flock hysteresis, fed back into computeFlocks
+  field: null,        // the open field group (built once, persists across visits)
+  floaters: null,     // grid-zone octahedra, gently bobbed in updateJourney
+  zone: null,         // current zone id (spires|city|dunes|grid)
+  beacon: null,       // crossroads gate light beam
+  assign: null,       // flock hysteresis, fed back into computeFlocks
   inFlock: false,
   myFlockSize: 1,
   mySlot: null,    // my V-slot target (null when I'm the leader)
   flockT: 0, musicT: 0,
-  lastSpeed: 0, // current forward speed (test seam reads the slipstream)
-  steer: { id: null, lx: 0, ly: 0, x: 0, y: 0 },
-  speedLines: null, speedPos: null,
+  lastSpeed: 0, // wisp speed (test seam reads the slipstream)
+  speedLines: null,
   gate: null,
-  gateZ: -350, // world-anchored: the gate stays put so you can catch it
   stars: null,
-  regening: false,
   lastJukeId: null,
   hintPrev: '',
 };
@@ -5395,71 +5440,21 @@ const _jTmpB = new THREE.Vector3();
 const _jBgT = new THREE.Color();
 const _jFogT = new THREE.Color();
 
-function journeyCurChunk() {
-  return Math.max(0, Math.floor(-wisp.position.z / J_CHUNK_LEN));
-}
-function journeyChunkBiome(i, shift) {
-  return J_BIOMES[(((Math.floor(i / J_PER_BIOME) + shift) % 4) + 4) % 4];
-}
-function journeyLeaderZ() {
-  let z = wisp.position.z;
-  for (const v of peerPositions.values()) if (v.z < z) z = v.z;
-  return z;
-}
-/* Wall-clock deterministic: every client derives the same shift, so the
-   whole flock sees the same world. Track changes (album or jukebox) turn
-   the world; distance keeps it turning on long stretches. */
-function journeyShiftNow() {
-  if (journey.pinShift != null) return journey.pinShift;
-  const t = Date.now();
-  let s;
-  if (juke.now && !juke.now.stopped) s = Math.floor((t - (juke.nowStartedAt || t)) / 90000);
-  else {
-    const an = albumNow();
-    s = an ? an.count : Math.floor(t / 150000);
-  }
-  s += Math.floor(Math.max(0, -journeyLeaderZ()) / 1400);
-  return s;
+/* Which zone is (x, z) in? Quadrants; callers apply the J_ZONE_BAND
+   hysteresis so the border never flickers. */
+function journeyZoneAt(x, z) {
+  if (x < 0) return z < 0 ? 'spires' : 'dunes';
+  return z < 0 ? 'city' : 'grid';
 }
 
-function journeyEnsureChunks(scene) {
-  const cur = journeyCurChunk();
-  const shift = journey.appliedShift;
-  for (let i = cur - J_BEHIND; i <= cur + J_AHEAD; i++) {
-    if (i < 0 || journey.chunks.has(i)) continue;
-    const c = buildJourneyChunk(i, journeyChunkBiome(i, shift));
-    journey.chunks.set(i, c);
-    scene.add(c.group);
-  }
-  for (const [i, c] of journey.chunks) {
-    if (i < cur - J_BEHIND - 2 || i > cur + J_AHEAD + 3) {
-      scene.remove(c.group);
-      disposeJourneyChunk(c);
-      journey.chunks.delete(i);
-    }
-  }
-}
-
-function journeyApplyShift(scene) {
-  const shift = journeyShiftNow();
-  if (shift === journey.appliedShift || journey.regening) return;
-  if (journey.appliedShift < 0) { // first build — no fade needed
-    journey.appliedShift = shift;
-    journeyEnsureChunks(scene);
-    return;
-  }
-  journey.regening = true;
-  journey.appliedShift = shift;
-  try { fadeEl.classList.add('on'); } catch (e) {}
-  setTimeout(() => {
-    try {
-      for (const [, c] of journey.chunks) { scene.remove(c.group); disposeJourneyChunk(c); }
-      journey.chunks.clear();
-      journeyEnsureChunks(scene);
-    } catch (e) {}
-    try { fadeEl.classList.remove('on'); } catch (e) {}
-    journey.regening = false;
-  }, 340);
+/* The zone banner: a quiet land-name that fades after a few seconds. */
+let zoneBannerT = null;
+function showZoneName(zone) {
+  if (!zoneNameEl) return;
+  zoneNameEl.textContent = J_ZONE_NAME[zone] || '';
+  zoneNameEl.classList.add('show');
+  if (zoneBannerT) clearTimeout(zoneBannerT);
+  zoneBannerT = setTimeout(() => zoneNameEl.classList.remove('show'), 2600);
 }
 
 /* ---------------- hosted album (build 33) ----------------
@@ -5622,8 +5617,8 @@ function makeSpeedLines() {
   const pos = new Float32Array(N * 3);
   for (let i = 0; i < N; i++) {
     pos[i * 3] = (Math.random() - 0.5) * 44;
-    pos[i * 3 + 1] = 8 + (Math.random() - 0.5) * 30;
-    pos[i * 3 + 2] = -Math.random() * 100;
+    pos[i * 3 + 1] = (Math.random() - 0.5) * 30;
+    pos[i * 3 + 2] = 12 - Math.random() * 112;
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -5646,19 +5641,36 @@ function buildJourneyRoom() {
   scene.add(sun);
   const stars = makeStars(500, 120, 260, 1.8, 0xcfe0ff);
   scene.add(stars);
-  // The gate home: hovers ahead of the wisp — fly through it to return.
+  // The open field: four zones, one map.
+  const field = buildJourneyField();
+  scene.add(field);
+  journey.field = field;
+  // The gate home stands at the crossroads (0,0) under a light beacon —
+  // visible from anywhere in the field. Fly through it to return.
   const { group, ring } = makePortal(makeJourneyTexture(), JOURNEY_DEF.accent, 'NEXUS', 2.4, 0.18);
+  group.position.set(0, 14, 0);
   scene.add(group);
+  const beam = new THREE.Mesh(
+    new THREE.CylinderGeometry(2.5, 4.5, 130, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: JOURNEY_DEF.accent, transparent: true, opacity: 0.12,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    }));
+  beam.position.set(0, 65, 0);
+  scene.add(beam);
+  journey.beacon = beam;
   const portals = [{ group, ring, pos: group.position.clone(), target: 'nexus', phase: 0, baseY: 0 }];
   const speedLines = makeSpeedLines();
   scene.add(speedLines);
   journey.speedLines = speedLines;
   journey.stars = stars;
   journey.gate = portals[0];
+  // spawn in the dunes, facing the crossroads gate
+  const spawnYaw = Math.atan2(-(0 - J_SPAWN.x), -(0 - J_SPAWN.z));
   return {
     key: JOURNEY_ROOM_KEY, name: JOURNEY_DEF.name, root: JOURNEY_DEF.root,
     scene, portals, echoes: [],
-    spawn: new THREE.Vector3(0, 8, 0), spawnYaw: 0, // face -Z, the endless route
+    spawn: new THREE.Vector3(J_SPAWN.x, J_SPAWN.y, J_SPAWN.z), spawnYaw,
     bound: 'journey',
     anim: { stars, speedLines },
     attunedShown: true, // n/a: no echoes here
@@ -5667,16 +5679,11 @@ function buildJourneyRoom() {
 }
 
 function journeyOnEnter() {
-  // Fresh sky: drop any chunks from a previous visit.
-  for (const [, c] of journey.chunks) { try { active.scene.remove(c.group); } catch (e) {} disposeJourneyChunk(c); }
-  journey.chunks.clear();
-  journey.appliedShift = -1;
   journey.assign = null;
   journey.inFlock = false;
   journey.myFlockSize = 1;
-  journey.regening = false;
-  journey.steer.x = 0; journey.steer.y = 0; journey.steer.id = null;
-  journey.gateZ = -350; // first gate home, 350 down the route
+  journey.mySlot = null;
+  journey.zone = null; // forces the zone banner + atmo on the first tick
   journey.lastJukeId = null;
   journey.hintPrev = hintEl ? hintEl.textContent : '';
   if (hintEl) hintEl.textContent = J_HINT;
@@ -5686,102 +5693,98 @@ function journeyOnEnter() {
 
 function journeyOnLeave() {
   albumPause();
-  for (const [, c] of journey.chunks) { try { active.scene.remove(c.group); } catch (e) {} disposeJourneyChunk(c); }
-  journey.chunks.clear();
   journey.inFlock = false;
-  journey.steer.id = null; journey.steer.x = 0; journey.steer.y = 0;
+  journey.mySlot = null;
   try { wispGlow.scale.set(3.2, 3.2, 1); } catch (e) {}
   try { wispCore.rotation.z = 0; } catch (e) {}
+  if (zoneNameEl) zoneNameEl.classList.remove('show');
+  if (zoneBannerT) { clearTimeout(zoneBannerT); zoneBannerT = null; }
   if (hintEl && journey.hintPrev) hintEl.textContent = journey.hintPrev;
   if (jukeSocialPill) jukeSocialPill.style.display = 'none';
   if (jukeFollowMenu) jukeFollowMenu.style.display = 'none';
 }
 
-/* The per-frame journey update: flight, steering, flocking, chunks, gate. */
+/* The per-frame journey update: flocking, zones, gate, music. Flight
+   itself is the Nexus free-fly model (updatePlayer runs for this room
+   too) — the journey adds the endless cruise drift, the V formation
+   and the slipstream surge. */
+/* The per-frame journey update: flocking, zones, gate, music.
+   Flight itself is the Nexus free-fly model (updatePlayer runs for this
+   room too) — the journey adds the endless cruise drift, the V formation
+   and the slipstream surge. */
 function updateJourney(dt, t) {
   const scene = active.scene;
   // --- flock (10Hz is plenty; positions broadcast at 12Hz) ---
   journey.flockT += dt;
   if (journey.flockT >= 0.1) {
     journey.flockT = 0;
-    const members = [{ cid: net.clientId || 'self', x: wisp.position.x, y: wisp.position.y, z: wisp.position.z }];
-    for (const [cid, v] of peerPositions) members.push({ cid, x: v.x, y: v.y, z: v.z });
-    const r = computeFlocks(members, journey.assign);
-    journey.assign = r.assign;
     const selfCid = net.clientId || 'self';
+    const members = [{
+      cid: selfCid,
+      x: wisp.position.x, y: wisp.position.y, z: wisp.position.z,
+      fx: myFwd.x, fy: myFwd.y, fz: myFwd.z,
+    }];
+    for (const [cid, v] of peerPositions) {
+      const m = { cid, x: v.x, y: v.y, z: v.z };
+      const h = peerHeadings.get(cid);
+      if (h) { m.fx = h.x; m.fy = h.y; m.fz = h.z; }
+      members.push(m);
+    }
+    // the flock's forward: mean of the broadcast headings (deterministic —
+    // every client runs this on the same inputs)
+    const heading = meanHeading(members) || { x: 0, y: 0, z: -1 };
+    const r = computeFlocks(members, journey.assign, heading);
+    journey.assign = r.assign;
     const mine = r.flocks.find((f) => f.slots.has(selfCid) || f.leaderCid === selfCid) || null;
     journey.inFlock = !!mine;
     journey.myFlockSize = mine ? mine.order.length + 1 : 1;
     journey.mySlot = mine ? mine.slots.get(selfCid) || null : null; // leader: no slot
   }
-  // --- flight: endless forward, slipstream when flocked ---
-  const speed = J_BASE_SPEED * (journey.inFlock ? J_SLIPSTREAM : 1);
-  journey.lastSpeed = speed;
   // gentle pull into the V slot (damped — never snaps, never oscillates)
   if (journey.mySlot) {
     _jTmpA.set(journey.mySlot.x, journey.mySlot.y, journey.mySlot.z);
     wisp.position.lerp(_jTmpA, 1 - Math.exp(-2.2 * dt));
   }
-  // steering: touch drag + keys
-  let sx = journey.steer.x, sy = journey.steer.y;
-  if (!chatFocused) {
-    if (keys.ArrowLeft || keys.KeyA) sx -= 1;
-    if (keys.ArrowRight || keys.KeyD) sx += 1;
-    if (keys.ArrowUp || keys.KeyW) sy += 1;
-    if (keys.ArrowDown || keys.KeyS) sy -= 1;
+  journey.lastSpeed = vel.length();
+  // --- zones: drifting into a new land cross-fades the world ---
+  const rawZone = journeyZoneAt(wisp.position.x, wisp.position.z);
+  if (rawZone !== journey.zone) {
+    const inBand = Math.abs(wisp.position.x) < J_ZONE_BAND || Math.abs(wisp.position.z) < J_ZONE_BAND;
+    if (!inBand || journey.zone === null) {
+      journey.zone = rawZone;
+      showZoneName(rawZone);
+      audio.setRoot(J_ZONE_ROOT[rawZone] || JOURNEY_DEF.root);
+    }
   }
-  sx = Math.max(-1, Math.min(1, sx));
-  sy = Math.max(-1, Math.min(1, sy));
-  wisp.position.x = Math.max(-J_BOUND_X, Math.min(J_BOUND_X, wisp.position.x + sx * J_STEER_SPEED * dt));
-  wisp.position.y = Math.max(J_MIN_Y, Math.min(J_MAX_Y, wisp.position.y + sy * J_STEER_SPEED * dt));
-  wisp.position.z -= speed * dt;
-  journey.steer.x *= Math.exp(-3 * dt); // drag stick relaxes
-  journey.steer.y *= Math.exp(-3 * dt);
-  // banking into the turn
-  try { wispCore.rotation.z += ((-sx * 0.4) - wispCore.rotation.z) * Math.min(1, dt * 6); } catch (e) {}
-  // camera basis for the follow-cam below (journey skips updatePlayer,
-  // which is where the camera lives in every other room — hotfix)
-  _fwd.set(0, 0, -1);
-  _camWant.copy(wisp.position).addScaledVector(_fwd, -7).add(_jTmpB.set(0, 2.2, 0));
-  camera.position.lerp(_camWant, 1 - Math.exp(-8 * dt));
-  _lookAt.copy(wisp.position).addScaledVector(_fwd, 8);
-  camera.lookAt(_lookAt);
-  pushTrail(dt); // the orb's trail, same as free-fly rooms
-  // --- world: biomes, chunks, atmosphere ---
-  journeyApplyShift(scene);
-  journeyEnsureChunks(scene);
-  const cur = journeyCurChunk();
-  const style = J_BIOME_STYLE[journeyChunkBiome(cur, journey.appliedShift)] || J_BIOME_STYLE.mountain;
+  const style = J_ZONE_STYLE[journey.zone] || J_ZONE_STYLE.spires;
   const kk = 1 - Math.exp(-1.5 * dt);
   scene.background.lerp(_jBgT.setHex(style.bg), kk);
   scene.fog.color.lerp(_jFogT.setHex(style.fog), kk);
-  scene.fog.density += (style.fogD - scene.fog.density) * kk;
-  if (journey.stars) journey.stars.position.z = wisp.position.z - 120;
-  // --- the gate home is world-anchored ahead; fly through it to return ---
-  if (journey.gate) {
-    const gp = journey.gate.group.position;
-    const gx = wisp.position.x * 0.85; // drifts toward your line, stays catchable
-    gp.x += (gx - gp.x) * Math.min(1, dt * 2.5);
-    gp.y = Math.max(J_MIN_Y + 1, Math.min(J_MAX_Y - 2, wisp.position.y + 1.5 + Math.sin(t * 0.9) * 0.6));
-    gp.z = journey.gateZ; // fixed in the world — fly through the ring
-    journey.gate.ring.rotation.z += dt * 0.5;
-    journey.gate.pos.copy(gp);
-    // Flew past it (or around it): lay the next gate further down the route.
-    if (wisp.position.z < journey.gateZ - 25) journey.gateZ -= 600;
-  }
+  // the fog wall: the world's edge thickens the air before the soft push-back
+  const hd = Math.hypot(wisp.position.x, wisp.position.z);
+  const edge = sstep01((hd - J_FIELD_SOFT) / (J_FIELD_R - J_FIELD_SOFT));
+  const targetD = style.fogD + edge * 0.022;
+  scene.fog.density += (targetD - scene.fog.density) * kk;
+  if (journey.stars) journey.stars.position.set(wisp.position.x, 0, wisp.position.z);
+  // --- the gate at the crossroads: ring turn + beacon pulse ---
+  if (journey.gate) journey.gate.ring.rotation.z += dt * 0.5;
+  if (journey.beacon) journey.beacon.material.opacity = 0.10 + 0.05 * Math.sin(t * 2.2);
+  if (journey.floaters) journey.floaters.position.y = Math.sin(t * 0.6) * 1.5;
   // --- slipstream visuals: speed lines + brighter trail ---
   const sl = journey.speedLines;
   if (sl) {
     sl.visible = journey.inFlock;
+    sl.position.copy(wisp.position);
+    sl.rotation.y = yaw; // local -Z lines up with the heading
     if (sl.visible) {
       const p = sl.geometry.attributes.position;
       const arr = p.array;
       for (let i = 0; i < arr.length; i += 3) {
         arr[i + 2] += 90 * dt;
-        if (arr[i + 2] > wisp.position.z + 12) {
-          arr[i] = wisp.position.x + (Math.random() - 0.5) * 44;
-          arr[i + 1] = wisp.position.y + (Math.random() - 0.5) * 30;
-          arr[i + 2] = wisp.position.z - 90 - Math.random() * 20;
+        if (arr[i + 2] > 12) {
+          arr[i] = (Math.random() - 0.5) * 44;
+          arr[i + 1] = (Math.random() - 0.5) * 30;
+          arr[i + 2] = -90 - Math.random() * 20;
         }
       }
       p.needsUpdate = true;
@@ -6123,7 +6126,7 @@ async function enterCouchMode() {
     couchActive = true;
     setNetPillVisible(false); // the online pill would lie about couch state
     clearPeerVisuals();
-    peerPositions.clear();
+    peerPositions.clear(); peerHeadings.clear();
     await couchNet.boot(myName);
     addSystemLine('couch mode — offline LAN. the internet drifters are out of reach for now.');
   }
@@ -6140,7 +6143,7 @@ async function exitCouchMode() {
   couchActive = false;
   setNetPillVisible(true);
   clearPeerVisuals();
-  peerPositions.clear();
+  peerPositions.clear(); peerHeadings.clear();
   renderCouchSection();
   addSystemLine('back online.');
   try {
@@ -6372,6 +6375,7 @@ const CHAT_HISTORY_CAP = 100;
 const BUBBLE_SECS = 4; // floating bubble lifetime above the sender's wisp
 
 const peerPositions = new Map(); // peerId -> THREE.Vector3 (last wisp broadcast)
+const peerHeadings = new Map();  // peerId -> {x,y,z} heading (flock leader votes)
 const chatHistory = []; // {name, text, time, sys, self, distant} — this session, capped
 let lastDistantHint = 0;
 
@@ -6531,14 +6535,6 @@ const joy = { id: null, ax: 0, ay: 0, x: 0, y: 0 };   // move stick, -1..1
 const look = { id: null, lx: 0, ly: 0 };              // look drag
 canvas.addEventListener('touchstart', (e) => {
   for (const t of e.changedTouches) {
-    if (active && active.key === JOURNEY_ROOM_KEY) {
-      // Endless journey: drag anywhere to steer the orb (no look-drag here).
-      if (journey.steer.id === null) {
-        journey.steer.id = t.identifier;
-        journey.steer.lx = t.clientX; journey.steer.ly = t.clientY;
-      }
-      continue;
-    }
     if (t.clientX < window.innerWidth / 2 && joy.id === null) {
       joy.id = t.identifier; joy.ax = t.clientX; joy.ay = t.clientY; joy.x = 0; joy.y = 0;
       joyBase.style.display = 'block';
@@ -6562,11 +6558,6 @@ canvas.addEventListener('touchmove', (e) => {
       pitch -= (t.clientY - look.ly) * 0.0042;
       pitch = Math.max(-1.45, Math.min(1.45, pitch));
       look.lx = t.clientX; look.ly = t.clientY;
-    } else if (active && active.key === JOURNEY_ROOM_KEY && t.identifier === journey.steer.id) {
-      // Journey steering: relative drag, up = climb.
-      journey.steer.x = Math.max(-1, Math.min(1, journey.steer.x + (t.clientX - journey.steer.lx) * 0.012));
-      journey.steer.y = Math.max(-1, Math.min(1, journey.steer.y - (t.clientY - journey.steer.ly) * 0.012));
-      journey.steer.lx = t.clientX; journey.steer.ly = t.clientY;
     }
   }
   e.preventDefault();
@@ -6575,7 +6566,6 @@ function endTouch(e) {
   for (const t of e.changedTouches) {
     if (t.identifier === joy.id) { joy.id = null; joy.x = 0; joy.y = 0; joyBase.style.display = 'none'; }
     if (t.identifier === look.id) look.id = null;
-    if (t.identifier === journey.steer.id) journey.steer.id = null;
   }
 }
 canvas.addEventListener('touchend', endTouch);
@@ -6596,7 +6586,7 @@ function goTo(key) {
   if (transitioning || !worlds[key]) return;
   // Leaving the sound room: stop the live relay + the mic automatically.
   if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) { jamMicOff(); }
-  // Leaving the journey: park the album, drop chunks, restore the wisp.
+  // Leaving the journey: park the album, restore the wisp.
   if (active && active.key === JOURNEY_ROOM_KEY && key !== JOURNEY_ROOM_KEY) { journeyOnLeave(); }
   transitioning = true;
   fadeEl.classList.add('on');
@@ -6767,7 +6757,7 @@ function clearPeerVisuals() {
     if (pv.trailObj) peerLayer.remove(pv.trailObj.group);
   }
   peerVisuals.clear();
-  peerPositions.clear(); // new room, new neighborhood
+  peerPositions.clear(); peerHeadings.clear(); // new room, new neighborhood
 }
 
 /* "DRIFTERS HERE" with a discovery state: while we're online, alone, and
@@ -6801,6 +6791,7 @@ function handleWisp(id, d) {
   if (!d || !Array.isArray(d.p)) return;
   const nm = String(d.n || 'drifter').slice(0, 16) || 'drifter';
   peerPositions.set(id, new THREE.Vector3(d.p[0], d.p[1], d.p[2])); // proximity table
+  if (d.f && Array.isArray(d.f) && d.f.length >= 3) peerHeadings.set(id, { x: +d.f[0], y: +d.f[1], z: +d.f[2] }); // flock heading
   let pv = peerVisuals.get(id);
   if (!pv) {
     if (peerVisuals.size >= MAX_REMOTE) return; // render cap; count still tracks
@@ -6840,6 +6831,7 @@ function handlePeerLeave(id) {
     peerVisuals.delete(id);
   }
   peerPositions.delete(id);
+  peerHeadings.delete(id);
   updatePeerCount();
 }
 
@@ -7066,6 +7058,7 @@ const _right = new THREE.Vector3();
 const _move = new THREE.Vector3();
 const _camWant = new THREE.Vector3();
 const _lookAt = new THREE.Vector3();
+const myFwd = new THREE.Vector3(0, 0, -1); // our heading, broadcast for the flock
 
 function updatePlayer(dt) {
   // Camera-relative flight axes.
@@ -7087,15 +7080,22 @@ function updatePlayer(dt) {
 
   _move.addScaledVector(_fwd, iz).addScaledVector(_right, ix);
   _move.y += iy * 0.9;
+  const isJourney = active.key === JOURNEY_ROOM_KEY;
+  // slipstream: flying in the V multiplies everything the wings do
+  const boost = (isJourney && journey.inFlock) ? J_SLIPSTREAM : 1;
   if (_move.lengthSq() > 0) {
     _move.normalize();
-    vel.addScaledVector(_move, 26 * dt);
+    vel.addScaledVector(_move, 26 * boost * dt);
   }
-
   // Dreamy inertia: exponential damping, then clamp speed.
   vel.multiplyScalar(Math.exp(-2.4 * dt));
+  if (isJourney) {
+    // the journey never stops drifting — birds on the wing, always forward
+    vel.addScaledVector(_fwd, J_CRUISE * boost * dt);
+  }
   const sp = vel.length();
-  if (sp > 16) vel.multiplyScalar(16 / sp);
+  const vmax = 16 * boost;
+  if (sp > vmax) vel.multiplyScalar(vmax / sp);
 
   wisp.position.addScaledVector(vel, dt);
 
@@ -7104,6 +7104,20 @@ function updatePlayer(dt) {
     wisp.position.x = Math.max(-52, Math.min(52, wisp.position.x));
     wisp.position.y = Math.max(-8, Math.min(36, wisp.position.y));
     wisp.position.z = Math.max(-54, Math.min(32, wisp.position.z));
+  } else if (active.bound === 'journey') {
+    // the open field: soft push-back at the fog wall, hard clamp at the edge
+    wisp.position.y = Math.max(J_MIN_Y, Math.min(J_MAX_Y, wisp.position.y));
+    const jhx = wisp.position.x, jhz = wisp.position.z;
+    const jhd = Math.hypot(jhx, jhz);
+    if (jhd > J_FIELD_SOFT) {
+      const push = (jhd - J_FIELD_SOFT) * 0.9;
+      vel.x -= (jhx / jhd) * push * dt;
+      vel.z -= (jhz / jhd) * push * dt;
+    }
+    if (jhd > J_FIELD_R) {
+      const js = J_FIELD_R / jhd;
+      wisp.position.x *= js; wisp.position.z *= js;
+    }
   } else {
     const hx = wisp.position.x, hz = wisp.position.z;
     const hd = Math.hypot(hx, hz);
@@ -7125,6 +7139,7 @@ function updatePlayer(dt) {
   camera.lookAt(_lookAt);
 
   pushTrail(dt);
+  myFwd.copy(_fwd); // broadcast to the flock in loop()
 }
 
 function checkPortals() {
@@ -7178,9 +7193,9 @@ function loop() {
     wall.texDirty = false;
   }
 
-  // The journey room drives its own flight model through active.update
-  // (build 33); every other room uses the free-fly wisp.
-  if (active.key !== JOURNEY_ROOM_KEY) updatePlayer(dt);
+  // Free flight everywhere — including the journey (its update adds
+  // the cruise drift, the V formation and the slipstream).
+  updatePlayer(dt);
   checkPortals();  checkEchoes();
 
   // Multiplayer: broadcast our wisp, ease remote wisps toward their targets.
@@ -7188,7 +7203,7 @@ function loop() {
     netTimer += dt;
     if (netTimer >= 1 / 12) {
       netTimer = 0;
-      net.broadcast(wisp.position);
+      net.broadcast(wisp.position, myFwd);
     }
     const k = 1 - Math.exp(-9 * dt);
     for (const pv of peerVisuals.values()) {
@@ -7238,7 +7253,10 @@ window.__limbo = {
   peerVisuals,
   chatHistory: () => chatHistory.slice(),
   myName: () => myName,
-  setPeerPos: (id, x, y, z) => peerPositions.set(id, new THREE.Vector3(x, y, z)),
+  setPeerPos: (id, x, y, z, fx, fy, fz) => {
+    peerPositions.set(id, new THREE.Vector3(x, y, z));
+    if (fx !== undefined) peerHeadings.set(id, { x: +fx, y: +fy, z: +fz });
+  },
   getPeerPos: (id) => peerPositions.get(id),
   handleWisp,
   showChatBubble,
@@ -7272,8 +7290,17 @@ window.__limbo = {
   activeKey: () => (active ? active.key : null),
   journeyGateZ: () => (journey.gate ? +journey.gate.group.position.z.toFixed(1) : null),
   journeySpeed: () => +journey.lastSpeed.toFixed(2),
-  /* build 33 test seam: drop the gate `d` units ahead (default 10) */
-  journeyDropGate: (d) => { journey.gateZ = wisp.position.z - (d || 10); },
+  journeyZone: () => journey.zone, // open-field zone id (spires|city|dunes|grid)
+  /* build 36 test seam: move the gate `d` units along our heading (default 10) */
+  journeyDropGate: (d) => {
+    if (!journey.gate) return;
+    const dd = d || 10;
+    journey.gate.group.position.set(
+      wisp.position.x + myFwd.x * dd, wisp.position.y + myFwd.y * dd, wisp.position.z + myFwd.z * dd);
+    journey.gate.pos.copy(journey.gate.group.position);
+  },
+  /* build 36 test seam: teleport the wisp (zone/boundary tests) */
+  journeyTeleport: (x, y, z) => { wisp.position.set(x, y, z); vel.set(0, 0, 0); },
   setPresence: (n, r) => net.setPresence(n, r),
   presencePayload: () => net._presencePayload(),
   lobbyPeers: () => [...net.lobbyPeers.entries()].map(([id, p]) => ({ id, ...p })),
@@ -7305,9 +7332,10 @@ window.__limbo = {
     x: +wisp.position.x.toFixed(2),
     y: +wisp.position.y.toFixed(2),
     z: +wisp.position.z.toFixed(2),
-    chunks: journey.chunks.size,
-    biome: journeyChunkBiome(journeyCurChunk(), journey.appliedShift),
-    shift: journey.appliedShift,
+    zone: journey.zone,
+    zoneName: zoneNameEl ? zoneNameEl.textContent : '',
+    bannerShown: !!(zoneNameEl && zoneNameEl.classList.contains('show')),
+    gateX: journey.gate ? +journey.gate.group.position.x.toFixed(1) : null,
     inFlock: journey.inFlock,
     flockSize: journey.myFlockSize,
     album: album.state,
@@ -7315,7 +7343,8 @@ window.__limbo = {
     speedLines: !!(journey.speedLines && journey.speedLines.visible),
     likePill: !!(jukeSocialPill && jukeSocialPill.style.display !== 'none'),
   }),
-  journeyPinShift: (n) => { journey.pinShift = n; },
+  /* build 36 test seam: pin the zone (bypasses the hysteresis band) */
+  journeyPinZone: (z) => { journey.zone = z; },
   albumState: () => ({ state: album.state, tracks: album.tracks.map((t) => t.title) }),
   jukeLikeCount: (id) => (jukeLikes.get(id) || new Set()).size,
   /* build 33 test seam: fake a live jukebox track to drive the like pill */
