@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=4';
-import { LimboNet } from './net.js?v=34';
-import { CouchNet } from './couch.js?v=34';
-import { computeFlocks, FLOCK_R } from './flock.js?v=34';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=34';
+import { AudioEngine } from './audio.js?v=35';
+import { LimboNet } from './net.js?v=35';
+import { CouchNet } from './couch.js?v=35';
+import { computeFlocks, FLOCK_R } from './flock.js?v=35';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=35';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
