@@ -1086,6 +1086,18 @@ html, body {
 }
 #juke-btn:active { background: rgba(141, 255, 122, 0.25); }
 
+/* ---------- journey room: zone banner (build 36) ---------- */
+#zone-name {
+  position: fixed; top: 12%; left: 0; right: 0; z-index: 40;
+  text-align: center; pointer-events: none;
+  font-size: 26px; letter-spacing: 0.42em; text-indent: 0.42em;
+  color: rgba(232, 244, 255, 0.92);
+  text-shadow: 0 0 18px rgba(122, 242, 255, 0.55), 0 2px 8px rgba(0, 0, 0, 0.6);
+  opacity: 0; transition: opacity 0.9s ease;
+  font-weight: 300;
+}
+#zone-name.show { opacity: 1; }
+
 /* ---------- journey room: like + follow pill (build 33) ---------- */
 #juke-social-pill {
   position: fixed; left: 50%; transform: translateX(-50%);
