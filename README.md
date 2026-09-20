@@ -672,3 +672,53 @@ transport drops room-scoped actions from drifters in other realms.
 opened once online before the offline night. A guest who joins mid-party
 syncs the wall/jukebox state on their next room hop (same late-joiner
 pattern as online). Keep the game in the foreground.
+
+## Build 35 — cache-bust hotfix (journey camera, round 2)
+Same-night follow-up to the build-34 journey-camera hotfix. The hotfix shipped
+with the same `?v=34` URLs, so phones that had already loaded build 34 kept
+serving the pre-hotfix `game.js` from HTTP cache — and worse, from the build-34
+service worker's cache-first `limbo-v34` cache, which the unchanged `sw.js`
+would have kept serving indefinitely. Build 35 bumps every version stamp
+(`?v=35`, SW cache `limbo-v35`); the new service worker uses skipWaiting +
+clients.claim and deletes old `limbo-v*` caches on activate, so one online
+visit flushes the stale bytes. No gameplay changes — the journey room already
+works solo (verified 9/9 on the live site with a clean cache: fly, steer,
+biomes, zero errors).
+
+## Build 36 — the open-field journey (Nexus-style free flight)
+
+Joshua's directive: *"I wanted the flying to be more like nexus. Maybe
+make a big open field map for us with those environments."* So the endless
+auto-forward rail is gone — the journey room now flies exactly like the
+Nexus (drag to steer, left side is the fly stick, the wisp keeps the same
+dreamy inertia), with one addition: the journey never stops drifting, a
+gentle cruise along your heading, like birds on the wing.
+
+**One big open field, four lands.** The recycling corridor is retired. The
+room is a single 1120×1120 map split into quadrants, and the four
+environments are regions of it: **THE SPIRES** (mountain peaks, northwest),
+**THE SLEEPING CITY** (tower blocks with lit windows, northeast),
+**THE LONG DUNES** (wind-shaped sand, southwest), **THE GRID** (neon lattice
+on black glass, southeast). Terrain tapers flat at the borders, so crossing
+between lands feels like drifting through a valley pass.
+
+**The world cross-fades around you.** Flying into a new land lerps the sky,
+fog color and fog density to that land's palette, retunes the ambient pad's
+root note (ducked while the jukebox or hosted album is playing), and a quiet
+banner names the land — plain words, his voice: THE SPIRES, THE SLEEPING
+CITY, THE LONG DUNES, THE GRID. A hysteresis band at the borders keeps the
+banner from flickering.
+
+**The edge is a fog wall, not a wall.** Past 440u the air thickens and a
+soft push-back turns you home; a hard clamp at 560u is the safety net. You
+spawn in the dunes facing the crossroads, where the **gate home** stands
+under a light beacon visible from anywhere in the field — fly through it to
+return to the Nexus.
+
+**Flocking survived the redesign** (build 33/34 mechanics, heading-aware
+now): the V formation's leader is the orb furthest along the flock's mean
+heading — every client computes this from the same broadcast headings, so
+all screens agree — and flying in formation still multiplies speed 1.35×
+(slipstream), with speed lines and a brighter trail. The jukebox, hosted
+album, and like/follow pill are all still in the room. Solo and multiplayer
+both work.

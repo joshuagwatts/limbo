@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=35">
+<link rel="stylesheet" href="css/style.css?v=36">
 <script type="importmap">
 {
   "imports": {
@@ -17,8 +17,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=35"></script>
-<script src="js/vendor/jsqr.js?v=35"></script>
+<script src="js/vendor/qrcode.js?v=36"></script>
+<script src="js/vendor/jsqr.js?v=36"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -117,6 +117,8 @@ if ('serviceWorker' in navigator) {
   </div>
   <div class="paint-hint">it paints live for everyone in the sound room</div>
 </div>
+<!-- build 36: journey zone banner — the land you're flying through. -->
+<div id="zone-name" aria-hidden="true"></div>
 <!-- build 33: journey room — like the jukebox track + follow Holowatts.
      Only visible while a jukebox track is playing in the endless journey. -->
 <div id="juke-social-pill" style="display:none">
@@ -313,6 +315,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=35"></script>
+<script type="module" src="js/game.js?v=36"></script>
 </body>
 </html>
