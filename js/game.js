@@ -5739,8 +5739,14 @@ function updateJourney(dt, t) {
   journey.steer.y *= Math.exp(-3 * dt);
   // banking into the turn
   try { wispCore.rotation.z += ((-sx * 0.4) - wispCore.rotation.z) * Math.min(1, dt * 6); } catch (e) {}
-  // camera basis for the shared follow-cam below
+  // camera basis for the follow-cam below (journey skips updatePlayer,
+  // which is where the camera lives in every other room — hotfix)
   _fwd.set(0, 0, -1);
+  _camWant.copy(wisp.position).addScaledVector(_fwd, -7).add(_jTmpB.set(0, 2.2, 0));
+  camera.position.lerp(_camWant, 1 - Math.exp(-8 * dt));
+  _lookAt.copy(wisp.position).addScaledVector(_fwd, 8);
+  camera.lookAt(_lookAt);
+  pushTrail(dt); // the orb's trail, same as free-fly rooms
   // --- world: biomes, chunks, atmosphere ---
   journeyApplyShift(scene);
   journeyEnsureChunks(scene);
