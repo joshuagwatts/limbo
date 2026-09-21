@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=50';
-import { CouchNet } from './couch.js?v=50';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=51';
+import { CouchNet } from './couch.js?v=51';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
 
@@ -7749,73 +7749,104 @@ function buildJourneyRays(scene) {
     g.scale.setScalar(1.1 + rnd() * 0.7);
     const ray = {
       group: g, wingR, wingL, hit,
-      cx: (rnd() - 0.5) * 700, cz: (rnd() - 0.5) * 700,
-      r: 45 + rnd() * 70,
-      w: (0.05 + rnd() * 0.07) * (rnd() < 0.5 ? 1 : -1),
-      phase: rnd() * Math.PI * 2,
-      yBase: 10 + rnd() * 22,
-      bobA: 1.5 + rnd() * 2.5,
-      flapSpd: 1.6 + rnd() * 0.9,
+      // flight brain: steered velocity toward a wandering sky target
+      vel: new THREE.Vector3((rnd() - 0.5) * 30, (rnd() - 0.5) * 6, (rnd() - 0.5) * 30),
+      tgt: new THREE.Vector3(),
+      yaw: rnd() * Math.PI * 2,
+      cruise: 26 + rnd() * 16,
+      flap: rnd() * Math.PI * 2,
+      flapSpd: 2,
+      rollT: 0, rollCd: 8 + rnd() * 24, rollDir: rnd() < 0.5 ? 1 : -1,
+      rndState: rnd,
       following: false,
     };
     hit.userData.ray = ray;
-    g.position.set(ray.cx + Math.cos(ray.phase) * ray.r, ray.yBase,
-      ray.cz + Math.sin(ray.phase) * ray.r);
+    g.rotation.order = 'YXZ';
+    g.position.set((rnd() - 0.5) * 700, 60 + rnd() * 120, (rnd() - 0.5) * 700);
+    journeyNewRayTarget(ray);
     scene.add(g);
     rays.push(ray);
   }
   journey.rays = rays;
 }
 
+/* A ray's next sky target — wide open field, real altitude. */
+function journeyNewRayTarget(ray) {
+  const r = ray.rndState || Math.random;
+  ray.tgt.set((r() - 0.5) * 620, 55 + r() * 140, (r() - 0.5) * 620);
+}
+
 function releaseRay(ray) {
   ray.following = false;
-  // resume the wander from right here — no snapping back to an old circle
-  ray.cx = ray.group.position.x;
-  ray.cz = ray.group.position.z;
-  ray.r = 50;
-  ray.yBase = Math.max(6, Math.min(40, ray.group.position.y));
+  // resume the wander from right here — pick a fresh target ahead of it
+  journeyNewRayTarget(ray);
 }
 
 function updateJourneyRays(dt, t) {
   if (!journey.rays) return;
+  const k = (s) => 1 - Math.exp(-s * dt);
   for (const ray of journey.rays) {
     const g = ray.group;
-    let hx, hy, hz;
+    let hx, hy, hz, spd;
     if (ray.following) {
       // a slot off the wisp's shoulder — a damped chase, never glued on
       _rayRight.crossVectors(myFwd, _rayUp).normalize();
       _raySlot.copy(wisp.position).addScaledVector(myFwd, -10)
         .addScaledVector(_rayRight, 5);
       _raySlot.y = Math.max(3.5, wisp.position.y + 3.5);
-      g.position.lerp(_raySlot, 1 - Math.exp(-1.7 * dt));
+      g.position.lerp(_raySlot, k(1.7));
       _jTmpA.copy(_raySlot).sub(g.position);
       if (_jTmpA.lengthSq() > 0.01) _jTmpA.normalize();
       else _jTmpA.copy(myFwd);
       hx = _jTmpA.x; hy = _jTmpA.y; hz = _jTmpA.z;
+      spd = 30;
     } else {
-      ray.phase += ray.w * dt;
-      const dir = Math.sign(ray.w);
-      const px = ray.cx + Math.cos(ray.phase) * ray.r;
-      const pz = ray.cz + Math.sin(ray.phase) * ray.r;
-      const py = ray.yBase + Math.sin(t * 0.5 + ray.phase * 3) * ray.bobA;
-      const k = 1 - Math.exp(-3 * dt);
-      g.position.x += (px - g.position.x) * k;
-      g.position.y += (py - g.position.y) * k;
-      g.position.z += (pz - g.position.z) * k;
-      hx = -Math.sin(ray.phase) * dir; hy = 0; hz = Math.cos(ray.phase) * dir;
+      // steering brain: chase the sky target, bank into every turn
+      _jTmpA.copy(ray.tgt).sub(g.position);
+      const dist = _jTmpA.length();
+      if (dist < 60) journeyNewRayTarget(ray);
+      else _jTmpA.multiplyScalar(1 / dist);
+      const cruise = ray.cruise * (ray.rollT > 0 ? 1.25 : 1);
+      _jTmpB.copy(_jTmpA).multiplyScalar(cruise);
+      ray.vel.lerp(_jTmpB, k(1.5));
+      // keep them out of the dirt and under the sky's lid
+      if (g.position.y < 25) ray.vel.y += 40 * dt;
+      if (g.position.y > 220) ray.vel.y -= 40 * dt;
+      g.position.addScaledVector(ray.vel, dt);
+      const vlen = ray.vel.length() || 1;
+      hx = ray.vel.x / vlen; hy = ray.vel.y / vlen; hz = ray.vel.z / vlen;
+      spd = vlen;
     }
-    // nose toward the heading, bank into the turn
+    // face the heading: yaw toward it, pitch with the climb, bank the turn
     const wantYaw = Math.atan2(hx, hz);
-    let dy = wantYaw - g.rotation.y;
+    let dy = wantYaw - ray.yaw;
     while (dy > Math.PI) dy -= Math.PI * 2;
     while (dy < -Math.PI) dy += Math.PI * 2;
-    const turn = Math.max(-0.9, Math.min(0.9, dy * 2.2));
-    g.rotation.y += dy * (1 - Math.exp(-3.2 * dt));
-    const wantBank = Math.max(-0.5, Math.min(0.5, -turn * 0.55));
-    g.rotation.z += (wantBank - g.rotation.z) * (1 - Math.exp(-2.5 * dt));
-    // wingbeat — harder when it's keeping up with you
-    const spd = ray.following ? ray.flapSpd * 1.7 : ray.flapSpd;
-    const flap = Math.sin(t * spd + ray.phase * 5) * (ray.following ? 0.5 : 0.36);
+    const turn = Math.max(-1, Math.min(1, dy * 2.4));
+    ray.yaw += dy * k(4);
+    const wantPitch = Math.max(-0.6, Math.min(0.6, -Math.asin(
+      Math.max(-1, Math.min(1, hy))) * 0.9));
+    const wantBank = Math.max(-0.65, Math.min(0.65, -turn * 0.6));
+    // the flourish: every so often a ray rolls clean through a barrel roll
+    ray.rollCd -= dt;
+    if (ray.rollCd <= 0 && !ray.following && ray.rollT <= 0) {
+      ray.rollT = 1.5; ray.rollCd = 14 + (ray.rndState || Math.random)() * 26;
+    }
+    let roll = 0;
+    if (ray.rollT > 0) {
+      ray.rollT -= dt;
+      roll = (1 - Math.max(0, ray.rollT) / 1.5) * Math.PI * 2 * ray.rollDir;
+    }
+    g.rotation.y = ray.yaw;
+    g.rotation.x += (wantPitch - g.rotation.x) * k(3);
+    g.rotation.z += (wantBank + roll - g.rotation.z) * k(5);
+    // wings: beat hard on the climb, hold flat on the dive — gliding birds
+    const climbing = hy > 0.08 && !ray.following;
+    const wantFlapSpd = ray.following ? 3.4 : climbing ? 6.5 : 1.4;
+    ray.flapSpd += (wantFlapSpd - ray.flapSpd) * k(2.5);
+    ray.flap += ray.flapSpd * dt;
+    const amp = ray.following ? 0.45 : climbing ? 0.6 : 0.1;
+    const flap = Math.sin(ray.flap) * amp;
     // wingL is mirrored (scale.x = -1), so the same sign lifts both tips
     ray.wingR.rotation.z = flap;
     ray.wingL.rotation.z = flap;
