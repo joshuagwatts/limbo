@@ -4117,6 +4117,17 @@ const JUKE_CONTENTION_MS = 1500; // competing jukePlays: earliest startedAt wins
    are expanded/resolved at queue time into plain youtube/soundcloud items.
    direct-audio (build 25): .mp3/.ogg/.wav/.m4a links play through the game's
    own WebAudio chain — sampler, FX and volume all work on them. */
+/* Build 57: every SoundCloud short-link shape — the current mobile share
+   host (on.soundcloud.com), the older snd.sc shortener, and the app's
+   Firebase Dynamic Links (soundcloud.app.goo.gl). All of them 404 in the
+   widget; all resolve through jukeResolveShortLink. */
+function jukeIsShortSCLink(url) {
+  try {
+    const h = new URL(String(url || '')).hostname.toLowerCase();
+    return h === 'on.soundcloud.com' || h === 'snd.sc' || h === 'soundcloud.app.goo.gl';
+  } catch (e) { return false; }
+}
+
 function jukeDetectProvider(raw) {
   let u;
   try { u = new URL(String(raw || '').trim()); }
@@ -4141,9 +4152,9 @@ function jukeDetectProvider(raw) {
     if (vid) return { provider: 'youtube', videoId: vid };
     return { provider: 'external' }; // some other youtube page (channel, bare /playlist…)
   }
+  // Short share links (mobile share, snd.sc, app Firebase links) — resolve at queue time.
+  if (jukeIsShortSCLink(u.href)) return { provider: 'soundcloud-short' };
   if (host === 'soundcloud.com' || host.endsWith('.soundcloud.com')) {
-    // Mobile "Share → Copy Link" gives on.soundcloud.com short links — resolve at queue time.
-    if (host === 'on.soundcloud.com') return { provider: 'soundcloud-short' };
     const parts = u.pathname.split('/').filter(Boolean);
     // api.soundcloud.com URLs come from oEmbed resolution of short links.
     if (host === 'api.soundcloud.com') {
@@ -4212,8 +4223,25 @@ async function jukeFetchTitle(url, provider) {
    URL via SoundCloud's own oEmbed (CORS-open, keyless): the returned iframe
    html carries the canonical url= param, and we get the real title for free.
    Returns { url, title } or null. */
+/* Resolve a SoundCloud short share link to its canonical track URL.
+   Build 57: soundcloud.app.goo.gl (Firebase Dynamic Links from the app)
+   won't answer oEmbed — follow the redirect first, then oEmbed the real
+   URL. Everything else goes straight to oEmbed. */
 async function jukeResolveShortLink(url) {
   try {
+    // Firebase app-share links: chase the redirect to the real track URL.
+    try {
+      const h = new URL(String(url || '')).hostname.toLowerCase();
+      if (h === 'soundcloud.app.goo.gl') {
+        const ctl2 = new AbortController();
+        const t2 = setTimeout(() => ctl2.abort(), 10000);
+        try {
+          const rr = await fetch(url, { redirect: 'follow', signal: ctl2.signal });
+          if (rr && rr.url && !jukeIsShortSCLink(rr.url)) url = rr.url;
+        } catch (e) { /* fall through to oEmbed with the original */ }
+        clearTimeout(t2);
+      }
+    } catch (e) { /* keep the original url */ }
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 15000); // build 54: was 8s — slow mobile networks need more
     const r = await fetch('https://soundcloud.com/oembed?url=' + encodeURIComponent(url) + '&format=json',
@@ -4391,10 +4419,10 @@ async function jukeAddTrack(rawUrl, titleHint) {
   }
   let url = cleanUrl; // build 45: extracted from pasted share text
   let resolvedTitle = titleHint || null;
-  // Mobile "Share → Copy Link" (on.soundcloud.com/xxx): resolve to the
-  // canonical track/set URL via oEmbed (also yields the real title). If it
-  // won't resolve here, the track keeps the short URL and gets one more
-  // resolve at play time (build 54) — the widget itself 404s on short
+  // Short share links (on.soundcloud.com, snd.sc, soundcloud.app.goo.gl):
+  // resolve to the canonical track/set URL via oEmbed (also yields the real
+  // title). If it won't resolve here, the track keeps the short URL and gets
+  // one more resolve at play time (build 54) — the widget itself 404s on short
   // links, so it is never handed one.
   if (det.provider === 'soundcloud-short') {
     jukeHint('resolving that soundcloud link…');
@@ -5237,7 +5265,7 @@ async function jukePlaySC(d, offset) {
     try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
     return;
   }
-  if (/^https?:\/\/(www\.)?on\.soundcloud\.com\//i.test(d.url || '')) {
+  if (jukeIsShortSCLink(d.url)) {
     jukeHint('resolving that soundcloud link…');
     let r = null;
     try { r = await jukeResolveShortLink(d.url); } catch (e) { r = null; }
