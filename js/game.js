@@ -15,6 +15,19 @@ import { CouchNet } from './couch.js?v=41';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
 
+/* Build 47: the build number rides the script's own ?v= cache-bust, so
+   the stamp below can never drift from what's actually running. */
+const LIMBO_BUILD = (() => {
+  try {
+    const m = String(import.meta.url || '').match(/[?&]v=(\d+)/);
+    return m ? m[1] : '?';
+  } catch (e) { return '?'; }
+})();
+try {
+  const bs = document.getElementById('build-stamp');
+  if (bs) bs.textContent = 'build ' + LIMBO_BUILD;
+} catch (e) {}
+
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
    "signal is aborted without reason" in Chrome. They're expected noise, not
@@ -2394,12 +2407,28 @@ function jamHitDrumLocal(drum, vel = 0.95) {
   renderJamJammers();
 }
 
+/* Build 47: chord readout — when anyone (you or a jammer) plays a chord,
+   the transport shows its name big. The pink pad flash stays; this is the
+   part you can actually read. */
+const jamChordDispEl = document.getElementById('jam-chord-disp');
+const jamChordWhoEl = document.getElementById('jam-chord-who');
+function jamShowChord(name, who) {
+  if (!jamChordDispEl) return;
+  jamChordDispEl.textContent = String(name || '–');
+  if (jamChordWhoEl) jamChordWhoEl.textContent = String(who || 'CHORD').toUpperCase().slice(0, 16);
+  // re-trigger the pop animation
+  jamChordDispEl.classList.remove('hit');
+  void jamChordDispEl.offsetWidth;
+  jamChordDispEl.classList.add('hit');
+}
+
 /* Chord stabs quantize to the bar — changes land like an arrangement. */
 function jamHitChordLocal(chord, vel = 0.85) {
   audioEnsureRunning(); // pad taps are gestures — iOS resumes the context here
   chord = Math.max(0, Math.min(JAM_CHORDS.length - 1, chord | 0));
   const ctx = audio.ctx;
   jamRenderChord(chord, vel, ctx ? ctx.currentTime + 0.01 : 0);
+  jamShowChord(JAM_CHORDS[chord].name, myName);
   const beatNow = jamBeatNow();
   const beat = beatNow != null ? quantizeUp(beatNow, 4) : null;
   jamBroadcastNote({ midi: 48, vel, beat, inst: 'pad', chord });
@@ -2430,6 +2459,8 @@ function handleJamNote(peerId, d) {
   };
   const drum = JAM_DRUMS.includes(d.drum) ? d.drum : null;
   const chord = Number.isInteger(Number(d.chord)) ? Number(d.chord) : null;
+  // build 47: a jammer's chord stab lights the readout with their name
+  if (chord != null && JAM_CHORDS[chord]) jamShowChord(JAM_CHORDS[chord].name, name);
   jamMarkJammer(name, inst);
   renderJamJammers();
   if (peerId) {
@@ -6561,11 +6592,13 @@ function buildJamLeadChords() {
   for (let d = 0; d < n; d++) {
     const midis = jamLeadChordMidis(d);
     const name = jamLeadChordRootName(d);
+    const q = jam.scale === 'chromatic' ? JAM_CHORD_QUALITIES[((d % 7) + 7) % 7] : null;
+    const dispName = name + (q === 'min' ? 'm' : q === 'dim' ? 'dim' : '');
     const b = document.createElement('button');
     b.className = 'jam-lead-chord';
     b.textContent = name;
     b.setAttribute('aria-label', 'chord on ' + name);
-    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamPlayChordLocal(midis, 0.85); });
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamPlayChordLocal(midis, 0.85); jamShowChord(dispName, myName); });
     jamLeadChordsEl.appendChild(b);
   }
 }
