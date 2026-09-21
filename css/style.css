@@ -494,6 +494,30 @@ html, body {
   box-shadow: 0 0 30px rgba(140, 180, 255, 0.25);
 }
 #drift-btn:disabled { opacity: 0.45; cursor: wait; }
+
+/* ---------- server picker (build 38) ---------- */
+#start-overlay .server-label { margin: 6px 0 -10px; }
+#server-list {
+  display: flex; flex-direction: column; gap: 5px;
+  width: min(300px, 78vw); max-height: 28vh; overflow-y: auto;
+  padding: 2px;
+}
+.server-row {
+  display: flex; justify-content: space-between; align-items: center;
+  background: transparent; border: 1px solid rgba(235, 240, 255, 0.14);
+  color: var(--ink-dim); font-family: inherit; font-weight: 300; font-size: 12px;
+  letter-spacing: 0.3em; text-indent: 0.3em; padding: 9px 16px;
+  cursor: pointer; transition: border-color 0.25s, color 0.25s, background 0.25s;
+}
+.server-row:hover { border-color: rgba(235, 240, 255, 0.45); color: var(--ink); }
+.server-row.sel {
+  border-color: rgba(150, 200, 255, 0.85); color: var(--ink);
+  background: rgba(140, 180, 255, 0.08);
+  box-shadow: 0 0 18px rgba(140, 180, 255, 0.22);
+}
+.server-row.off { justify-content: center; cursor: default; }
+.server-row .server-count { letter-spacing: 0.2em; font-size: 11px; color: var(--ink-faint); }
+.server-row.sel .server-count { color: var(--ink-dim); }
 #start-overlay .tiny {
   font-weight: 300; font-size: 10px;
   letter-spacing: 0.35em;
