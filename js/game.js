@@ -4095,7 +4095,6 @@ const juke = {
   joinWaiting: false, // autoplay blocked: pulsing "tap to join the music"
   prewarmed: false,   // build 25: first user gesture warms the provider players
   warmYt: null,       // {player, ready, queue} persistent invisible YT player
-  warmSc: null,       // {widget, ready, queue, armed, playingId} persistent invisible SC widget
   watchT: null,       // build 25: hardened playback watchdog timer
   playerErrored: false, // a provider error event fired for the current track
   phoneFiles: {},   // build 27: fileId -> {buf: Uint8Array, name, size, type} (uploader or fetched)
@@ -5048,20 +5047,17 @@ if (soundPillEl) {
   soundPillEl.addEventListener('click', () => { soundPillTap(); soundPillEl.blur(); });
 }
 
-/* ---------- invisible players (build 25) ----------
+/* ---------- invisible players (build 25, simplified build 55) ----------
    The provider iframes are permanently invisible (1px, off-screen, no
    pointer events — never display:none, which throttles some players).
-   After the game's first user gesture we build ONE persistent player per
-   provider; every track cues into it instead of rebuilding iframes, so
-   playback starts faster and more reliably. If warmup fails, the old
-   per-track path (jukePlayYTFresh / jukePlaySCFresh) still applies. */
-const JUKE_WARM_SC_URL = 'https://soundcloud.com/psylicious/dj-sarana-reflection'; // verified playable
+   YouTube keeps ONE persistent warm player (loadVideoById is solid);
+   SoundCloud plays one fresh widget per track, aimed straight at the URL —
+   simpler, and the proven path. */
 
 function jukePrewarm() {
   if (juke.prewarmed) return;
   juke.prewarmed = true;
   jukeEnsureWarmYT(() => {});
-  jukeEnsureWarmSC(() => {});
 }
 
 function jukeEnsureWarmYT(cb) {
@@ -5223,70 +5219,6 @@ function jukeOnTrackError(msg) {
   }
 }
 
-function jukeEnsureWarmSC(cb) {
-  if (juke.warmSc && juke.warmSc.ready) { cb(juke.warmSc); return; }
-  juke.warmSc = juke.warmSc || { widget: null, ready: false, queue: [], armed: null, playingId: null, playingFlag: () => false };
-  juke.warmSc.queue.push(cb);
-  if (juke.warmSc.widget) return; // building already
-  jukeLoadSCApi((ok) => {
-    const w = juke.warmSc;
-    if (!w) return;
-    if (!ok || !window.SC || !window.SC.Widget) {
-      w.queue.splice(0).forEach((f) => { try { f(null); } catch (e) {} });
-      juke.warmSc = null;
-      return;
-    }
-    try {
-      const holder = document.getElementById('juke-sc-holder');
-      const iframe = document.createElement('iframe');
-      iframe.id = 'juke-sc-warm';
-      iframe.setAttribute('frameborder', '0');
-      iframe.setAttribute('allow', 'autoplay');
-      iframe.width = '1'; iframe.height = '1';
-      iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(JUKE_WARM_SC_URL) +
-        '&auto_play=false&visual=false&hide_related=true&show_comments=false&show_user=false';
-      holder.appendChild(iframe);
-      const wg = window.SC.Widget(iframe);
-      let playingFlag = false;
-      const armedId = () => (w.armed && w.armed.d ? w.armed.d.id : null);
-      wg.bind(window.SC.Widget.Events.PLAY, () => { playingFlag = true; });
-      wg.bind(window.SC.Widget.Events.PAUSE, () => { playingFlag = false; });
-      wg.bind(window.SC.Widget.Events.FINISH, () => {
-        playingFlag = false;
-        if (w.playingId && juke.now && juke.now.id === w.playingId) jukeOnPlayerEnded();
-      });
-      wg.bind(window.SC.Widget.Events.ERROR, () => {
-        playingFlag = false;
-        // Only the armed/playing track may fail the room; a warmup-track
-        // failure just means warmup is degraded, not fatal.
-        if ((w.playingId && juke.now && juke.now.id === w.playingId) || armedId()) {
-          juke.playerErrored = true;
-          jukeOnTrackError();
-        }
-      });
-      wg.bind(window.SC.Widget.Events.READY, () => {
-        if (!w.ready) {
-          w.ready = true;
-          w.lastUrl = JUKE_WARM_SC_URL; // the warmup iframe already holds this track
-          w.queue.splice(0).forEach((f) => { try { f(w); } catch (e) {} });
-          return;
-        }
-        // READY after a per-track load(): arm the track at the room offset.
-        jukeArmWarmSC(w, wg, w.armed);
-      });
-      w.widget = wg;
-      w.playingFlag = () => playingFlag;
-      setTimeout(() => {
-        if (w && !w.ready && w.queue.length) {
-          w.queue.splice(0).forEach((f) => { try { f(null); } catch (e) {} });
-        }
-      }, 25000);
-    } catch (e) {
-      juke.warmSc = null;
-    }
-  });
-}
-
 /* Build 54: the widget 404s on on.soundcloud.com short links (verified),
    so a track whose URL never resolved at queue time gets one more resolve
    here, before any widget sees it. If it still won't resolve, say so
@@ -5313,80 +5245,15 @@ async function jukePlaySC(d, offset) {
       return;
     }
   }
-  jukeEnsureWarmSC((w) => {
-    if (!juke.now || juke.now.id !== d.id) return; // stale track
-    if (w && w.ready) { jukeUseWarmSC(w, d, offset); return; }
-    jukePlaySCFresh(d, offset);
-  });
+  // Build 55: one path — a fresh widget per track, aimed straight at the
+  // URL. (The warm widget's load() was a second failure mode with no upside
+  // for a jukebox; the per-track iframe is the proven player.)
+  if (!juke.now || juke.now.id !== d.id) return; // skipped while resolving
+  jukePlaySCFresh(d, offset);
 }
 
-function jukeUseWarmSC(w, d, offset) {
-  const wg = w.widget;
-  w.playingId = null;
-  let lastPos = null;
-  let lastDur = null;
-  juke.player = {
-    kind: 'soundcloud', warm: true,
-    get playingFlag() { return w.playingFlag(); },
-    play: () => { try { wg.play(); } catch (e) {} },
-    pause: () => { try { wg.pause(); } catch (e) {} },
-    seekTo: (s) => { try { wg.seekTo(Math.round(s * 1000)); } catch (e) {} },
-    pos: () => {
-      try { wg.getPosition((ms) => { lastPos = ms / 1000; }); } catch (e) {}
-      return lastPos;
-    },
-    dur: () => {
-      try { wg.getDuration((ms) => { lastDur = ms / 1000; }); } catch (e) {}
-      return lastDur;
-    },
-    setVolume: (v) => { try { wg.setVolume(v); } catch (e) {} },
-    destroy: () => { try { wg.pause(); } catch (e) {} w.armed = null; w.playingId = null; },
-  };
-  try { wg.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
-  const arm = { d, offset: jukeOffsetFor(d) };
-  jukeArmPlayWatchdog('soundcloud', d, () => {
-    // Build 54: the warm load never produced audio. Don't blindly re-arm —
-    // w.lastUrl is set optimistically before load() completes, so arming
-    // here could play whatever the widget still holds (wrong track).
-    // Fall back to a fresh widget, which navigates straight to the URL.
-    if (!juke.now || juke.now.id !== d.id) return;
-    try { wg.pause(); } catch (e) {}
-    w.armed = null; w.playingId = null;
-    jukePlaySCFresh(d, jukeOffsetFor(juke.now));
-  });
-  try {
-    if (w.lastUrl === d.url) {
-      // The widget already holds this track (e.g. the warmup track itself):
-      // load() with the same URL is a no-op that never re-fires READY,
-      // so arm it directly instead of waiting on an event that won't come.
-      jukeArmWarmSC(w, wg, arm);
-    } else {
-      w.armed = arm;
-      w.lastUrl = d.url;
-      wg.load(d.url, { auto_play: false, visual: false, hide_related: true, show_comments: false, show_user: false });
-    }
-  } catch (e) { jukeOnTrackError(); return; }
-}
-
-/* Arm an already-loaded SC track at the room offset: seek, play, duration.
-   Shared by the READY-after-load path and the same-URL shortcut. */
-function jukeArmWarmSC(w, wg, a) {
-  if (!a || !juke.now || juke.now.id !== a.d.id) return;
-  w.armed = null;
-  w.playingId = a.d.id;
-  try { wg.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
-  try { if (a.offset > 1) wg.seekTo(Math.round(a.offset * 1000)); } catch (e) {}
-  try { wg.play(); } catch (e) {}
-  try {
-    wg.getDuration((ms) => {
-      if (juke.now && juke.now.id === a.d.id && ms > 0) juke.now.durationMs = ms;
-    });
-  } catch (e) {}
-}
-
-/* Fallback when the warm widget couldn't be built: the old per-track
-   widget, still invisible. destroy() only unbinds — the transient iframe
-   is removed. */
+/* The per-track widget: a fresh invisible iframe aimed straight at the
+   track URL. destroy() only unbinds — the transient iframe is removed. */
 function jukePlaySCFresh(d, offset) {
   const holder = document.getElementById('juke-sc-holder');
   if (!holder) { jukeOnTrackError(); return; }
@@ -10436,7 +10303,7 @@ window.__limbo = {
   jukeWarmState: () => ({
     prewarmed: juke.prewarmed,
     yt: !!(juke.warmYt && juke.warmYt.ready),
-    sc: !!(juke.warmSc && juke.warmSc.ready),
+    sc: !!(juke.player && juke.player.kind === 'soundcloud'), // build 55: per-track, no warm widget
   }),
   jukeDirectRms: () => jukeDirectRms(),
   // build 27: phone-file P2P
