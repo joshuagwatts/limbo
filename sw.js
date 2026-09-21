@@ -14,7 +14,7 @@
  * successful (ok) responses).
  */
 
-const BUILD = '41';
+const BUILD = '42';
 const CACHE = `limbo-v${BUILD}`;
 
 /* Same version stamps the page uses (?v=40). query strings are part of
@@ -23,9 +23,9 @@ const CORE_ASSETS = [
   './',
   './index.html',
   './manifest.webmanifest',
-  './css/style.css?v=40',
-  './js/game.js?v=40',
-  './js/net.js?v=39',
+  './css/style.css?v=42',
+  './js/game.js?v=42',
+  './js/net.js?v=42',
   './js/couch.js?v=39',
   './js/jam.js?v=39',
   './js/audio.js?v=39',
