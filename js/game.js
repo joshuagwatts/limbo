@@ -13,7 +13,7 @@ import { AudioEngine } from './audio.js?v=41';
 import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=53';
 import { CouchNet } from './couch.js?v=53';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=42';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=42';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -1606,6 +1606,11 @@ const jam = {
     lfoRate: 5, // Hz
     lfoPitch: 0, // cents of vibrato
     lfoFilter: 0, // 0..1 filter wobble
+    // build 64: the synth's pedalboard — clipper drive, tempo delay, limiter
+    drive: 0, // 0..1 clipper drive
+    dlyMix: 0.25, // 0..1 delay wet
+    dlyFb: 0.35, // 0..0.92 delay feedback
+    dlyDiv: 0.75, // delay note value in beats (0.5=1/8, 0.75=dotted 1/8, 1=1/4)
   },
   scale: 'chromatic', // chromatic | minpent | majpent — the lead keys remap
   drumVariant: (() => { // build 63: per-pad sample pick (persists)
@@ -1810,18 +1815,32 @@ function jamEnsureChain() {
     const gains = {};
     // build 40: lead/drums/loop faders live on the mixer strip — the chain
     // is built from the stored mix so a rejoin keeps your levels.
+    // build 64: the synth's own pedalboard (clipper -> delay -> limiter)
+    // sits between the lead fader and the bus.
+    let synthFx = null;
+    try {
+      synthFx = createSynthFx(ctx);
+      synthFx.updateTempo(jam.bpm);
+      synthFx.setDrive(jam.synth.drive || 0);
+      synthFx.setDelay(jam.synth.dlyMix, jam.synth.dlyFb, jam.synth.dlyDiv);
+    } catch (e) { synthFx = null; }
     const levels = { lead: mixer.levels.lead, bass: 1.0, drums: mixer.levels.drums, pad: 0.8 };
     for (const id of JAM_INST_IDS) {
       const g = ctx.createGain();
       g.gain.value = levels[id];
-      g.connect(bus);
+      if (id === 'lead' && synthFx) {
+        g.connect(synthFx.input);
+        synthFx.output.connect(bus);
+      } else {
+        g.connect(bus);
+      }
       gains[id] = g;
     }
     const loopG = ctx.createGain();
     loopG.gain.value = mixer.levels.loop;
     loopG.connect(bus);
     gains.loop = loopG;
-    jam.chain = { bus, comp, conv, delay, revSend, dlySend, gains };
+    jam.chain = { bus, comp, conv, delay, revSend, dlySend, gains, synthFx };
     return jam.chain;
   } catch (e) {
     return null;
@@ -2338,6 +2357,7 @@ function jamSyncDelayToBpm() {
   if (!ch || !audio.ctx) return;
   try {
     ch.delay.delayTime.setTargetAtTime((60 / jam.bpm) * 0.75, audio.ctx.currentTime, 0.1);
+    if (ch.synthFx) ch.synthFx.updateTempo(jam.bpm); // build 64: synth delay follows too
   } catch (e) { /* ignore */ }
 }
 
@@ -7105,11 +7125,11 @@ if (jamMetroVolEl) jamMetroVolEl.addEventListener('input', () => {
  * room hears YOUR voice. Presets snap the whole patch at once. The key
  * scale remaps the one-octave keys (pentatonics span two octaves). */
 const JAM_PRESETS = {
-  spark: { wave: 'sawtooth', wave2: 'sawtooth', osc2mix: 0.45, cutoff: 3200, reso: 4, env: 0.5, attack: 0.005, decay: 0.35, sustain: 0.6, release: 0.3, sub: 0, spread: 14, echo: 0.4, glide: 0, lfoRate: 5, lfoPitch: 0, lfoFilter: 0 },
-  acid: { wave: 'sawtooth', wave2: 'square', osc2mix: 0.3, cutoff: 700, reso: 10, env: 0.85, attack: 0.004, decay: 0.3, sustain: 0.4, release: 0.2, sub: 0.15, spread: 8, echo: 0.25, glide: 0.06, lfoRate: 5, lfoPitch: 0, lfoFilter: 0 },
-  drift: { wave: 'sawtooth', wave2: 'triangle', osc2mix: 0.5, cutoff: 1400, reso: 2, env: 0.2, attack: 0.25, decay: 1.4, sustain: 0.8, release: 0.8, sub: 0.3, spread: 20, echo: 0.6, glide: 0.02, lfoRate: 0.4, lfoPitch: 0, lfoFilter: 0.35 },
-  pluck: { wave: 'square', wave2: 'sawtooth', osc2mix: 0.35, cutoff: 2400, reso: 6, env: 0.7, attack: 0.003, decay: 0.22, sustain: 0.25, release: 0.25, sub: 0, spread: 10, echo: 0.35, glide: 0, lfoRate: 5, lfoPitch: 0, lfoFilter: 0 },
-  pad: { wave: 'sawtooth', wave2: 'sawtooth', osc2mix: 0.6, cutoff: 1100, reso: 1.5, env: 0.15, attack: 0.6, decay: 1.2, sustain: 0.9, release: 1.2, sub: 0.25, spread: 24, echo: 0.7, glide: 0, lfoRate: 0.3, lfoPitch: 6, lfoFilter: 0.25 },
+  spark: { wave: 'sawtooth', wave2: 'sawtooth', osc2mix: 0.45, cutoff: 3200, reso: 4, env: 0.5, attack: 0.005, decay: 0.35, sustain: 0.6, release: 0.3, sub: 0, spread: 14, echo: 0.4, glide: 0, lfoRate: 5, lfoPitch: 0, lfoFilter: 0, drive: 0.15, dlyMix: 0.3, dlyFb: 0.35, dlyDiv: 0.75 },
+  acid: { wave: 'sawtooth', wave2: 'square', osc2mix: 0.3, cutoff: 700, reso: 10, env: 0.85, attack: 0.004, decay: 0.3, sustain: 0.4, release: 0.2, sub: 0.15, spread: 8, echo: 0.25, glide: 0.06, lfoRate: 5, lfoPitch: 0, lfoFilter: 0, drive: 0.45, dlyMix: 0.2, dlyFb: 0.3, dlyDiv: 0.5 },
+  drift: { wave: 'sawtooth', wave2: 'triangle', osc2mix: 0.5, cutoff: 1400, reso: 2, env: 0.2, attack: 0.25, decay: 1.4, sustain: 0.8, release: 0.8, sub: 0.3, spread: 20, echo: 0.6, glide: 0.02, lfoRate: 0.4, lfoPitch: 0, lfoFilter: 0.35, drive: 0, dlyMix: 0.45, dlyFb: 0.5, dlyDiv: 0.75 },
+  pluck: { wave: 'square', wave2: 'sawtooth', osc2mix: 0.35, cutoff: 2400, reso: 6, env: 0.7, attack: 0.003, decay: 0.22, sustain: 0.25, release: 0.25, sub: 0, spread: 10, echo: 0.35, glide: 0, lfoRate: 5, lfoPitch: 0, lfoFilter: 0, drive: 0.25, dlyMix: 0.25, dlyFb: 0.35, dlyDiv: 0.75 },
+  pad: { wave: 'sawtooth', wave2: 'sawtooth', osc2mix: 0.6, cutoff: 1100, reso: 1.5, env: 0.15, attack: 0.6, decay: 1.2, sustain: 0.9, release: 1.2, sub: 0.25, spread: 24, echo: 0.7, glide: 0, lfoRate: 0.3, lfoPitch: 6, lfoFilter: 0.25, drive: 0, dlyMix: 0.4, dlyFb: 0.45, dlyDiv: 1 },
 };
 const JAM_SYNTH_SLIDERS = [
   // [element id, patch key, fromSlider, toSlider]
@@ -7128,7 +7148,20 @@ const JAM_SYNTH_SLIDERS = [
   ['jam-spread', 'spread', (v) => v, (v) => v],
   ['jam-echo', 'echo', (v) => v / 100, (v) => v * 100],
   ['jam-glide', 'glide', (v) => v / 100, (v) => v * 100],
+  // build 64: the pedalboard
+  ['jam-drive', 'drive', (v) => v / 100, (v) => v * 100],
+  ['jam-dlymix', 'dlyMix', (v) => v / 100, (v) => v * 100],
+  ['jam-dlyfb', 'dlyFb', (v) => v / 100, (v) => v * 100],
 ];
+/* Build 64: push the pedalboard knobs into the live FX chain. */
+function jamSyncSynthFx() {
+  const fx = jam.chain && jam.chain.synthFx;
+  if (!fx) return;
+  try {
+    fx.setDrive(jam.synth.drive);
+    fx.setDelay(jam.synth.dlyMix, jam.synth.dlyFb, jam.synth.dlyDiv);
+  } catch (e) { /* ignore */ }
+}
 function jamSyncSynthUI() {
   const s = jam.synth;
   for (const [id, key, , toSlider] of JAM_SYNTH_SLIDERS) {
@@ -7139,6 +7172,9 @@ function jamSyncSynthUI() {
     const osc = x.dataset.osc || '1';
     x.classList.toggle('sel', (osc === '2' ? s.wave2 : s.wave) === x.dataset.wave);
   });
+  document.querySelectorAll('.jam-dlydiv').forEach((x) =>
+    x.classList.toggle('sel', Number(x.dataset.div) === s.dlyDiv));
+  jamSyncSynthFx(); // build 64: presets land on the pedalboard too
 }
 function jamApplyPreset(name) {
   const p = JAM_PRESETS[name];
@@ -7167,9 +7203,21 @@ for (const [id, key, fromSlider] of JAM_SYNTH_SLIDERS) {
   const el = document.getElementById(id);
   if (el) el.addEventListener('input', () => {
     jam.synth[key] = fromSlider(Number(el.value));
+    jamSyncSynthFx(); // build 64: pedalboard knobs hit the live chain
     document.querySelectorAll('.jam-preset').forEach((x) => x.classList.remove('sel'));
   });
 }
+/* Build 64: delay note-value buttons (1/8, dotted 1/8, 1/4). */
+document.querySelectorAll('.jam-dlydiv').forEach((b) => {
+  b.addEventListener('click', () => {
+    jam.synth.dlyDiv = Number(b.dataset.div) || 0.75;
+    document.querySelectorAll('.jam-dlydiv').forEach((x) =>
+      x.classList.toggle('sel', x === b));
+    jamSyncSynthFx();
+    document.querySelectorAll('.jam-preset').forEach((x) => x.classList.remove('sel'));
+    b.blur();
+  });
+});
 document.querySelectorAll('.jam-scale').forEach((b) => {
   b.addEventListener('click', () => {
     jam.scale = b.dataset.scale || 'chromatic';
