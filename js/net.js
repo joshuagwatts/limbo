@@ -78,7 +78,17 @@
 
 const APP_ID = 'limbo_by_holowatts';
 const MAX_NAME = 16;
-const NEXUS_ROOM = 'limbo-nexus';
+/* Build 38 — numbered Nexus servers. Fresh clients pick one in the start
+   overlay (#1–#10, live headcounts from the lobby); the Trystero room key
+   is 'limbo-nexus-N'. The old bare 'limbo-nexus' room is retired. */
+const NEXUS_SERVERS = 10;
+function nexusServerKey(n) {
+  const k = Math.min(Math.max(1, (n | 0) || 1), NEXUS_SERVERS);
+  return 'limbo-nexus-' + k;
+}
+function isNexusServerKey(k) {
+  return /^limbo-nexus-\d+$/.test(String(k || ''));
+}
 /* Shared presence room: every client joins it at boot and heartbeats
    {name, realm} here. Presence ONLY — no wisps, no chat — so the friends
    list can show who's live and where without joining every realm room. */
@@ -90,7 +100,7 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '37';
+const BUILD = '38';
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
@@ -847,8 +857,17 @@ export class LimboNet {
 
   /* Loads all strategy modules (tolerating individual failures) + TURN
      credentials. Resolves true when at least one strategy loaded. */
+  /* Build 38: boot is idempotent — the start overlay boots early (so the
+     server picker has live headcounts) and the drift tap re-boots with the
+     real name. Same promise, name updated. */
   async boot(name) {
-    this.name = this.cleanName(name);
+    if (name) this.name = this.cleanName(name);
+    if (this._bootPromise) return this._bootPromise;
+    this._bootPromise = this._boot();
+    return this._bootPromise;
+  }
+
+  async _boot() {
     this.clientId = this._makeClientId();
     try {
       this.turnCreds = await makeTurnCreds();
@@ -908,6 +927,14 @@ export class LimboNet {
          fall back to STUN-only behavior for this room */
     }
     this._joinAll();
+    // build 38: relay-FIRST — engage the relay the moment we join instead
+    // of burning ~30s on a direct connection the carrier will never allow.
+    // Fire-and-forget: WebRTC keeps trying in parallel and direct peers
+    // still merge in. The watchdog / join-error / no-discovery triggers
+    // below stay as backstops (all no-op once relayMode is true).
+    try {
+      this.enterRelayMode('join-fast').catch(() => {});
+    } catch (e) {}
     // build 37: relay mode is sticky across room hops — move the room
     // subscription to the new room's tag. (leave() already dropped the old
     // tag's peers via peers.clear().)
@@ -1162,7 +1189,7 @@ export class LimboNet {
         !this.quietFired &&
         this.peerCount() === 0 &&
         this.roomKey &&
-        this.roomKey !== NEXUS_ROOM &&
+        !isNexusServerKey(this.roomKey) &&
         this.onQuietCb
       ) {
         this.quietFired = true;
@@ -1872,3 +1899,6 @@ export class LimboNet {
 function r1(v) {
   return Math.round(v * 10) / 10;
 }
+
+/* Build 38: numbered Nexus servers, shared with game.js for the picker. */
+export { NEXUS_SERVERS, nexusServerKey, isNexusServerKey };

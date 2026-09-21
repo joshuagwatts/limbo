@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=37';
-import { LimboNet } from './net.js?v=37';
-import { CouchNet } from './couch.js?v=37';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=37';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=37';
+import { AudioEngine } from './audio.js?v=38';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=38';
+import { CouchNet } from './couch.js?v=38';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=38';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=38';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -201,10 +201,25 @@ try { myName = localStorage.getItem('limbo_name') || 'drifter'; } catch (e) { /*
 if (nameInput && myName !== 'drifter') nameInput.value = myName;
 
 function roomKeyFor(worldKey) {
-  if (worldKey === 'nexus') return 'limbo-nexus';
+  if (worldKey === 'nexus') return nexusServerKey(selectedServer);
   if (worldKey === SOUND_ROOM_KEY) return 'limbo-realm-5';
   if (worldKey === JOURNEY_ROOM_KEY) return 'limbo-realm-6';
   return 'limbo-realm-' + worldKey.replace('realm', '');
+}
+
+/* Build 38 — numbered Nexus servers. The start overlay lets the drifter
+   pick #1–#10 with live headcounts; the pick survives realm hops. */
+let selectedServer = 1;
+function serverCount(n) {
+  const key = nexusServerKey(n);
+  let c = 0;
+  for (const [, p] of net.lobbyPeers) if (p.room === key) c++;
+  return c;
+}
+/* What our lobby heartbeat advertises: the full server room key in the
+   Nexus, the plain world key everywhere else. */
+function presenceKeyFor(worldKey) {
+  return worldKey === 'nexus' ? nexusServerKey(selectedServer) : worldKey;
 }
 
 /* ---------------- tiny utils ---------------- */
@@ -793,6 +808,7 @@ function livePresenceFor(name) {
   return best;
 }
 function realmDisplayName(key) {
+  if (isNexusServerKey(key)) return 'Nexus #' + key.split('-').pop();
   if (key === 'nexus') return NEXUS_DEF.name;
   if (key === SOUND_ROOM_KEY) return SOUND_DEF.name;
   if (key === JOURNEY_ROOM_KEY) return JOURNEY_DEF.name;
@@ -844,6 +860,69 @@ function renderFriendsSection() {
     friendsListEl.appendChild(row);
   }
   if (friendsLiveEl) friendsLiveEl.textContent = liveCount > 0 ? `— ${liveCount} drifting now` : '';
+}
+
+/* ---------------- server picker (build 38) ----------------
+   Numbered Nexus servers with live headcounts from the lobby roster.
+   Rendered in the start overlay once net boots; re-rendered in place on
+   every presence tick (no DOM rebuild under the user's finger). The pick
+   survives realm hops via selectedServer. */
+
+const serverListEl = document.getElementById('server-list');
+let serverListTouched = false; // the drifter picked manually — stop auto-select
+
+function bestServer() {
+  let best = 1, bestN = -1;
+  for (let n = 1; n <= NEXUS_SERVERS; n++) {
+    const c = serverCount(n);
+    if (c > bestN) { bestN = c; best = n; }
+  }
+  return best;
+}
+
+function renderServerList() {
+  if (!serverListEl || started) return; // overlay gone — nothing to render
+  if (!net.enabled) {
+    serverListEl.innerHTML = '';
+    const d = document.createElement('div');
+    d.className = 'server-row off';
+    d.textContent = 'offline — solo drift';
+    serverListEl.appendChild(d);
+    return;
+  }
+  if (!serverListTouched) selectedServer = bestServer();
+  let rows = serverListEl.querySelectorAll('.server-row');
+  if (rows.length !== NEXUS_SERVERS) {
+    serverListEl.innerHTML = '';
+    for (let n = 1; n <= NEXUS_SERVERS; n++) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'server-row';
+      row.setAttribute('role', 'option');
+      const num = document.createElement('span');
+      num.className = 'server-num';
+      num.textContent = '#' + n;
+      const cnt = document.createElement('span');
+      cnt.className = 'server-count';
+      row.appendChild(num);
+      row.appendChild(cnt);
+      row.addEventListener('click', () => {
+        selectedServer = n;
+        serverListTouched = true;
+        renderServerList();
+        row.blur();
+      });
+      serverListEl.appendChild(row);
+    }
+    rows = serverListEl.querySelectorAll('.server-row');
+  }
+  rows.forEach((row, i) => {
+    const n = i + 1;
+    const c = serverCount(n);
+    row.classList.toggle('sel', n === selectedServer);
+    row.setAttribute('aria-selected', n === selectedServer ? 'true' : 'false');
+    row.querySelector('.server-count').textContent = c === 0 ? 'empty' : c + ' here';
+  });
 }
 
 /* ---------------- sound room: shared jam + jukebox (build 12; broadcast relay retired build 28) ----------------
@@ -6046,6 +6125,15 @@ function finishBoot() {
   loadingEl.classList.add('done');
   driftBtn.disabled = false;
   driftBtn.textContent = 'click to drift';
+  // Build 38: boot net NOW (not on the drift tap) so the server picker has
+  // live headcounts before the drifter picks. Idempotent — the drift tap
+  // re-boots with the real name on the same promise.
+  try {
+    net.boot((nameInput.value || '').trim() || myName || 'drifter').then((ok) => {
+      if (ok) net.joinLobby(); // shared presence room: who's live, where
+      renderServerList();
+    });
+  } catch (e) { renderServerList(); /* solo drift */ }
   requestAnimationFrame(loop);
 }
 manager.onProgress = (url, loaded, total) => {
@@ -6583,6 +6671,13 @@ function showTitleCard(name) {
 }
 
 function goTo(key) {
+  // Build 38: a friend in Nexus #N advertises the full server room key —
+  // land on their server, then portal to the Nexus world itself.
+  if (isNexusServerKey(key)) {
+    const n = parseInt(String(key).split('-').pop(), 10);
+    if (n >= 1 && n <= NEXUS_SERVERS) { selectedServer = n; renderServerList(); }
+    key = 'nexus';
+  }
   if (transitioning || !worlds[key]) return;
   // Leaving the sound room: stop the live relay + the mic automatically.
   if (active && active.key === SOUND_ROOM_KEY && key !== SOUND_ROOM_KEY) { jamMicOff(); }
@@ -6595,7 +6690,7 @@ function goTo(key) {
     active.scene.add(wisp, localTrail.group, peerLayer); // re-parents from the previous scene
     clearPeerVisuals();                       // old room's drifters stay in the old room
     net.join(roomKeyFor(active.key));         // hop to this location's P2P room
-    net.setPresence(myName, active.key);      // lobby heartbeat: we're elsewhere now
+    net.setPresence(myName, presenceKeyFor(active.key)); // lobby heartbeat: we're elsewhere now
     updatePeerCount();
     wisp.position.copy(active.spawn);
     vel.set(0, 0, 0);
@@ -6862,7 +6957,7 @@ net.onChatCb = (peerId, d) => {
 };
 net.onQuietCb = () =>
   addSystemLine('the void is quiet here — drift to the Nexus to find other drifters');
-net.onPresenceCb = () => { if (settingsOpen) renderFriendsSection(); };
+net.onPresenceCb = () => { if (settingsOpen) renderFriendsSection(); if (!started) renderServerList(); };
 // Jam room (build 13): clock/note/pad events -> local synthesis.
 net.onJamClockCb = handleJamClock;
 net.onJamNoteCb = handleJamNote;
@@ -7041,7 +7136,7 @@ driftBtn.addEventListener('click', () => {
   // Multiplayer: best-effort — the game plays exactly like v1 without it.
   net.boot(myName).then((ok) => {
     if (ok) {
-      net.setPresence(myName, active.key);
+      net.setPresence(myName, presenceKeyFor(active.key));
       net.joinLobby(); // shared presence room: who's live, where
       net.join(roomKeyFor(active.key));
       updatePeerCount();
@@ -7308,6 +7403,11 @@ window.__limbo = {
   notePresence: (id, d) => net._notePresence(id, d),
   sweepLobby: (now) => net._sweepLobby(now),
   joinLobby: () => net.joinLobby(),
+  // servers (build 38)
+  selectedServer: () => selectedServer,
+  selectServer: (n) => { selectedServer = n; serverListTouched = true; renderServerList(); },
+  renderServerList,
+  serverCount,
   // couch co-op (build 34): offline LAN transport + ceremony
   couchNet, // direct handle (bypasses the dispatcher proxy)
   couchActive: () => couchActive,
