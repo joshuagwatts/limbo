@@ -4132,7 +4132,7 @@ const juke = {
   volume: 0.7,
   ytApiReady: false, ytApiLoading: false, ytApiQueue: [],
   scApiReady: false, scApiLoading: false, scApiQueue: [],
-  resyncTimer: null, endTimer: null, progressTimer: null,
+  resyncTimer: null, endTimer: null, progressRaf: null,
   overSince: 0,       // Date.now() when the current track was first seen over
   joinWaiting: false, // autoplay blocked: pulsing "tap to join the music"
   prewarmed: false,   // build 25: first user gesture warms the provider players
@@ -5797,13 +5797,14 @@ function jukeArmResync() {
 }
 
 function jukeArmProgress() {
-  clearInterval(juke.progressTimer);
-  /* Build 60: monotonic + 4x updates. The bar is wall-clock driven, so a
-     startedAt bump (sync) or duration refinement used to make it jump.
-     Within a track it now never moves backward, and forward leaps are
-     capped — hiccups absorbed, motion stays smooth. */
+  cancelAnimationFrame(juke.progressRaf);
+  /* Build 61: frame-synced, monotonic. The bar is wall-clock driven, so a
+     startedAt bump (sync) or duration refinement used to make it leap.
+     Within a track it now never moves backward, and rAF (no CSS transition
+     fighting the timer) keeps motion fluid even when ticks jitter. */
   let lastP = -1, lastTrackId = null;
-  juke.progressTimer = setInterval(() => {
+  const tick = () => {
+    juke.progressRaf = requestAnimationFrame(tick);
     const fill = document.getElementById('juke-progress-fill');
     if (!fill || !juke.now) return;
     const tid = juke.now.id;
@@ -5811,19 +5812,16 @@ function jukeArmProgress() {
     const dm = juke.now.durationMs;
     if (dm && dm > 0) {
       let p = Math.min(1, (Date.now() - juke.now.startedAt) / dm);
-      if (lastP >= 0) {
-        if (p < lastP) p = lastP; // never backward within a track
-        const maxStep = (5 * 1000) / dm; // cap forward leaps to 5s of progress
-        if (p - lastP > maxStep) p = lastP + maxStep;
-      }
+      if (lastP >= 0 && p < lastP) p = lastP; // never backward within a track
       lastP = p;
       fill.classList.remove('pulse');
-      fill.style.width = (p * 100).toFixed(1) + '%';
+      fill.style.width = (p * 100).toFixed(2) + '%';
     } else {
       fill.style.width = '';
       fill.classList.add('pulse');
     }
-  }, 250);
+  };
+  juke.progressRaf = requestAnimationFrame(tick);
 }
 
 function jukeStopPlayer() {
@@ -5846,7 +5844,8 @@ function jukeStopPlayback() {
   jukeStopPlayer();
   clearInterval(juke.endTimer); juke.endTimer = null;
   clearInterval(juke.resyncTimer); juke.resyncTimer = null;
-  clearInterval(juke.progressTimer); juke.progressTimer = null;
+  try { cancelAnimationFrame(juke.progressRaf); } catch (e) {}
+  juke.progressRaf = null;
   juke.overSince = 0;
   juke.joinWaiting = false;
 }
