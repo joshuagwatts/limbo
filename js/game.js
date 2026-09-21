@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=41';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=42';
 import { CouchNet } from './couch.js?v=41';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
@@ -8170,16 +8170,21 @@ function addSystemLine(text) {
 function sendChatLine() {
   const text = chatInput.value.trim().slice(0, 140);
   if (!text) { chatInput.blur(); return; }
-  addChatLine(myName, text, false, true);
   if (net.enabled && net.sendChat) {
-    net.say(text);
+    try {
+      net.say(text);
+    } catch (e) {
+      addSystemLine('that one didn\u2019t carry \u2014 your words are still here, try again');
+      return; // keep the draft: nothing typed is lost
+    }
+    addChatLine(myName, text, false, true);
+    chatInput.value = '';
+    // After sending we dismiss the keyboard on touch devices.
+    if (window.matchMedia && matchMedia('(pointer: coarse)').matches) chatInput.blur();
   } else {
     addSystemLine('the void is quiet \u2014 no connection to send with');
+    // keep the draft: it can fly once the connection is back
   }
-  chatInput.value = '';
-  // On touch devices the keyboard's action key may not fire Enter — the
-  // send button covers that — and after sending we dismiss the keyboard.
-  if (window.matchMedia && matchMedia('(pointer: coarse)').matches) chatInput.blur();
 }
 
 /* Floating speech bubble above a peer's wisp, ~4s. Only when on screen. */
@@ -8263,13 +8268,31 @@ chatInput.addEventListener('blur', () => { chatFocused = false; });
 })();
 chatInput.addEventListener('keydown', (e) => {
   e.stopPropagation(); // keep game keys out of the window handler
-  if (e.key === 'Enter') sendChatLine();
+  if (e.key === 'Enter') { lastChatSendAt = Date.now(); sendChatLine(); }
   else if (e.key === 'Escape') chatInput.blur();
 });
 
-// Send button — the touch path. Phone keyboards often dismiss instead of
-// firing Enter on a bare input, so without this mobile chat can't send.
-chatSend.addEventListener('click', () => { sendChatLine(); chatSend.blur(); });
+/* Send button — the touch path. Phone keyboards often dismiss instead of
+   firing Enter on a bare input, so without this mobile chat can't send.
+   build 42: iOS Safari was silently eating the tap. Tapping the button
+   blurs the input, the keyboard starts away, and the keyboard-lift drops
+   the whole chat bar ~300px *between* touchstart and touchend — the button
+   moves out from under the finger before the click can land. So we send on
+   pointerdown (fires first, before any blur or layout shift) and freeze the
+   layout with preventDefault. */
+let lastChatSendAt = 0;
+function chatSendNow(e) {
+  if (e) e.preventDefault(); // no blur, no keyboard bounce: the button stays put
+  lastChatSendAt = Date.now();
+  sendChatLine();
+}
+chatSend.addEventListener('pointerdown', chatSendNow);
+chatSend.addEventListener('click', () => {
+  // pointerdown already handled touch taps (its preventDefault suppresses
+  // the compat click); this is the mouse/keyboard-activation path only.
+  if (Date.now() - lastChatSendAt < 700) return;
+  chatSendNow(null);
+});
 
 // Toggleable history panel (speech-bubble button).
 let chatLogOpen = true;
