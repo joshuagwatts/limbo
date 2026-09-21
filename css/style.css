@@ -1724,6 +1724,19 @@ html { -webkit-text-size-adjust: 100%; }
   background: rgba(6, 8, 18, 0.66);
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
+/* build 49: manta-ray tap feedback — quiet toast, bottom-center */
+#journey-toast {
+  position: fixed;
+  left: 50%; bottom: calc(110px + env(safe-area-inset-bottom));
+  transform: translateX(-50%) translateY(10px);
+  background: rgba(8, 14, 30, 0.85);
+  border: 1px solid rgba(157, 184, 221, 0.45); border-radius: 18px;
+  color: #d8e8ff; font-size: 13px; letter-spacing: 0.04em;
+  padding: 9px 16px; white-space: nowrap;
+  opacity: 0; transition: opacity 0.35s ease, transform 0.35s ease;
+  pointer-events: none; z-index: 31;
+}
+#journey-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
 /* ---------- build 47: chord readout ---------- */
 .jam-chord-wrap { text-align: center; min-width: 64px; }
