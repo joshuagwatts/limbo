@@ -5311,15 +5311,42 @@ function jukePlaySCFresh(d, offset) {
     try {
       const w = window.SC.Widget(iframe);
       let playingFlag = false;
+      let playAt = 0;   // build 58: last PLAY timestamp
+      let peakMs = 0;   // build 58: furthest real widget position seen
+      let posIv = null; // build 58: position sampler (PLAY fires before the stream is confirmed)
       w.bind(window.SC.Widget.Events.PLAY, () => {
         playingFlag = true;
+        playAt = Date.now();
         // Build 56: the track beat the watchdog on its own (slow network) —
         // clear the stale "tap to join" pill instead of leaving it up.
         if (juke.joinWaiting) { juke.joinWaiting = false; renderJuke(); }
+        if (!posIv) posIv = setInterval(() => {
+          try { w.getPosition((ms) => { if (ms > peakMs) peakMs = ms; }); } catch (e) {}
+        }, 1000);
       });
-      w.bind(window.SC.Widget.Events.PAUSE, () => { playingFlag = false; });
-      w.bind(window.SC.Widget.Events.FINISH, () => { playingFlag = false; jukeOnPlayerEnded(); });
-      w.bind(window.SC.Widget.Events.ERROR, () => { playingFlag = false; juke.playerErrored = true; jukeOnTrackError(); });
+      w.bind(window.SC.Widget.Events.PAUSE, () => {
+        playingFlag = false;
+        // Build 58: PLAY followed quickly by PAUSE with the needle never
+        // moving means SoundCloud's audio stream died upstream (the track
+        // itself is broken — metadata loads, media 404s). Say so honestly
+        // and move on instead of sitting silent with a moving progress bar.
+        if (playAt && Date.now() - playAt < 12000 && peakMs < 2000) {
+          playAt = 0;
+          if (posIv) { clearInterval(posIv); posIv = null; }
+          juke.playerErrored = true;
+          jukeOnTrackError('that track\u2019s audio wouldn\u2019t load on soundcloud');
+        }
+      });
+      w.bind(window.SC.Widget.Events.FINISH, () => {
+        playingFlag = false;
+        if (posIv) { clearInterval(posIv); posIv = null; }
+        jukeOnPlayerEnded();
+      });
+      w.bind(window.SC.Widget.Events.ERROR, () => {
+        playingFlag = false;
+        if (posIv) { clearInterval(posIv); posIv = null; }
+        juke.playerErrored = true; jukeOnTrackError();
+      });
       w.bind(window.SC.Widget.Events.READY, () => {
         const off = juke.now && juke.now.id === d.id ? jukeOffsetFor(juke.now) : 0;
         try { w.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
@@ -5353,7 +5380,7 @@ function jukePlaySCFresh(d, offset) {
           return lastDur;
         },
         setVolume: (v) => { try { w.setVolume(v); } catch (e) {} },
-        destroy: () => { try { w.unbind(window.SC.Widget.Events.FINISH); } catch (e) {} try { iframe.remove(); } catch (e) {} },
+        destroy: () => { try { if (posIv) clearInterval(posIv); } catch (e) {} try { w.unbind(window.SC.Widget.Events.FINISH); } catch (e) {} try { iframe.remove(); } catch (e) {} },
       };
     } catch (e) { jukeOnTrackError(); }
   });
