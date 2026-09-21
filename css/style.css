@@ -1724,3 +1724,19 @@ html { -webkit-text-size-adjust: 100%; }
   background: rgba(6, 8, 18, 0.66);
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
+
+/* ---------- build 47: chord readout ---------- */
+.jam-chord-wrap { text-align: center; min-width: 64px; }
+#jam-chord-disp { font-size: 30px; color: #ffc7ea; line-height: 1; min-height: 30px; }
+#jam-chord-disp.hit { animation: jam-chord-pop 0.45s ease; }
+@keyframes jam-chord-pop {
+  0% { transform: scale(1.4); filter: brightness(1.7); }
+  100% { transform: scale(1); filter: none; }
+}
+#jam-chord-who { max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- build 47: build stamp on the start overlay ---------- */
+#build-stamp {
+  position: absolute; bottom: calc(10px + env(safe-area-inset-bottom)); right: 14px;
+  font-size: 10px; letter-spacing: 0.22em; color: var(--ink-dim); opacity: 0.75;
+}
