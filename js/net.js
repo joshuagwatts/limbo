@@ -100,7 +100,7 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '40';
+const BUILD = '41';
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
@@ -158,11 +158,23 @@ const ACTION_CBS = {
   jukeFileChunk: 'onJukeFileChunkCb',
   jukeFileHave: 'onJukeFileHaveCb',
   jukeLike: 'onJukeLikeCb', // build 33: P2P likes for the jukebox track
+  voiceChunk: 'onVoiceChunkCb', // build 40: live room voice over the relay
+  voiceTalk: 'onVoiceTalkCb',
 };
 const BROADCAST_ACTIONS = Object.keys(ACTION_CBS).filter(
   (n) => n !== 'jukeFileReq' && n !== 'jukeFileChunk'
 );
 const TARGETED_ACTIONS = ['jukeFileReq', 'jukeFileChunk'];
+
+/* Build 41: the jukebox is server-wide. These actions ride a dedicated
+   server channel (the selected Nexus server's tag) instead of the current
+   world room — one shared queue per server, same list on every phone,
+   whether you're in the sound room, the journey, or the nexus itself.
+   jukeFileReq/Chunk stay world-room targeted (direct transfers only). */
+const JUKE_SERVER_ACTIONS = new Set([
+  'jukeAdd', 'jukeRemove', 'jukePlay', 'jukeSkipVote',
+  'jukeStateReq', 'jukeState', 'jukeLike',
+]);
 
 /* OpenRelay static-auth (no signup): time-limited HMAC-SHA1 credentials. */
 const TURN_HOST = 'staticauth.openrelay.metered.ca';
@@ -512,6 +524,8 @@ export class LimboNet {
     this.onJukeFileHaveCb = null; // (data, peerId)
     this.onJukeStateReqCb = null; // (data, peerId)
     this.onJukeStateCb = null; // (data, peerId)
+    this.onVoiceChunkCb = null; // (data, peerId)
+    this.onVoiceTalkCb = null; // (data, peerId)
     // send functions are installed by _joinAll(); null when no rooms
     this._nullSends();
     this.quietTimer = null;
@@ -548,6 +562,10 @@ export class LimboNet {
     this.relayMode = false;
     this._relayRoomTag = null;
     this._relaySince = 0;
+    // --- server-wide jukebox channel (build 41) ---
+    this._jukeServerKey = null; // e.g. 'limbo-nexus-3'
+    this._jukeServerTag = null; // relay tag subscribed for jukebox traffic
+    this._jukeServerHandler = (obj) => this._onRelayJukeServer(obj);
     this._lastRelayWisp = 0;
     this._relaySkipLogged = new Set();
     this._relayRoomHandler = (obj) => this._onRelayRoom(obj);
@@ -943,6 +961,8 @@ export class LimboNet {
         this.relayLink.unsubscribe(this._relayRoomTag, this._relayRoomHandler);
       this._relayRoomTag = this.relayLink.tagFor(roomKey);
       this.relayLink.subscribe(this._relayRoomTag, this._relayRoomHandler);
+      // build 41: keep the server-wide jukebox channel across room hops
+      this.setJukeServer(this._jukeServerKey);
     }
     this._armQuietTimer();
     this._updatePill();
@@ -992,12 +1012,79 @@ export class LimboNet {
     }
     if (this.rooms.length > 0) {
       for (const n of BROADCAST_ACTIONS)
-        this['send' + cap(n)] = (data) => this._bcast(n, data);
+        // build 41: jukebox actions ride the server channel, not the world room
+        this['send' + cap(n)] = JUKE_SERVER_ACTIONS.has(n)
+          ? (data) => this._jukeBcast(n, data)
+          : (data) => this._bcast(n, data);
       for (const n of TARGETED_ACTIONS)
         this['send' + cap(n)] = (data, target) => this._sendTo(n, data, target);
     } else {
       this._nullSends();
     }
+  }
+
+  /* Build 41: publish a jukebox action on the server channel. The relay is
+     the transport (it engages ~600ms after join, always); before it does,
+     fall back to the world-room broadcast so nothing is lost. */
+  _jukeBcast(actionName, data) {
+    if (!this.enabled) return;
+    let out;
+    try {
+      out = Object.assign({ cid: this.clientId }, data);
+    } catch (e) {
+      out = { cid: this.clientId };
+    }
+    if (this.relayMode && this.relayLink) {
+      const tag = this._jukeServerTag || this._relayRoomTag;
+      if (tag) { this._relayPublishTo(tag, actionName, out, null); return; }
+    }
+    this._bcast(actionName, data);
+  }
+
+  /* Build 41: point the server-wide jukebox channel at a Nexus server room.
+     Safe to call any time; subscribes once the relay is up and keeps the
+     subscription across room hops (leave() drops it). */
+  setJukeServer(serverKey) {
+    this._jukeServerKey = serverKey || null;
+    if (this.relayLink && this._jukeServerTag) {
+      try {
+        this.relayLink.unsubscribe(this._jukeServerTag, this._jukeServerHandler);
+      } catch (e) {}
+      this._jukeServerTag = null;
+    }
+    if (!this._jukeServerKey || !this.relayMode || !this.relayLink) return;
+    try {
+      const tag = this.relayLink.tagFor(this._jukeServerKey);
+      if (tag && tag !== this._relayRoomTag) {
+        this.relayLink.subscribe(tag, this._jukeServerHandler);
+        this._jukeServerTag = tag;
+      }
+    } catch (e) {}
+  }
+
+  /* Build 41: incoming jukebox traffic from the server channel. Same _in()
+     path as the room handler; only jukebox actions are honored here. */
+  _onRelayJukeServer(obj) {
+    try {
+      if (!obj || typeof obj !== 'object') return;
+      const actionName = obj.a;
+      if (typeof actionName !== 'string' || !JUKE_SERVER_ACTIONS.has(actionName)) return;
+      const d = obj.d;
+      if (!d || typeof d !== 'object') return;
+      const cbProp = ACTION_CBS[actionName];
+      if (!cbProp) return;
+      const cid = typeof d.cid === 'string' && d.cid ? d.cid : null;
+      if (!cid || cid === this.clientId) return;
+      if (obj.to && obj.to !== this.clientId) return;
+      let rec = this.peers.get(cid);
+      if (!rec) {
+        rec = { conns: new Map(), relay: true, lastSeen: 0 };
+        this.peers.set(cid, rec);
+      }
+      rec.lastSeen = Date.now();
+      this._in('relay', actionName, cbProp, d, cid);
+      this._updatePill();
+    } catch (e) {}
   }
 
   _wireRoom(entry) {
@@ -1221,6 +1308,14 @@ export class LimboNet {
       } catch (e) {}
       this._relayRoomTag = null;
     }
+    // build 41: the jukebox server channel is re-pointed by setJukeServer,
+    // never dropped by a room hop — but a full leave() resets it.
+    if (this.relayLink && this._jukeServerTag) {
+      try {
+        this.relayLink.unsubscribe(this._jukeServerTag, this._jukeServerHandler);
+      } catch (e) {}
+      this._jukeServerTag = null;
+    }
     this._updatePill();
   }
 
@@ -1382,6 +1477,8 @@ export class LimboNet {
       this._relayRoomTag = this.relayLink.tagFor(this.roomKey);
       this.relayLink.subscribe(this._relayRoomTag, this._relayRoomHandler);
     }
+    // build 41: the server-wide jukebox channel follows the selected server
+    this.setJukeServer(this._jukeServerKey);
     this.relayLink.subscribe(
       this.relayLink.tagFor(LOBBY_ROOM),
       this._relayLobbyHandler
@@ -1392,8 +1489,15 @@ export class LimboNet {
   /* Publish one action payload over the relay. Same envelope the data
      channel would carry ({cid, ...}), wrapped as {a, d, to?}. */
   _relayPublish(actionName, data, targetCid) {
+    if (!this._relayRoomTag) return;
+    this._relayPublishTo(this._relayRoomTag, actionName, data, targetCid);
+  }
+
+  /* Build 41: publish to an explicit relay tag (the server-wide jukebox
+     channel). The plain _relayPublish keeps the old room-tag behavior. */
+  _relayPublishTo(tag, actionName, data, targetCid) {
     try {
-      if (!this.relayMode || !this.relayLink || !this._relayRoomTag) return;
+      if (!this.relayMode || !this.relayLink || !tag) return;
       if (RELAY_SKIP_ACTIONS.has(actionName)) {
         if (!this._relaySkipLogged.has(actionName)) {
           this._relaySkipLogged.add(actionName);
@@ -1410,7 +1514,7 @@ export class LimboNet {
       }
       const env = { a: actionName, d: data };
       if (targetCid) env.to = targetCid;
-      this.relayLink.publish(this._relayRoomTag, env);
+      this.relayLink.publish(tag, env);
     } catch (e) {
       /* relay must never break the game loop */
     }

@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=39';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=39';
-import { CouchNet } from './couch.js?v=39';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=39';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=39';
+import { AudioEngine } from './audio.js?v=41';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=41';
+import { CouchNet } from './couch.js?v=41';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -210,6 +210,36 @@ function roomKeyFor(worldKey) {
 /* Build 38 — numbered Nexus servers. The start overlay lets the drifter
    pick #1–#10 with live headcounts; the pick survives realm hops. */
 let selectedServer = 1;
+/* Build 41: the jukebox is server-wide — one shared queue per Nexus
+   server, same list on every phone. The server channel follows the pick:
+   changing servers leaves the old party (queue resets) and asks the new
+   server for its queue + now-playing. */
+let jukeServerN = 0;
+function syncJukeServer() {
+  try {
+    if (net && net.setJukeServer) net.setJukeServer(nexusServerKey(selectedServer));
+  } catch (e) {}
+  if (jukeServerN !== selectedServer) {
+    jukeServerN = selectedServer;
+    jukeLeaveServer(); // fresh party per server — no stale queue
+    // Ask the new server's party for its queue; the channel is already
+    // subscribed, so live messages will also just arrive.
+    setTimeout(() => {
+      try {
+        if (net && net.sendJukeStateReq && !juke.now && !juke.queue.length) {
+          net.sendJukeStateReq({ reqId: 'srv-' + Date.now().toString(36) });
+        }
+      } catch (e) {}
+    }, 2500);
+  }
+}
+function pickServer(n) {
+  n = Math.max(1, Math.min(NEXUS_SERVERS, +n || 1));
+  selectedServer = n;
+  serverListTouched = true;
+  renderServerList();
+  syncJukeServer();
+}
 function serverCount(n) {
   const key = nexusServerKey(n);
   let c = 0;
@@ -449,10 +479,26 @@ function makeTrail(n, sizeScale) {
   }
 
   setStyle('ribbon');
-  return { group, setStyle, setColor, update, clear, getStyle: () => style };
-}
 
-// Local trail (full length). Thin wrappers keep the old call sites working.
+  /* Build 41: audio reactivity — the trail breathes with the room's low
+     end (jam bus + direct-audio jukebox through roomBassSmooth). v ~ 0..1. */
+  let pulse = 0;
+  function setPulse(v) {
+    pulse = Math.max(0, Math.min(1.5, Number(v) || 0));
+    const s = (1 + pulse * 0.9) * sizeScale;
+    try {
+      R.pts.material.size = 0.45 * s;
+      G1.pts.material.size = 0.9 * s;
+      G2.pts.material.size = 0.9 * s;
+      comet.material.size = 0.3 * s;
+      const o = Math.min(1, 0.8 + pulse * 0.2);
+      R.pts.material.opacity = o;
+      G1.pts.material.opacity = o;
+      G2.pts.material.opacity = o;
+    } catch (e) {}
+  }
+  return { group, setStyle, setColor, setPulse, update, clear, getStyle: () => style };
+}
 const localTrail = makeTrail(60, 1);
 function retintTrail(hex) { localTrail.setColor(hex); }
 function clearTrail() { localTrail.clear(wisp.position); }
@@ -890,7 +936,7 @@ function renderServerList() {
     serverListEl.appendChild(d);
     return;
   }
-  if (!serverListTouched) selectedServer = bestServer();
+  if (!serverListTouched) { selectedServer = bestServer(); syncJukeServer(); }
   let rows = serverListEl.querySelectorAll('.server-row');
   if (rows.length !== NEXUS_SERVERS) {
     serverListEl.innerHTML = '';
@@ -907,9 +953,7 @@ function renderServerList() {
       row.appendChild(num);
       row.appendChild(cnt);
       row.addEventListener('click', () => {
-        selectedServer = n;
-        serverListTouched = true;
-        renderServerList();
+        pickServer(n);
         row.blur();
       });
       serverListEl.appendChild(row);
@@ -951,20 +995,42 @@ function roomAnalyserGet(create) {
 
 /* Room chrome: show/hide each room's buttons when we drift between
    rooms. (Build 28: the DJ HUD line and go-live button are gone.)
-   Build 33: the jukebox also plays in the endless journey — each music
-   room gets its own listening party. Jam + paint stay sound-room only. */
+   Build 41: the jukebox is server-wide — its button rides everywhere,
+   and the queue survives room hops (it resets only on server change).
+   Jam + paint stay sound-room only. */
 function inMusicRoom() {
   return !!(active && (active.key === SOUND_ROOM_KEY || active.key === JOURNEY_ROOM_KEY));
 }
 function renderRoomChrome() {
   const inSound = !!(active && active.key === SOUND_ROOM_KEY);
-  const inMusic = inMusicRoom();
   if (jamBtn) jamBtn.style.display = inSound ? '' : 'none';
   if (paintBtn) paintBtn.style.display = inSound ? '' : 'none';
-  if (jukeBtn) jukeBtn.style.display = inMusic ? '' : 'none';
+  if (jukeBtn) jukeBtn.style.display = ''; // build 41: the server jukebox rides everywhere
   if (!inSound && paint.open) setPaintOpen(false); // paint mode can't leave the room
-  if (!inMusic) jukeLeaveRoom(); // the jukebox only plays in the music rooms
+  renderJourneyChrome(); // build 41: journey-only buttons + minimap
 }
+
+/* Build 41: the endless journey's own chrome — return-to-nexus, jam mute,
+   minimap. Everything else in the HUD stays as it was. */
+function renderJourneyChrome() {
+  const inJourney = !!(active && active.key === JOURNEY_ROOM_KEY);
+  const el = document.getElementById('journey-chrome');
+  if (el) el.style.display = inJourney ? '' : 'none';
+  if (inJourney) {
+    journeyJamMuteSet(journeyJamMuted); // refresh the toggle label
+    journeyMinimapInit();
+  }
+}
+const journeyHomeBtn = document.getElementById('journey-home-btn');
+if (journeyHomeBtn) journeyHomeBtn.addEventListener('click', () => {
+  try { goTo('nexus'); } catch (e) {}
+  journeyHomeBtn.blur();
+});
+const journeyJammuteBtn = document.getElementById('journey-jammute');
+if (journeyJammuteBtn) journeyJammuteBtn.addEventListener('click', () => {
+  journeyJamMuteSet(!journeyJamMuted);
+  journeyJammuteBtn.blur();
+});
 
 /* Make sure the WebAudio engine is up and running. The drift tap calls
    audio.init(); this is the safety net for programmatic callers. */
@@ -1045,6 +1111,8 @@ const jamSeqSwingEl = document.getElementById('jam-seq-swing');
 const jamSeqClearEl = document.getElementById('jam-seq-clear');
 const jamMicBtnEl = document.getElementById('jam-mic-btn');
 const jamMicMuteEl = document.getElementById('jam-mic-mute');
+const jamMicLoopEl = document.getElementById('jam-mic-loop');
+const jamTalkBtnEl = document.getElementById('jam-talk-btn');
 const jamMicMeterEl = document.getElementById('jam-mic-meter');
 const jamMicMeterFillEl = document.getElementById('jam-mic-meter-fill');
 const jamMicNoteEl = document.getElementById('jam-mic-note');
@@ -1272,13 +1340,19 @@ function jamEnsureChain() {
     delay.connect(dlyRet); dlyRet.connect(comp);
     comp.connect(audio.master);
     const gains = {};
-    const levels = { lead: 0.9, bass: 1.0, drums: 0.85, pad: 0.8 };
+    // build 40: lead/drums/loop faders live on the mixer strip — the chain
+    // is built from the stored mix so a rejoin keeps your levels.
+    const levels = { lead: mixer.levels.lead, bass: 1.0, drums: mixer.levels.drums, pad: 0.8 };
     for (const id of JAM_INST_IDS) {
       const g = ctx.createGain();
       g.gain.value = levels[id];
       g.connect(bus);
       gains[id] = g;
     }
+    const loopG = ctx.createGain();
+    loopG.gain.value = mixer.levels.loop;
+    loopG.connect(bus);
+    gains.loop = loopG;
     jam.chain = { bus, comp, conv, delay, revSend, dlySend, gains };
     return jam.chain;
   } catch (e) {
@@ -1294,35 +1368,44 @@ function jamDestFor(inst) {
   return audio.master;
 }
 
-/* ---------------- mic in (build 27) ----------------
-   Your voice joins the jam like any instrument: mic -> gain -> jam bus
-   (reverb, delay, limiter) -> speakers, and out to the room when you're
-   live. echoCancellation + noiseSuppression are on; the headphone note in
-   the panel says the rest. The mic NEVER touches the "sample the room"
-   tab-capture path — that API only sees the tab's rendered output, so no
-   software feedback loop exists. Denial is an honest toast, never a crash. */
+/* ---------------- mic in (build 27, voice routing build 40) ----------------
+   The mic is live-only by default: mic -> gain -> dry monitor -> master,
+   never the jam bus — so the overdub looper can't capture it. The
+   "voice → loop" toggle (jamMicToggleLoop) explicitly re-adds the bus
+   tap when Joshua wants his voice in the loop. "Talk" (voiceTalkToggle)
+   streams 16kHz PCM frames to the room over the relay; incoming voices
+   land on audio.master through the mixer's voice fader. echoCancellation
+   + noiseSuppression are on; the headphone note in the panel says the
+   rest. The mic NEVER touches the "sample the room" tab-capture path —
+   that API only sees the tab's rendered output, so no software feedback
+   loop exists. Denial is an honest toast, never a crash. */
 const jamMic = {
   on: false,
   muted: false,
   stream: null,
   src: null,
-  gain: null,
+  gain: null,      // mute lives here (post-mute taps: TX, loop, monitor)
   analyser: null,
   analyserData: null,
+  local: null,     // dry monitor -> master (live-only)
+  loopTap: null,   // opt-in tap -> jam bus (gets room space + looper)
+  loopIn: false,
   meterRaf: 0,
 };
 
-async function jamMicToggle() {
-  if (jamMic.on) { jamMicOff(); return; }
+/* Open the mic stream inside the caller's tap gesture (iPhone Safari
+   requires getUserMedia in a user gesture). Returns true when live. */
+async function jamMicEnsureStream() {
+  if (jamMic.on && jamMic.stream) return true;
   const gum = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
     ? (c) => navigator.mediaDevices.getUserMedia(c) // bound: the method needs its receiver
     : null;
   if (!gum) {
     showUnlockToast(['this browser has no mic input']);
-    return;
+    return false;
   }
   try {
-    if (!audioEnsureRunning()) { showUnlockToast(['audio isn\u2019t running']); return; }
+    if (!audioEnsureRunning()) { showUnlockToast(['audio isn\u2019t running']); return false; }
     const stream = await gum({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
@@ -1331,31 +1414,64 @@ async function jamMicToggle() {
       try { (stream.getTracks() || []).forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {}
       throw new Error('no mic track');
     }
-    const ch = jamEnsureChain();
-    if (!ch || !ch.bus) { try { track.stop(); } catch (e) {} throw new Error('no jam bus'); }
     const ctx = audio.ctx;
     const srcNode = ctx.createMediaStreamSource(stream);
     const gain = ctx.createGain();
     gain.gain.value = 1.0;
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
+    // Build 40: voice is live-only by default — the monitor lands dry on
+    // the master, NEVER the jam bus, so the overdub looper can't capture
+    // it. The "voice → loop" toggle below re-adds the bus tap explicitly.
+    const local = ctx.createGain();
+    local.gain.value = 1.0;
     srcNode.connect(gain);
     gain.connect(analyser);
-    analyser.connect(ch.bus); // into the mix like any instrument
+    analyser.connect(local);
+    local.connect(audio.master);
+    const loopTap = ctx.createGain();
+    loopTap.gain.value = 0;
+    analyser.connect(loopTap);
+    const ch = jamEnsureChain();
+    if (ch && ch.bus) loopTap.connect(ch.bus);
     jamMic.stream = stream;
     jamMic.src = srcNode;
     jamMic.gain = gain;
     jamMic.analyser = analyser;
     jamMic.analyserData = new Uint8Array(analyser.frequencyBinCount);
+    jamMic.local = local;
+    jamMic.loopTap = loopTap;
+    jamMic.loopIn = false;
     jamMic.on = true;
     jamMic.muted = false;
     track.onended = () => jamMicOff(); // OS / browser revoked the mic
     renderJamMic();
     jamMicMeterLoop();
-    addSystemLine('mic is live in the jam \u2014 headphones on');
+    return true;
   } catch (e) {
     jamMicDeny(e);
+    return false;
   }
+}
+
+async function jamMicToggle() {
+  if (jamMic.on) { jamMicOff(); return; }
+  const ok = await jamMicEnsureStream();
+  if (ok) addSystemLine('mic is live \u2014 headphones on');
+}
+
+/* Opt-in: let the voice drift into the jam bus (room space + the overdub
+   looper can capture it). Off by default — voice stays live-only. */
+function jamMicToggleLoop() {
+  if (!jamMic.on || !jamMic.loopTap || !audio.ctx) return;
+  jamMic.loopIn = !jamMic.loopIn;
+  try {
+    jamMic.loopTap.gain.setTargetAtTime(jamMic.loopIn ? 1 : 0, audio.ctx.currentTime, 0.03);
+  } catch (e) {}
+  addSystemLine(jamMic.loopIn
+    ? 'your voice drifts into the loop now'
+    : 'your voice stays live-only');
+  renderJamMic();
 }
 
 function jamMicDeny(e) {
@@ -1374,17 +1490,22 @@ function jamMicDeny(e) {
 }
 
 function jamMicOff() {
+  if (voice.tx.on) voiceTalkStop(); // talking stops when the mic dies
   if (!jamMic.on && !jamMic.stream) return;
   jamMic.on = false;
   jamMic.muted = false;
+  jamMic.loopIn = false;
   if (jamMic.meterRaf) { try { cancelAnimationFrame(jamMic.meterRaf); } catch (e) {} jamMic.meterRaf = 0; }
   try { if (jamMic.gain) jamMic.gain.disconnect(); } catch (e) {}
   try { if (jamMic.analyser) jamMic.analyser.disconnect(); } catch (e) {}
+  try { if (jamMic.local) jamMic.local.disconnect(); } catch (e) {}
+  try { if (jamMic.loopTap) jamMic.loopTap.disconnect(); } catch (e) {}
   try { if (jamMic.src) jamMic.src.disconnect(); } catch (e) {}
   try {
     if (jamMic.stream) (jamMic.stream.getTracks() || []).forEach((t) => { try { t.stop(); } catch (e2) {} });
   } catch (e) {}
-  jamMic.stream = jamMic.src = jamMic.gain = jamMic.analyser = jamMic.analyserData = null;
+  jamMic.stream = jamMic.src = jamMic.gain = jamMic.analyser = jamMic.analyserData =
+    jamMic.local = jamMic.loopTap = null;
   if (jamMicMeterFillEl) jamMicMeterFillEl.style.width = '0%';
   renderJamMic();
 }
@@ -1427,8 +1548,278 @@ function renderJamMic() {
     jamMicMuteEl.style.display = jamMic.on ? '' : 'none';
     jamMicMuteEl.textContent = jamMic.muted ? 'unmute' : 'mute';
   }
+  if (jamMicLoopEl) {
+    jamMicLoopEl.style.display = jamMic.on ? '' : 'none';
+    jamMicLoopEl.classList.toggle('sel', jamMic.loopIn);
+    jamMicLoopEl.setAttribute('aria-pressed', jamMic.loopIn ? 'true' : 'false');
+  }
+  if (jamTalkBtnEl) renderVoiceTalkBtn();
   if (jamMicMeterEl) jamMicMeterEl.style.display = jamMic.on ? '' : 'none';
   if (jamMicNoteEl) jamMicNoteEl.style.display = jamMic.on ? '' : 'none';
+}
+
+/* ---------------- room voice (build 40) ----------------
+   Tap "talk" and your voice drifts out to the room — live, riding the
+   same relay path everyone connects on (no separate media server, no
+   data-channel chunking hacks). iPhone-safe: the mic only ever opens
+   inside your tap (getUserMedia needs the gesture); echoCancellation +
+   noiseSuppression are on.
+   Transport: the mic is downsampled to 16kHz mono and framed into 120ms
+   PCM chunks (~5KB base64), broadcast as voiceChunk events. Receivers
+   jitter-buffer ~360ms and play frames back to back — about a half-second
+   behind you, steady. Your own echo never comes back: the transport drops
+   self-echo before it reaches us.
+   Voice is LIVE-only: incoming voices land on audio.master, never the
+   jam bus, so the overdub looper can't capture them. Opt-in, always —
+   the mic starts OFF; mute rests your voice too; the talk button shows
+   exactly when you're live. */
+const VOICE_FRAME = 1920; // 16kHz * 0.12s per chunk
+const VOICE_PRIME = 3;    // frames of jitter buffer before playout starts
+const voice = {
+  tx: { on: false, starting: false, node: null, zero: null, seq: 0, gen: 0 },
+  rx: new Map(), // peerId -> {name,q:Map,next,started,prime,playAt,lastChunk,ended}
+  inGain: null,
+  _tick: 0,
+  lastError: '',
+};
+
+/* Raw PCM capture: downsample to ~16kHz mono, emit 120ms Int16 frames. */
+const VOICE_WORKLET_SRC = `class VoiceCap extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.step = Math.max(1, Math.round(sampleRate / 16000));
+    this.buf = new Int16Array(${VOICE_FRAME});
+    this.n = 0; this.seq = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i += this.step) {
+        let s = ch[i];
+        s = s < -1 ? -1 : s > 1 ? 1 : s;
+        this.buf[this.n++] = s < 0 ? s * 32768 : s * 32767;
+        if (this.n >= this.buf.length) {
+          const out = new Int16Array(this.buf);
+          this.port.postMessage({ seq: this.seq++, pcm: out.buffer }, [out.buffer]);
+          this.n = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('limbo-voice-cap', VoiceCap);`;
+
+/* Jam-panel hint line (mirrors jukeHint). */
+function jamHint(msg) {
+  if (jamHintEl) jamHintEl.textContent = msg;
+}
+
+function voiceEnsureInGain() {  if (voice.inGain || !audio.ctx) return voice.inGain;
+  try {
+    const g = audio.ctx.createGain();
+    g.gain.value = mixer.levels.voice;
+    g.connect(audio.master);
+    voice.inGain = g;
+  } catch (e) { /* no graph yet */ }
+  return voice.inGain;
+}
+
+async function voiceTalkToggle() {
+  if (voice.tx.on) { voiceTalkStop(); return; }
+  if (voice.tx.starting) return; // a start is already in flight — don't race it
+  voice.tx.starting = true;
+  try {
+    if (!audioEnsureRunning()) { showUnlockToast(['audio isn\u2019t running']); return; }
+    // One tap opens the mic (same gesture = one permission prompt) and
+    // starts the send. The mic stream is shared with the monitor path.
+    const ok = await jamMicEnsureStream();
+    if (!ok || !jamMic.on || !jamMic.gain) return;
+    if (!net.sendVoiceChunk) {
+      // Couch co-op has no voice transport yet — stay honest, don't fake it.
+      jamHint('voice rides the online room — the couch stays quiet for now');
+      return;
+    }
+    const ctx = audio.ctx;
+    if (!ctx.audioWorklet) { showUnlockToast(['this browser can\u2019t send voice']); return; }
+    // Unique processor name per start: a rapid double-tap must never race
+    // two registrations of the same name.
+    const gen = ++voice.tx.gen;
+    const src = VOICE_WORKLET_SRC.replace('limbo-voice-cap', `limbo-voice-cap-${gen}`);
+    const blobUrl = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    try {
+      await ctx.audioWorklet.addModule(blobUrl);
+    } finally {
+      try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+    }
+    if (!voice.tx.starting) return; // stopped while starting — bail quietly
+    const node = new AudioWorkletNode(ctx, `limbo-voice-cap-${gen}`);
+    const zero = ctx.createGain();
+    zero.gain.value = 0;
+    jamMic.gain.connect(node); // post-mute: muting rests your voice too
+    node.connect(zero);
+    zero.connect(ctx.destination); // keep the node pulled; silence out
+    voice.tx.node = node;
+    voice.tx.zero = zero;
+    voice.tx.seq = 0;
+    node.port.onmessage = (e) => voiceTxSend(e.data);
+    voice.tx.on = true;
+    if (net.sendVoiceTalk) { try { net.sendVoiceTalk({ on: true, name: myName }); } catch (e) {} }
+    renderVoiceTalkBtn();
+    jamHint('your voice is drifting out \u2014 tap again to rest');
+  } catch (e) {
+    voice.lastError = (e && (e.name + ': ' + e.message)) || String(e);
+    jamMicDeny(e);
+  } finally {
+    voice.tx.starting = false;
+  }
+}
+
+function voiceTxSend(frame) {
+  if (!voice.tx.on || !frame || typeof frame.seq !== 'number' || !frame.pcm) return;
+  if (jamMic.muted) return; // muted rests your voice
+  if (!net.sendVoiceChunk) return; // e.g. couch mode: no voice transport yet
+  try {
+    const u8 = new Uint8Array(frame.pcm);
+    let bin = '';
+    for (let i = 0; i < u8.length; i += 8192) {
+      bin += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+    }
+    net.sendVoiceChunk({ seq: frame.seq, data: btoa(bin) });
+  } catch (e) { /* best effort per frame */ }
+}
+
+function voiceTalkStop() {
+  voice.tx.starting = false; // an in-flight start bails when it sees this
+  if (!voice.tx.on && !voice.tx.node) return;
+  voice.tx.on = false;
+  try { if (voice.tx.node) voice.tx.node.disconnect(); } catch (e) {}
+  try { if (voice.tx.zero) voice.tx.zero.disconnect(); } catch (e) {}
+  voice.tx.node = voice.tx.zero = null;
+  if (net.sendVoiceTalk) { try { net.sendVoiceTalk({ on: false, name: myName }); } catch (e) {} }
+  renderVoiceTalkBtn();
+}
+
+/* --- receive path --- */
+
+function voiceRxEntry(id) {
+  let r = voice.rx.get(id);
+  if (!r) {
+    r = { name: '', q: new Map(), next: 0, started: false, prime: 0, playAt: 0, lastChunk: 0, ended: false };
+    voice.rx.set(id, r);
+  }
+  return r;
+}
+
+function handleVoiceTalk(d, peerId) {
+  if (!d || typeof d.on !== 'boolean') return;
+  const r = voiceRxEntry(peerId || 'unknown');
+  if (d.on) {
+    if (typeof d.name === 'string' && d.name) r.name = d.name.slice(0, 16);
+    r.ended = false;
+    r.lastChunk = Date.now(); // announced — reap if no audio follows
+    voicePlayoutKick(); // the ticker also reaps stale talkers
+  } else {
+    r.ended = true; // drain what arrived, then clear
+  }
+  renderVoiceUI();
+}
+
+function handleVoiceChunk(d, peerId) {
+  if (!d || typeof d.seq !== 'number' || typeof d.data !== 'string') return;
+  if (d.data.length > 60000) return; // absurd — drop
+  const r = voiceRxEntry(peerId || 'unknown');
+  if (r.q.size > 40) return; // flooded — drop, don't balloon
+  try {
+    const bin = atob(d.data);
+    if (!bin.length || bin.length % 2) return;
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    const i16 = new Int16Array(u8.buffer);
+    const f32 = new Float32Array(i16.length);
+    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+    if (!r.started) { r.next = d.seq; r.started = true; }
+    r.q.set(d.seq, f32);
+    r.lastChunk = Date.now();
+    if (audio.ctx && audio.ctx.state === 'suspended') soundPillShow();
+  } catch (e) { /* one bad frame never breaks the room */ }
+  voicePlayoutKick();
+}
+
+/* One shared 120ms ticker plays every peer's next frame, chained
+   gaplessly via playAt. Missing frames become silence — never a stall. */
+function voicePlayoutKick() {
+  if (voice._tick) return;
+  voice._tick = setInterval(() => {
+    const ctx = audio.ctx;
+    if (!ctx || ctx.state !== 'running') return;
+    const g = voiceEnsureInGain();
+    if (!g) return;
+    const now = Date.now();
+    for (const [id, r] of voice.rx) {
+      const quietFor = now - r.lastChunk;
+      // stale talker (announced but no audio ever arrived) or a finished
+      // talker fully drained — clear them off the roster line.
+      if ((!r.started && !r.ended && quietFor > 4000) ||
+          (r.ended && r.q.size === 0 && quietFor > 1200) ||
+          (!r.ended && r.started && r.q.size === 0 && quietFor > 4000)) {
+        voice.rx.delete(id);
+        renderVoiceUI();
+        continue;
+      }
+      if (!r.started) continue;
+      if (r.prime < VOICE_PRIME) {
+        let have = 0;
+        for (const s of r.q.keys()) if (s >= r.next) have++;
+        if (have < VOICE_PRIME && now - r.lastChunk < 1500) { r.prime = have; continue; }
+        r.prime = VOICE_PRIME;
+        r.playAt = ctx.currentTime + 0.05;
+      }
+      let f = r.q.get(r.next);
+      r.q.delete(r.next);
+      r.next++;
+      if (r.q.size > 12) { // falling behind — shed ancient backlog
+        const ks = [...r.q.keys()].sort((a, b) => a - b);
+        const cut = ks[ks.length - 12];
+        for (const k of ks) if (k < cut) r.q.delete(k);
+      }
+      try {
+        if (r.playAt < ctx.currentTime - 0.3 || r.playAt > ctx.currentTime + 1.5) {
+          r.playAt = ctx.currentTime + 0.05; // resync after a stall
+        }
+        const buf = ctx.createBuffer(1, VOICE_FRAME, 16000);
+        if (f) buf.getChannelData(0).set(f.subarray(0, VOICE_FRAME));
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(g);
+        src.start(r.playAt);
+        r.playAt += VOICE_FRAME / 16000;
+      } catch (e) {}
+    }
+    if (!voice.rx.size && voice._tick) { clearInterval(voice._tick); voice._tick = 0; }
+  }, 120);
+}
+
+/* --- voice UI --- */
+
+function renderVoiceTalkBtn() {
+  if (!jamTalkBtnEl) return;
+  jamTalkBtnEl.style.display = jamMic.on || voice.tx.on ? '' : 'none';
+  jamTalkBtnEl.classList.toggle('live', voice.tx.on);
+  jamTalkBtnEl.innerHTML = voice.tx.on ? '&#127908; talking \u2014 tap to rest' : '&#127908; talk';
+}
+
+function renderVoiceUI() {
+  renderVoiceTalkBtn();
+  renderJamJammers(); // talkers ride the room roster line
+}
+
+function voiceTalkers() {
+  const out = [];
+  for (const [, r] of voice.rx) {
+    if (!r.ended || r.q.size) out.push(r.name || 'a drifter');
+  }
+  return out;
 }
 
 /* Keep the delay musical under tempo changes — dotted eighth, eased. */
@@ -2280,7 +2671,8 @@ function loopStartPlayback(buf, atTime) {
     const g = ctx.createGain();
     g.gain.value = 0.9;
     src.connect(g);
-    g.connect(ch.bus); // the loop drifts with the room: space + limiter
+    // build 40: the loop drifts through its own mixer fader, then the room bus
+    g.connect((ch.gains && ch.gains.loop) || ch.bus); // space + limiter
     src.start(Math.max(atTime, ctx.currentTime + 0.01));
     dub.src = src;
     dub.srcGain = g;
@@ -3547,6 +3939,7 @@ async function jukeAddTrack(rawUrl, titleHint) {
     addedBy: myName, addedAt: Date.now(),
   };
   juke.queue.push(t);
+  jukeSortQueue(); // the adder sorts too — same list as everyone else
   if (net.enabled && net.sendJukeAdd) {
     try { net.sendJukeAdd(t); } catch (e) { /* best effort */ }
   }
@@ -3599,6 +3992,7 @@ async function jukeAddPlaylist(url, det, titleHint) {
     if (!jukeValidAdd(t)) continue;
     items.push(t);
     juke.queue.push(t);
+    jukeSortQueue();
     if (net.enabled && net.sendJukeAdd) {
       try { net.sendJukeAdd(t); } catch (e) { /* best effort */ }
     }
@@ -3625,11 +4019,19 @@ function jukeRemoveGroup(gid) {
   return true;
 }
 
+/* Build 40: one shared list — every phone sorts the same way. addedAt
+   orders the line; the id breaks ties so two phones never disagree, even
+   when two tracks land in the same millisecond. */
+function jukeSortQueue() {
+  juke.queue.sort((a, b) =>
+    (a.addedAt - b.addedAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
 function handleJukeAdd(d, peerId) {
   if (!jukeValidAdd(d)) return;
   if (juke.queue.some((t) => t.id === d.id)) return; // dedupe
   juke.queue.push(d);
-  juke.queue.sort((a, b) => a.addedAt - b.addedAt); // FIFO by queue time
+  jukeSortQueue(); // FIFO by queue time, identical on every phone
   renderJuke();
   jukeEnrichTitle(d); // everyone resolves the real title locally
 }
@@ -3687,6 +4089,12 @@ function handleJukeSkip(d, peerId) {
   jukeAdvance();
 }
 
+/* build 40: are we on the broadcast relay? (chunked phone-file transfers
+   can't ride it — the relay skips them by design.) */
+function netIsRelay() {
+  try { return !!(typeof net !== 'undefined' && net && net.relayMode); } catch (e) { return false; }
+}
+
 /* ---------- phone files (build 27) ----------
    "Play from my phone": the picked audio file travels to the room over
    Trystero's data channel — no upload site, no link that can expire, no
@@ -3734,6 +4142,13 @@ async function jukeAddPhoneFile(file) {
   const audioish = /audio\//i.test(type) ||
     /\.(mp3|m4a|aac|ogg|oga|wav|wave|flac|opus|weba)$/i.test(name);
   if (!audioish) { jukeHint('that doesn\u2019t look like an audio file'); return null; }
+  // build 40: the relay is broadcast-only and skips file chunks by design,
+  // so phone bytes can never reach the room — refuse honestly at queue time
+  // instead of letting the room hang on a fetch that can't land.
+  if (netIsRelay()) {
+    jukeHint('phone tracks can\u2019t drift over the relay \u2014 paste a link instead');
+    return null;
+  }
   let ab = null;
   try { ab = await file.arrayBuffer(); }
   catch (e) { jukeHint('couldn\u2019t read that file'); return null; }
@@ -3746,6 +4161,7 @@ async function jukeAddPhoneFile(file) {
     addedBy: myName, addedAt: Date.now(),
   };
   juke.queue.push(item);
+  jukeSortQueue();
   if (net.enabled && net.sendJukeAdd) { try { net.sendJukeAdd(item); } catch (e) {} }
   jukeHint(`\u{1F4F1} "${stem}" queued \u2014 the room pulls it from your phone when it plays`);
   renderJuke();
@@ -3769,6 +4185,14 @@ function jukePlayPhoneFile(d, offset) {
     // Late joiners can pull from us too.
     if (net.enabled && net.sendJukeFileHave) { try { net.sendJukeFileHave({ fileId: d.fileId, by: myName }); } catch (e) {} }
     jukePlayDirect({ ...d, url }, offset);
+    return;
+  }
+  // build 40: on the relay the chunks never come (skipped by design) — say
+  // so plainly and hold the room's place instead of hanging at 0%. The
+  // uploader hears it on their phone; their advance broadcast resyncs us.
+  if (netIsRelay()) {
+    jukeHint(`\u201c${(d.fileName || 'phone track').slice(0, 40)}\u201d lives on ${(d.addedBy || d.by || 'a drifter').slice(0, 16)}\u2019s phone \u2014 the relay can\u2019t carry it, drifting on`);
+    renderJuke();
     return;
   }
   // Receiving: show progress until the bytes land.
@@ -4090,7 +4514,15 @@ function jukeJoinTap() {
    join-tap path seeks to the wall-clock offset and plays. */
 const soundPillEl = document.getElementById('sound-pill');
 function soundPillShow() {
-  if (soundPillEl) soundPillEl.style.display = '';
+  if (!soundPillEl) return;
+  // build 40: when the block is the jukebox waiting on a gesture, the pill
+  // says so in the room's own language.
+  try {
+    soundPillEl.innerHTML = juke.joinWaiting
+      ? '&#128263; tap to join the music'
+      : '&#128263; tap for sound';
+  } catch (e) {}
+  soundPillEl.style.display = '';
 }
 function soundPillHide() {
   if (soundPillEl) soundPillEl.style.display = 'none';
@@ -4945,7 +5377,10 @@ document.addEventListener('click', () => {
 
 /* ---------- leaving the room ---------- */
 
-function jukeLeaveRoom() {
+/* Build 41: the queue belongs to the SERVER, not the world room — it
+   survives hops between the nexus, the sound room and the journey. Only
+   a server change (or going offline) starts a fresh party. */
+function jukeLeaveServer() {
   jukeStopPlayback();
   juke.now = null;
   juke.queue = [];
@@ -5064,6 +5499,26 @@ function renderJuke() {
       });
     }
   }
+  jukeBadge(); // build 40: the shared list is visible on the button itself
+}
+
+/* Build 40: the queue lives on every phone — show it without opening the
+   panel. The button carries now-playing + how many are in line. */
+function jukeBadge() {
+  if (!jukeBtn) return;
+  jukeBtn.innerHTML = '';
+  const add = (html, text) => {
+    if (jukeBtn.childNodes.length) jukeBtn.appendChild(document.createTextNode(' · '));
+    const s = document.createElement('span');
+    if (html) s.innerHTML = html; else s.textContent = text;
+    jukeBtn.appendChild(s);
+  };
+  add('&#127925; jukebox');
+  if (juke.now && !juke.now.stopped) {
+    const t = (juke.now.title || 'untitled').toString().slice(0, 18);
+    add(null, `now: ${t}`);
+  }
+  if (juke.queue.length) add(null, `${juke.queue.length} in line`);
 }
 
 function jukeSetVolume(v) {
@@ -5071,7 +5526,91 @@ function jukeSetVolume(v) {
   if (juke.player) { try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {} }
   const el = document.getElementById('juke-vol');
   if (el && document.activeElement !== el) el.value = Math.round(juke.volume * 100);
+  mixerSyncJuke(); // build 40: the mixer strip mirrors the jukebox fader
 }
+
+/* ---------------- per-source mixer (build 40) ----------------
+   Five faders in the jam room: lead (your synth), drums (the sequencer +
+   drum keys), juke (the jukebox), loop (the overdub looper), voice (room
+   voices — people talking). Levels ride in localStorage so your mix is
+   still yours when you drift back. */
+const mixer = {
+  levels: { lead: 0.9, drums: 0.85, juke: 0.7, loop: 1.0, voice: 0.9 },
+  load() {
+    try {
+      const s = JSON.parse(localStorage.getItem('limbo-mix40') || '{}');
+      for (const k of Object.keys(this.levels)) {
+        const v = +s[k];
+        if (isFinite(v)) this.levels[k] = Math.max(0, Math.min(1, v));
+      }
+    } catch (e) {}
+  },
+  save() {
+    try { localStorage.setItem('limbo-mix40', JSON.stringify(this.levels)); } catch (e) {}
+  },
+};
+mixer.load();
+juke.volume = mixer.levels.juke; // your last jukebox level, before any player exists
+
+/* Push stored levels into the live audio graph (no-op until audio is up). */
+function jamJourneyDuck() {
+  // build 41: audio zoning — in the endless journey the jam can be muted
+  // outright (the jukebox and voices are never ducked).
+  try {
+    return (typeof journeyJamMuted !== 'undefined' && journeyJamMuted &&
+      typeof active !== 'undefined' && active && active.key === JOURNEY_ROOM_KEY) ? 0 : 1;
+  } catch (e) { return 1; }
+}
+function mixerApplyGains() {
+  const ch = (typeof audio !== 'undefined' && audio.ctx && jam.chain) || null;
+  if (!ch || !ch.gains) return;
+  const duck = jamJourneyDuck();
+  try {
+    if (ch.gains.lead) ch.gains.lead.gain.setTargetAtTime(mixer.levels.lead * duck, audio.ctx.currentTime, 0.02);
+    if (ch.gains.drums) ch.gains.drums.gain.setTargetAtTime(mixer.levels.drums * duck, audio.ctx.currentTime, 0.02);
+    if (ch.gains.loop) ch.gains.loop.gain.setTargetAtTime(mixer.levels.loop * duck, audio.ctx.currentTime, 0.02);
+    if (ch.gains.bass) ch.gains.bass.gain.setTargetAtTime(1.0 * duck, audio.ctx.currentTime, 0.02);
+    if (ch.gains.pad) ch.gains.pad.gain.setTargetAtTime(0.8 * duck, audio.ctx.currentTime, 0.02);
+  } catch (e) {}
+  // voice rides its own gain on the master (build 40) — never the bus.
+  try {
+    if (voice.inGain) voice.inGain.gain.setTargetAtTime(mixer.levels.voice, audio.ctx.currentTime, 0.02);
+  } catch (e) {}
+}
+
+/* The jukebox fader on the mixer strip mirrors juke.volume (and the
+   jukebox panel's own slider) — one level, three faces. */
+function mixerSyncJuke() {
+  mixer.levels.juke = juke.volume;
+  mixer.save();
+  const el = document.getElementById('mix-juke');
+  if (el && document.activeElement !== el) el.value = Math.round(juke.volume * 100);
+}
+
+function mixerSet(src, v) {
+  if (!mixer.levels.hasOwnProperty(src)) return;
+  v = Math.max(0, Math.min(1, +v || 0));
+  mixer.levels[src] = v;
+  mixer.save();
+  if (src === 'juke') jukeSetVolume(v); // fans out to player + both sliders
+  else mixerApplyGains();
+  const el = document.getElementById('mix-' + src);
+  if (el && document.activeElement !== el) el.value = Math.round(v * 100);
+}
+
+function mixerInitUI() {
+  for (const src of Object.keys(mixer.levels)) {
+    const el = document.getElementById('mix-' + src);
+    if (el) el.value = Math.round(mixer.levels[src] * 100);
+  }
+  const jv = document.getElementById('juke-vol');
+  if (jv) jv.value = Math.round(juke.volume * 100);
+}
+for (const src of ['lead', 'drums', 'juke', 'loop', 'voice']) {
+  const el = document.getElementById('mix-' + src);
+  if (el) el.addEventListener('input', () => mixerSet(src, el.value / 100));
+}
+mixerInitUI();
 
 if (jukeBtn) {
   jukeBtn.addEventListener('click', () => setJukePanel(!juke.open));
@@ -5397,12 +5936,12 @@ function renderJamJammers() {
     else jam.jammers.delete(n);
   }
   jamJammersEl.innerHTML = '';
-  if (!entries.length) {
-    jamJammersEl.textContent = 'the room is quiet — play something \u{1F3B9}';
-    return;
-  }
   const label = document.createElement('span');
-  label.textContent = 'jamming now: ';
+  if (!entries.length) {
+    label.textContent = 'the room is quiet \u2014 play something \u{1F3B9}';
+  } else {
+    label.textContent = 'jamming now: ';
+  }
   jamJammersEl.appendChild(label);
   entries.forEach(([n, inst], i) => {
     if (i > 0) jamJammersEl.appendChild(document.createTextNode(', '));
@@ -5417,6 +5956,21 @@ function renderJamJammers() {
     wrap.appendChild(nm);
     jamJammersEl.appendChild(wrap);
   });
+  // Build 40: room voice — show who's talking on the same roster line,
+  // even when nobody's playing yet.
+  const talkers = voiceTalkers();
+  if (talkers.length) {
+    const sep = document.createElement('span');
+    sep.textContent = entries.length ? ' · ' : ' — ';
+    jamJammersEl.appendChild(sep);
+    talkers.forEach((t, i) => {
+      if (i > 0) jamJammersEl.appendChild(document.createTextNode(', '));
+      const mic = document.createElement('span');
+      mic.className = 'jammer-talking';
+      mic.textContent = `\u{1F3A4} ${t} is talking`;
+      jamJammersEl.appendChild(mic);
+    });
+  }
 }
 setInterval(() => { if (jam.open) renderJamJammers(); }, 5000);
 
@@ -5661,6 +6215,8 @@ if (jamGrabEl) jamGrabEl.addEventListener('click', () => { jamGrabLoop(); jamGra
 if (jamGrabRoomEl) jamGrabRoomEl.addEventListener('click', () => { jamRoomSample(); jamGrabRoomEl.blur(); });
 if (jamMicBtnEl) jamMicBtnEl.addEventListener('click', () => { jamMicToggle(); jamMicBtnEl.blur(); });
 if (jamMicMuteEl) jamMicMuteEl.addEventListener('click', () => { jamMicToggleMute(); jamMicMuteEl.blur(); });
+if (jamMicLoopEl) jamMicLoopEl.addEventListener('click', () => { jamMicToggleLoop(); jamMicLoopEl.blur(); });
+if (jamTalkBtnEl) jamTalkBtnEl.addEventListener('click', () => { voiceTalkToggle(); jamTalkBtnEl.blur(); });
 if (jamInstTabsEl) {
   jamInstTabsEl.querySelectorAll('.jam-inst-tab').forEach((b) => {
     b.addEventListener('click', () => { selectJamInstrument(b.dataset.inst); b.blur(); });
@@ -6316,11 +6872,33 @@ const journey = {
   stars: null,
   lastJukeId: null,
   hintPrev: '',
+  rings: null,        // build 41: fly-through speed rings on 3 circuits
+  gems: null,         // build 41: boost gems
+  boost: 1,           // build 41: proximity-graded speed multiplier
+  ringBoost: 0, gemBoost: 0, // decaying bursts
+  lastRing: null,     // circuit combo tracking
+  mapT: 0,            // minimap redraw throttle
 };
 const _jTmpA = new THREE.Vector3();
 const _jTmpB = new THREE.Vector3();
 const _jBgT = new THREE.Color();
 const _jFogT = new THREE.Color();
+
+/* Build 41: audio zoning — the jam can be muted in the endless journey
+   (the jukebox + voices stay). Persists; the toggle lives in the journey HUD. */
+let journeyJamMuted = false;
+try { journeyJamMuted = localStorage.getItem('limbo_journey_jammute') === '1'; } catch (e) {}
+function journeyJamMuteSet(m) {
+  journeyJamMuted = !!m;
+  try { localStorage.setItem('limbo_journey_jammute', journeyJamMuted ? '1' : '0'); } catch (e) {}
+  try { mixerApplyGains(); } catch (e) {}
+  const b = document.getElementById('journey-jammute');
+  if (b) {
+    b.textContent = journeyJamMuted ? '🔇 jam muted' : '🎶 jam on';
+    b.classList.toggle('off', !journeyJamMuted);
+    b.setAttribute('aria-pressed', journeyJamMuted ? 'true' : 'false');
+  }
+}
 
 /* Which zone is (x, z) in? Quadrants; callers apply the J_ZONE_BAND
    hysteresis so the border never flickers. */
@@ -6547,6 +7125,11 @@ function buildJourneyRoom() {
   journey.speedLines = speedLines;
   journey.stars = stars;
   journey.gate = portals[0];
+  // build 41: rings + gems, built once with the field
+  if (!journey.rings) buildJourneyRings(scene);
+  else for (const r of journey.rings) { r.cooldown = 0; r.flash = 0; scene.add(r.mesh); }
+  if (!journey.gems) buildJourneyGems(scene);
+  else for (const g of journey.gems) scene.add(g.mesh);
   // spawn in the dunes, facing the crossroads gate
   const spawnYaw = Math.atan2(-(0 - J_SPAWN.x), -(0 - J_SPAWN.z));
   return {
@@ -6560,6 +7143,276 @@ function buildJourneyRoom() {
   };
 }
 
+/* ============ build 41: endless journey fun pass ============
+   Rings to fly through (speed + path), boost gems, proximity-graded
+   speed (not just a binary fast mode), audio-reactive trails, minimap.
+   Additive only — the existing field art is untouched. */
+
+/* A tiny game chime that rides audio.master directly — never the jam bus,
+   so it sings even when the journey's jam is muted. */
+function journeyBlip(freq, dur, vol) {
+  try {
+    if (!audio.ctx || audio.ctx.state !== 'running') return;
+    const t0 = audio.ctx.currentTime;
+    const o = audio.ctx.createOscillator();
+    const g = audio.ctx.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol || 0.18, t0 + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + (dur || 0.35));
+    o.connect(g); g.connect(audio.master);
+    o.start(t0); o.stop(t0 + (dur || 0.35) + 0.05);
+  } catch (e) {}
+}
+
+const J_RING_R = 6.5;          // fly-through detection radius
+const J_RING_CIRCUITS = [
+  { cx: -220, cz: -220, r: 130, n: 8, y0: 14, yAmp: 6,  color: 0x7ae0ff },
+  { cx: 220,  cz: -220, r: 150, n: 8, y0: 18, yAmp: 8,  color: 0xb388ff },
+  { cx: 0,    cz: 0,    r: 300, n: 10, y0: 12, yAmp: 10, color: 0xffd97a },
+];
+function buildJourneyRings(scene) {
+  const rings = [];
+  for (let c = 0; c < J_RING_CIRCUITS.length; c++) {
+    const circ = J_RING_CIRCUITS[c];
+    for (let i = 0; i < circ.n; i++) {
+      const a = (i / circ.n) * Math.PI * 2;
+      const x = circ.cx + Math.cos(a) * circ.r;
+      const z = circ.cz + Math.sin(a) * circ.r;
+      const y = circ.y0 + Math.sin(a * 2 + c) * circ.yAmp;
+      const mesh = new THREE.Mesh(
+        new THREE.TorusGeometry(J_RING_R, 0.55, 10, 36),
+        new THREE.MeshBasicMaterial({
+          color: circ.color, transparent: true, opacity: 0.75,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        })
+      );
+      mesh.position.set(x, y, z);
+      // face along the circuit tangent — fly the path, thread the rings
+      _jTmpA.set(x - Math.sin(a), y, z + Math.cos(a));
+      mesh.lookAt(_jTmpA);
+      scene.add(mesh);
+      rings.push({
+        x, y, z, mesh, circuit: c, idx: i,
+        cooldown: 0, flash: 0, baseOp: 0.75,
+      });
+    }
+  }
+  journey.rings = rings;
+}
+
+const J_GEMS_N = 14;
+const J_GEM_COLORS = [0xffd97a, 0x7ae0ff, 0xff8ad1, 0x9dff8a];
+function journeyGemSpot() {
+  const a = Math.random() * Math.PI * 2;
+  const r = 60 + Math.random() * 420;
+  return { x: Math.cos(a) * r, z: Math.sin(a) * r, y: 8 + Math.random() * 22 };
+}
+function buildJourneyGems(scene) {
+  const gems = [];
+  for (let i = 0; i < J_GEMS_N; i++) {
+    const s = journeyGemSpot();
+    const mesh = new THREE.Mesh(
+      new THREE.OctahedronGeometry(2.2),
+      new THREE.MeshBasicMaterial({
+        color: J_GEM_COLORS[i % J_GEM_COLORS.length],
+        transparent: true, opacity: 0.9,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      })
+    );
+    mesh.position.set(s.x, s.y, s.z);
+    scene.add(mesh);
+    gems.push({
+      x: s.x, y: s.y, z: s.z, mesh,
+      active: true, respawn: 0, phase: Math.random() * Math.PI * 2,
+    });
+  }
+  journey.gems = gems;
+}
+
+/* Ring pass / gem pickup: bursts, chimes, combo on the circuit path. */
+function journeyRingPass(ring) {
+  ring.cooldown = 3;
+  ring.flash = 1;
+  const now = performance.now() / 1000;
+  let combo = 1;
+  if (journey.lastRing &&
+      journey.lastRing.circuit === ring.circuit &&
+      journey.lastRing.idx === (ring.idx + J_RING_CIRCUITS[ring.circuit].n - 1) % J_RING_CIRCUITS[ring.circuit].n &&
+      now - journey.lastRing.t < 12) {
+    combo = Math.min(journey.lastRing.combo + 1, 8);
+  }
+  journey.lastRing = { circuit: ring.circuit, idx: ring.idx, t: now, combo };
+  journey.ringBoost = Math.min(1.5, 0.65 + combo * 0.12);
+  journeyBlip(520 + combo * 60, 0.4, 0.2);
+  setTimeout(() => journeyBlip(780 + combo * 60, 0.3, 0.12), 90);
+}
+function journeyGemGet(gem) {
+  gem.active = false;
+  gem.mesh.visible = false;
+  gem.respawn = 25 + Math.random() * 15;
+  journey.gemBoost = Math.min(1.5, (journey.gemBoost || 0) + 0.8);
+  journeyBlip(880, 0.25, 0.16);
+  setTimeout(() => journeyBlip(1174, 0.35, 0.14), 80);
+}
+
+/* Proximity-graded speed: flock slipstream by slot distance, ring/gem
+   nearness, drafting off nearby drifters — plus decaying bursts from
+   rings and gems. Never just a binary fast mode. */
+function journeyBoostCalc(dt) {
+  let boost = 1;
+  // flock slipstream: the closer to your V slot, the more you surge
+  if (journey.inFlock) {
+    if (journey.mySlot) {
+      const d = Math.hypot(
+        wisp.position.x - journey.mySlot.x,
+        wisp.position.y - journey.mySlot.y,
+        wisp.position.z - journey.mySlot.z
+      );
+      const prox = Math.max(0, 1 - d / 30);
+      boost += (J_SLIPSTREAM - 1) * (0.35 + 0.65 * prox);
+    } else {
+      boost += (J_SLIPSTREAM - 1) * 0.5; // leading the V still surges a little
+    }
+  }
+  // ring nearness: threading the path pulls you faster
+  let ringNear = Infinity;
+  if (journey.rings) {
+    for (const r of journey.rings) {
+      const d = Math.hypot(wisp.position.x - r.x, wisp.position.y - r.y, wisp.position.z - r.z);
+      if (d < ringNear) ringNear = d;
+    }
+  }
+  if (ringNear < 45) boost += 0.35 * (1 - ringNear / 45);
+  // gem nearness
+  let gemNear = Infinity;
+  if (journey.gems) {
+    for (const g of journey.gems) {
+      if (!g.active) continue;
+      const d = Math.hypot(wisp.position.x - g.x, wisp.position.y - g.y, wisp.position.z - g.z);
+      if (d < gemNear) gemNear = d;
+    }
+  }
+  if (gemNear < 30) boost += 0.15 * (1 - gemNear / 30);
+  // drafting: tuck in close behind another drifter
+  let peerNear = Infinity;
+  try {
+    for (const [, v] of peerPositions) {
+      const d = Math.hypot(wisp.position.x - v.x, wisp.position.y - v.y, wisp.position.z - v.z);
+      if (d < peerNear) peerNear = d;
+    }
+  } catch (e) {}
+  if (peerNear < 30) boost += 0.25 * (1 - peerNear / 30);
+  // bursts decay
+  journey.ringBoost = Math.max(0, (journey.ringBoost || 0) - dt * 0.55);
+  journey.gemBoost = Math.max(0, (journey.gemBoost || 0) - dt * 0.8);
+  boost *= 1 + journey.ringBoost * 0.9 + journey.gemBoost * 0.5;
+  journey.boost = Math.min(2.6, boost);
+  return journey.boost;
+}
+
+/* Ring/gem per-frame: pass detection, pickups, respawns, shimmer. */
+function journeyUpdatePickups(dt, t) {
+  if (!journey.rings || !journey.gems) return;
+  const px = wisp.position.x, py = wisp.position.y, pz = wisp.position.z;
+  for (const r of journey.rings) {
+    if (r.cooldown > 0) r.cooldown -= dt;
+    r.flash = Math.max(0, r.flash - dt * 2.2);
+    const d = Math.hypot(px - r.x, py - r.y, pz - r.z);
+    if (d < J_RING_R + 1 && r.cooldown <= 0) journeyRingPass(r);
+    // shimmer: breathe near, flash on pass
+    const near = d < 45 ? (1 - d / 45) : 0;
+    const s = 1 + near * 0.12 + r.flash * 0.55;
+    r.mesh.scale.set(s, s, s);
+    r.mesh.material.opacity = Math.min(1, r.baseOp + near * 0.2 + r.flash * 0.25);
+    r.mesh.rotation.z += dt * (0.4 + near * 1.6);
+  }
+  for (const g of journey.gems) {
+    if (!g.active) {
+      g.respawn -= dt;
+      if (g.respawn <= 0) {
+        const s = journeyGemSpot();
+        g.x = s.x; g.y = s.y; g.z = s.z;
+        g.mesh.position.set(s.x, s.y, s.z);
+        g.active = true; g.mesh.visible = true;
+      }
+      continue;
+    }
+    g.mesh.rotation.y += dt * 1.8;
+    g.mesh.position.y = g.y + Math.sin(t * 1.7 + g.phase) * 1.2;
+    const d = Math.hypot(px - g.mesh.position.x, py - g.mesh.position.y, pz - g.mesh.position.z);
+    if (d < 5.5) journeyGemGet(g);
+  }
+}
+
+/* Minimap: the field, its four lands, the gate home, rings, gems,
+   fellow drifters, and you. ~10Hz redraw. */
+let journeyMinimapCtx = null;
+function journeyMinimapInit() {
+  if (journeyMinimapCtx) return;
+  const cv = document.getElementById('journey-minimap');
+  if (!cv) return;
+  journeyMinimapCtx = cv.getContext('2d');
+}
+const J_MAP_R = 66; // canvas 132px, field radius 560
+function journeyMapXY(x, z) {
+  const s = J_MAP_R / 560;
+  return [66 + x * s, 66 + z * s];
+}
+function journeyMinimapDraw() {
+  const c = journeyMinimapCtx;
+  if (!c) return;
+  c.clearRect(0, 0, 132, 132);
+  // field + four lands
+  c.beginPath(); c.arc(66, 66, J_MAP_R, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(20, 26, 54, 0.9)'; c.fill();
+  const lands = [
+    ['rgba(122, 224, 255, 0.10)', 66 - J_MAP_R, 66 - J_MAP_R], // spires x<0,z<0
+    ['rgba(179, 136, 255, 0.10)', 66, 66 - J_MAP_R],           // city  x>0,z<0
+    ['rgba(255, 217, 122, 0.10)', 66 - J_MAP_R, 66],           // dunes x<0,z>0
+    ['rgba(255, 138, 209, 0.10)', 66, 66],                     // grid  x>0,z>0
+  ];
+  for (const [col, qx, qy] of lands) { c.fillStyle = col; c.fillRect(qx, qy, J_MAP_R, J_MAP_R); }
+  c.beginPath(); c.arc(66, 66, J_MAP_R, 0, Math.PI * 2);
+  c.strokeStyle = 'rgba(122, 224, 255, 0.35)'; c.stroke();
+  // rings
+  if (journey.rings) {
+    c.fillStyle = 'rgba(122, 224, 255, 0.5)';
+    for (const r of journey.rings) {
+      const [mx, my] = journeyMapXY(r.x, r.z);
+      c.fillRect(mx - 1, my - 1, 2, 2);
+    }
+  }
+  // gems
+  if (journey.gems) {
+    for (const g of journey.gems) {
+      if (!g.active) continue;
+      const [mx, my] = journeyMapXY(g.x, g.z);
+      c.fillStyle = '#ffd97a';
+      c.beginPath(); c.arc(mx, my, 1.8, 0, Math.PI * 2); c.fill();
+    }
+  }
+  // the gate home at the crossroads
+  c.fillStyle = '#ffffff';
+  c.beginPath(); c.arc(66, 66, 2.6, 0, Math.PI * 2); c.fill();
+  // fellow drifters
+  try {
+    c.fillStyle = 'rgba(122, 224, 255, 0.9)';
+    for (const [, v] of peerPositions) {
+      const [mx, my] = journeyMapXY(v.x, v.z);
+      c.beginPath(); c.arc(mx, my, 2, 0, Math.PI * 2); c.fill();
+    }
+  } catch (e) {}
+  // you, with a heading tick
+  const [sx, sy] = journeyMapXY(wisp.position.x, wisp.position.z);
+  c.fillStyle = '#ffffff';
+  c.beginPath(); c.arc(sx, sy, 3, 0, Math.PI * 2); c.fill();
+  const ha = Math.atan2(myFwd.x, -myFwd.z);
+  c.strokeStyle = '#ffffff'; c.lineWidth = 1.5;
+  c.beginPath(); c.moveTo(sx, sy);
+  c.lineTo(sx + Math.sin(ha) * 7, sy - Math.cos(ha) * 7); c.stroke();
+}
+
 function journeyOnEnter() {
   journey.assign = null;
   journey.inFlock = false;
@@ -6571,6 +7424,9 @@ function journeyOnEnter() {
   if (hintEl) hintEl.textContent = J_HINT;
   albumEnsure(); // hosted album, if Joshua has sent tracks
   if (journey.speedLines) journey.speedLines.visible = false;
+  // build 41: fresh speed state on every visit
+  journey.boost = 1; journey.ringBoost = 0; journey.gemBoost = 0;
+  journey.lastRing = null;
 }
 
 function journeyOnLeave() {
@@ -6654,8 +7510,11 @@ function updateJourney(dt, t) {
   if (journey.floaters) journey.floaters.position.y = Math.sin(t * 0.6) * 1.5;
   // --- slipstream visuals: speed lines + brighter trail ---
   const sl = journey.speedLines;
+  // build 41: speed lines follow the graded boost, not just the flock flag
+  const boostNow = journeyBoostCalc(dt);
+  const slOn = boostNow > 1.12 || journey.inFlock;
   if (sl) {
-    sl.visible = journey.inFlock;
+    sl.visible = slOn;
     sl.position.copy(wisp.position);
     sl.rotation.y = yaw; // local -Z lines up with the heading
     if (sl.visible) {
@@ -6674,10 +7533,17 @@ function updateJourney(dt, t) {
     }
   }
   try {
-    const gs = journey.inFlock ? 5.4 : 3.2;
+    const gs = slOn ? 5.4 : 3.2;
     const s = wispGlow.scale.x + (gs - wispGlow.scale.x) * Math.min(1, dt * 5);
     wispGlow.scale.set(s, s, 1);
   } catch (e) {}
+  // --- build 41: rings, gems, minimap ---
+  journeyUpdatePickups(dt, t);
+  journey.mapT += dt;
+  if (journey.mapT >= 0.1) {
+    journey.mapT = 0;
+    try { journeyMinimapDraw(); } catch (e) {}
+  }
   // --- music + social, throttled ---
   journey.musicT += dt;
   if (journey.musicT >= 0.5) {
@@ -7492,7 +8358,7 @@ function goTo(key) {
   // land on their server, then portal to the Nexus world itself.
   if (isNexusServerKey(key)) {
     const n = parseInt(String(key).split('-').pop(), 10);
-    if (n >= 1 && n <= NEXUS_SERVERS) { selectedServer = n; renderServerList(); }
+    if (n >= 1 && n <= NEXUS_SERVERS) pickServer(n);
     key = 'nexus';
   }
   if (transitioning || !worlds[key]) return;
@@ -7508,6 +8374,7 @@ function goTo(key) {
     clearPeerVisuals();                       // old room's drifters stay in the old room
     net.join(roomKeyFor(active.key));         // hop to this location's P2P room
     net.setPresence(myName, presenceKeyFor(active.key)); // lobby heartbeat: we're elsewhere now
+    try { mixerApplyGains(); } catch (e) {} // build 41: re-seat the journey jam duck
     updatePeerCount();
     wisp.position.copy(active.spawn);
     vel.set(0, 0, 0);
@@ -7521,10 +8388,19 @@ function goTo(key) {
     audio.setAuraDucked(key === SOUND_ROOM_KEY);
     showTitleCard(active.name);
     renderRoomChrome(); // show/hide each room's buttons for this room
-    // Build 33: entering the journey resets the sky and starts the album
-    // probe; each music room gets a fresh listening party.
+    // Build 33: entering the journey resets the sky and starts the album probe.
     const musicRoom = key === SOUND_ROOM_KEY || key === JOURNEY_ROOM_KEY;
-    if (musicRoom) jukeLeaveRoom(); // fresh party per room — no stale queue
+    // Build 41: the jukebox queue is server-wide — entering a music room
+    // no longer starts a fresh party. The server channel is live-subscribed,
+    // so the queue is already here; ask only if we're somehow empty.
+    if (musicRoom && net.enabled && net.sendJukeStateReq && !juke.now && !juke.queue.length) {
+      const reqId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+      setTimeout(() => {
+        if (active && inMusicRoom() && net.sendJukeStateReq && !juke.now && !juke.queue.length) {
+          try { net.sendJukeStateReq({ reqId: reqId + '-juke' }); } catch (e) { /* best effort */ }
+        }
+      }, 2000);
+    }
     if (key === JOURNEY_ROOM_KEY) journeyOnEnter();
     // Community wall (build 18): late joiner asks the room for the current
     // canvas. Delayed so the data channel has a moment to connect; peers
@@ -7795,6 +8671,9 @@ net.onJukeStateCb = handleJukeState;
 net.onJukeFileReqCb = handleJukeFileReq; // build 27: phone-file P2P
 net.onJukeFileChunkCb = handleJukeFileChunk;
 net.onJukeFileHaveCb = handleJukeFileHave;
+// Room voice (build 40): live PCM frames over the relay.
+net.onVoiceChunkCb = handleVoiceChunk;
+net.onVoiceTalkCb = handleVoiceTalk;
 
 /* ---------------- settings panel ----------------
    Gear button opens it; D key is a desktop shortcut to the same panel.
@@ -7993,8 +8872,10 @@ function updatePlayer(dt) {
   _move.addScaledVector(_fwd, iz).addScaledVector(_right, ix);
   _move.y += iy * 0.9;
   const isJourney = active.key === JOURNEY_ROOM_KEY;
-  // slipstream: flying in the V multiplies everything the wings do
-  const boost = (isJourney && journey.inFlock) ? J_SLIPSTREAM : 1;
+  // build 41: proximity-graded speed — flock slipstream, ring/gem nearness,
+  // drafting off nearby drifters, plus ring/gem bursts. Not a binary fast mode.
+  // (updateJourney runs before updatePlayer each frame, so journey.boost is fresh.)
+  const boost = (isJourney && journey.boost > 0) ? journey.boost : 1;
   if (_move.lengthSq() > 0) {
     _move.normalize();
     vel.addScaledVector(_move, 26 * boost * dt);
@@ -8097,6 +8978,8 @@ function loop() {
     }
     roomBassSmooth += (Math.min(1, target) - roomBassSmooth) * Math.min(1, dt * 6);
     if (active.key === SOUND_ROOM_KEY && active.setBass) active.setBass(roomBassSmooth);
+    // build 41: the wisp's trail breathes with the room's low end
+    try { if (localTrail && localTrail.setPulse) localTrail.setPulse(roomBassSmooth); } catch (e) {}
   }
 
   // Community wall (build 18): push new strokes to the GPU texture.
@@ -8222,7 +9105,7 @@ window.__limbo = {
   joinLobby: () => net.joinLobby(),
   // servers (build 38)
   selectedServer: () => selectedServer,
-  selectServer: (n) => { selectedServer = n; serverListTouched = true; renderServerList(); },
+  selectServer: (n) => { pickServer(n); },
   renderServerList,
   serverCount,
   // couch co-op (build 34): offline LAN transport + ceremony
@@ -8285,7 +9168,19 @@ window.__limbo = {
   jamMicToggle: () => jamMicToggle(),
   jamMicOff: () => jamMicOff(),
   jamMicToggleMute: () => jamMicToggleMute(),
-  jamMicState: () => ({ on: jamMic.on, muted: jamMic.muted, hasStream: !!jamMic.stream, level: jamMicLevel() }),
+  jamMicToggleLoop: () => jamMicToggleLoop(),
+  jamMicState: () => ({ on: jamMic.on, muted: jamMic.muted, hasStream: !!jamMic.stream, level: jamMicLevel(), loopIn: jamMic.loopIn, loopTapGain: jamMic.loopTap ? jamMic.loopTap.gain.value : null }),
+  // room voice (build 40)
+  voiceTalkToggle: () => voiceTalkToggle(),
+  voiceTxState: () => ({ on: voice.tx.on, starting: voice.tx.starting, seq: voice.tx.seq, hasNode: !!voice.tx.node, lastError: voice.lastError }),
+  voiceRxTalk: (d, pid) => handleVoiceTalk(d, pid),
+  voiceRxChunk: (d, pid) => handleVoiceChunk(d, pid),
+  voiceRxState: () => [...voice.rx.entries()].map(([id, r]) => ({ id, name: r.name, queued: r.q.size, ended: r.ended, started: r.started })),
+  voiceTalkers: () => voiceTalkers(),
+  voiceInGainTarget: () => (voice.inGain ? 'master' : null),
+  mixerSet: (s, v) => mixerSet(s, v),
+  mixerLevels: () => ({ ...mixer.levels }),
+  jukeBadge: () => jukeBadge(),
   jamState: () => ({
     open: jam.open,
     bpm: jam.bpm,
@@ -8591,6 +9486,19 @@ window.__limbo = {
   jukeSetFactory: (f) => jukeSetFactory(f),
   jukeSetVolume: (v) => jukeSetVolume(v),
   jukeJoinTap: () => jukeJoinTap(),
+  // build 40: mixer + relay seams
+  mixerSet: (src, v) => mixerSet(src, v),
+  mixerLevels: () => ({ ...mixer.levels }),
+  mixerGains: () => {
+    const ch = (typeof audio !== 'undefined' && audio.ctx && jam.chain) || null;
+    const o = {};
+    if (ch && ch.gains) for (const k of Object.keys(ch.gains)) {
+      try { o[k] = +ch.gains[k].gain.value.toFixed(4); } catch (e) {}
+    }
+    return o;
+  },
+  netIsRelay: () => netIsRelay(),
+  netSetRelay: (v) => { try { net.relayMode = !!v; return net.relayMode; } catch (e) { return false; } },
   jukeResolveShortLink: (u) => jukeResolveShortLink(u),
   jukeRemoveGroup: (g) => jukeRemoveGroup(g),
   jukePlayerInfo: () => { // test seam: live read of the real provider player
