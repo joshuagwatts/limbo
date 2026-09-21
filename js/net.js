@@ -171,6 +171,10 @@ const ACTION_CBS = {
   stageReq: 'onStageReqCb', // build 66: late joiner asks for the stage
   fohSync: 'onFohSyncCb', // build 66: shared front-of-house light rig
   fohReq: 'onFohReqCb', // build 66: late joiner asks for the lights
+  modelShare: 'onModelShareCb', // build 69: model-room shared shelf — one model
+  modelDel: 'onModelDelCb', // build 69: a maker deleted their model
+  modelReq: 'onModelReqCb', // build 69: late joiner asks for the shelf
+  modelChunk: 'onModelChunkCb', // build 69: chunked large model payloads
   voiceChunk: 'onVoiceChunkCb', // build 40: live room voice over the relay
   voiceTalk: 'onVoiceTalkCb',
 };
@@ -1080,14 +1084,27 @@ export class LimboNet {
       out = { cid: this.clientId };
     }
     /* Build 43: stamp every jukebox payload with its server key. Receivers
-       drop payloads from other servers, so a pre-relay world-room broadcast
-       (or any stray) can never contaminate another server's line. */
+       drop payloads from other servers, so a stray can never contaminate
+       another server's line. */
     if (this._jukeServerKey) out.srv = this._jukeServerKey;
+    /* Build 70: dual-leg delivery. The relay server channel is the primary
+       leg, but a peer whose relay never engaged (blocked CDN, dead socket)
+       is silently cut out of a relay-only broadcast while everything else
+       keeps working over data channels — the "flying together but the track
+       never arrived" hole. So the stamped payload ALSO rides the world-room
+       data channels; the receive-side dedup collapses the double delivery
+       and jukeSrvOk keeps servers from cross-talking. */
     if (this.relayMode && this.relayLink) {
       const tag = this._jukeServerTag || this._relayRoomTag;
-      if (tag) { this._relayPublishTo(tag, actionName, out, null); return; }
+      if (tag) this._relayPublishTo(tag, actionName, out, null);
     }
-    this._bcast(actionName, data);
+    for (const e of this.rooms) {
+      try {
+        if (e.A[actionName]) e.A[actionName].send(out);
+      } catch (err) {
+        /* best effort per room */
+      }
+    }
   }
 
   /* Build 41: point the server-wide jukebox channel at a Nexus server room.

@@ -14,7 +14,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=67">
+<link rel="stylesheet" href="css/style.css?v=70">
 <script type="importmap">
 {
   "imports": {
@@ -24,8 +24,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=67"></script>
-<script src="js/vendor/jsqr.js?v=67"></script>
+<script src="js/vendor/qrcode.js?v=70"></script>
+<script src="js/vendor/jsqr.js?v=70"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -407,6 +407,7 @@ if ('serviceWorker' in navigator) {
       <label class="ws-color">color <input id="ws-color" type="color" value="#7ae0ff"></label>
     </div>
     <div class="ws-edit-row">
+      <button id="ws-sculpt">&#10022; sculpt</button>
       <button id="ws-undo">&#8617; undo</button>
       <button id="ws-delete">delete piece</button>
     </div>
@@ -418,6 +419,42 @@ if ('serviceWorker' in navigator) {
   </div>
   <div class="ws-sub">SAVED MODELS</div>
   <div id="ws-models" class="ws-models"></div>
+  <!-- build 69: the room shelf — models shared by everyone in the model room.
+       Tapping one loads a copy into your own workbench. -->
+  <div class="ws-sub">ROOM SHELF <span id="ws-roster" class="ws-roster"></span></div>
+  <div id="ws-shelf" class="ws-models"></div>
+</div>
+
+<!-- build 68: sculpt mode — Nomad-style touch sculpting on the selected piece.
+     Canvas-first: floating brush toolbar, minimal chrome. -->
+<div id="sculpt-hud" style="display:none">
+  <div class="sc-top">
+    <span id="sc-name">sculpt</span>
+    <div class="sc-detail" id="sc-detail" role="group" aria-label="detail level">
+      <button data-detail="low">low</button>
+      <button data-detail="med" class="sel">med</button>
+      <button data-detail="high">high</button>
+    </div>
+    <button id="sc-sym" class="on" aria-label="mirror symmetry">&#8646;</button>
+    <button id="sc-invert" aria-label="invert brush">&#8645;</button>
+    <button id="sc-undo" class="off" aria-label="undo stroke">&#8617;</button>
+    <button id="sc-done">&#10003; done</button>
+  </div>
+  <div class="sc-bottom">
+    <div class="sc-sliders">
+      <label>size <input id="sc-size" type="range" min="8" max="200" step="1" value="55"></label>
+      <label>push <input id="sc-int" type="range" min="5" max="100" step="1" value="50"></label>
+    </div>
+    <div class="sc-brushes" id="sc-brushes">
+      <button data-brush="grab"><span class="g">&#9995;</span><span class="t">grab</span></button>
+      <button data-brush="clay" class="sel"><span class="g">&#9679;</span><span class="t">clay</span></button>
+      <button data-brush="smooth"><span class="g">~</span><span class="t">smooth</span></button>
+      <button data-brush="flatten"><span class="g">&#9646;</span><span class="t">flat</span></button>
+      <button data-brush="pinch"><span class="g">&#8601;</span><span class="t">pinch</span></button>
+      <button data-brush="inflate"><span class="g">&#9678;</span><span class="t">inflate</span></button>
+    </div>
+    <div class="sc-hint">drag the clay to push it &middot; drag the background to orbit &middot; pinch to zoom</div>
+  </div>
 </div>
 
 <!-- settings (gear) — wisp skins/hats, sound, drifter name, debug readout -->
@@ -541,6 +578,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=67"></script>
+<script type="module" src="js/game.js?v=70"></script>
 </body>
 </html>

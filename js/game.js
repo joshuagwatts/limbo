@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=67';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=67';
-import { CouchNet } from './couch.js?v=67';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=67';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=67';
+import { AudioEngine } from './audio.js?v=70';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=70';
+import { CouchNet } from './couch.js?v=70';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=70';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=70';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -5087,8 +5087,13 @@ function jukeArmPlayWatchdog(kind, d, recover) {
       return;
     }
     // Recovered once, still silent, no provider error: autoplay is blocked.
+    // Build 70: raise the GLOBAL pill too — the in-panel join button is
+    // invisible while the jukebox is closed, which is exactly when a remote
+    // track on a fresh phone needs it. One tap seeks to the wall-clock
+    // offset and plays.
     juke.joinWaiting = true;
     renderJuke();
+    soundPillShow();
   };
   juke.watchT = setTimeout(tick, 700);
 }
@@ -7529,13 +7534,16 @@ function wsSaveModels(m) {
   try { localStorage.setItem('limbo_models_v1', JSON.stringify(m)); } catch (e) {}
 }
 function wsPieceSpec(p) {
-  return {
+  const spec = {
     t: p.type,
     p: [+p.mesh.position.x.toFixed(3), +p.mesh.position.y.toFixed(3), +p.mesh.position.z.toFixed(3)],
     ry: +p.mesh.rotation.y.toFixed(3),
     s: +p.mesh.scale.x.toFixed(3),
     c: '#' + p.mesh.material.color.getHexString(),
   };
+  // build 68: sculpted pieces carry their clay (detail + displaced verts)
+  if (p.sculpt && p.sculpt.v && p.sculpt.detail) { spec.detail = p.sculpt.detail; spec.v = p.sculpt.v; }
+  return spec;
 }
 function wsSerialize() { return ws.pieces.map(wsPieceSpec); }
 function wsSanitizeSpec(s) {
@@ -7543,22 +7551,32 @@ function wsSanitizeSpec(s) {
   const t = ['box', 'sphere', 'cylinder', 'cone', 'torus', 'plane'].includes(s.t) ? s.t : 'box';
   const num = (v, d) => (Number.isFinite(+v) ? +v : d);
   const p = Array.isArray(s.p) ? s.p : [0, 1.6, 0];
-  return {
+  const out = {
     t,
     p: [num(p[0], 0), num(p[1], 1.6), num(p[2], 0)],
     ry: num(s.ry, 0),
     s: Math.max(0.05, Math.min(8, num(s.s, 1))),
     c: typeof s.c === 'string' && /^#[0-9a-fA-F]{6}$/.test(s.c) ? s.c : '#7ae0ff',
   };
+  // build 68: sculpt payload round-trips (validated; corrupt data falls back to the plain primitive)
+  if (s.detail && SCULPT_DETAIL[s.detail] && typeof s.v === 'string' && s.v.length > 64 && s.v.length < 4000000) {
+    out.detail = s.detail;
+    out.v = s.v;
+  }
+  return out;
 }
 function wsInstantiate(spec) {
   const s = wsSanitizeSpec(spec);
   if (!s) return null;
-  const mesh = modelPieceMesh(s.t, s.c);
+  // build 68: sculpted specs rebuild their clay; corrupt data falls back to the plain primitive
+  let mesh = (s.v && s.detail) ? sculptMeshFromSpec(s) : null;
+  if (!mesh) mesh = modelPieceMesh(s.t, s.c);
   mesh.position.set(s.p[0], s.p[1], s.p[2]);
   mesh.rotation.y = s.ry;
   mesh.scale.setScalar(s.s);
-  return { id: ws.nextId++, type: s.t, mesh };
+  const piece = { id: ws.nextId++, type: s.t, mesh };
+  if (s.v && s.detail) piece.sculpt = { detail: s.detail, v: s.v };
+  return piece;
 }
 /* Rebuild the bench from a serialized list. */
 function wsRebuild(list) {
@@ -7574,7 +7592,7 @@ function wsRebuild(list) {
 }
 function wsPushUndo() {
   ws.undoStack.push(JSON.stringify(wsSerialize()));
-  if (ws.undoStack.length > 40) ws.undoStack.shift();
+  if (ws.undoStack.length > 24) ws.undoStack.shift(); // build 68: 24 — sculpted snapshots carry vert data
 }
 function wsUndo() {
   const snap = ws.undoStack.pop();
@@ -7640,6 +7658,7 @@ function wsSaveModel(name) {
   if (wsNameEl) wsNameEl.value = '';
   wsRenderModels();
   stageRenderModels(); // the jam room's stage list sees it immediately
+  wsBroadcastModel(nm); // build 69: the room shelf sees it too
   addSystemLine(`model "${nm}" saved — place it from the jam room stage`);
   return true;
 }
@@ -7659,6 +7678,7 @@ function wsDeleteModel(name) {
   wsSaveModels(models);
   wsRenderModels();
   stageRenderModels();
+  wsBroadcastModelDel(name); // build 69: pull it off the room shelf too
   return true;
 }
 function wsRenderPieces() {
@@ -7727,8 +7747,729 @@ function wsRenderModels() {
 function setWorkshopPanel(open) {
   ws.open = !!open;
   if (workshopPanel) workshopPanel.style.display = ws.open ? '' : 'none';
-  if (ws.open) { wsRenderPieces(); wsRenderEdit(); wsRenderModels(); }
+  if (ws.open) { wsRenderPieces(); wsRenderEdit(); wsRenderModels(); wsShelfRender(); }
 }
+
+/* ---------------- shared model shelf (build 69) ----------------
+   v1 multiplayer for the model room: a shared-shelf model, NOT live
+   stroke-level co-sculpting. Every saved model is broadcast to the room;
+   the shelf lists everyone's models with the maker's name. Tapping a
+   peer's model loads a COPY into your own workbench (sculpted clay
+   included — it round-trips through wsSanitizeSpec). Large models ride
+   chunked (data channels cap ~256KB/message; 48KB chunks stay safe). */
+const wsShelfEl = document.getElementById('ws-shelf');
+const wsRosterEl = document.getElementById('ws-roster');
+const wsShelf = new Map(); // `${peerId}::${name}` -> { name, by, specs, peerId }
+const MODEL_CHUNK = 48000; // base64 chars per message
+const MODEL_MAX_CHUNKS = 64; // ~3MB ceiling per shared model
+const wsPendingModels = new Map(); // `${peerId}:${tid}` -> { name, by, parts, n, t }
+
+function wsShelfKey(peerId, name) { return String(peerId) + '::' + String(name); }
+function wsMyName() { return (typeof myName === 'string' && myName) || 'drifter'; }
+
+/* Send one of MY models to the room. Small models go direct; large ones
+   go as meta + indexed chunks (order-independent reassembly). */
+function wsBroadcastModel(name) {
+  if (!net.enabled || !net.sendModelShare) return false;
+  const models = wsLoadModels();
+  const specs = models[name];
+  if (!Array.isArray(specs) || !specs.length) return false;
+  const by = wsMyName();
+  const tid = Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
+  const payload = JSON.stringify({ name, by, specs });
+  if (payload.length <= MODEL_CHUNK) {
+    try { net.sendModelShare({ tid, name, by, specs }); } catch (e) { return false; }
+    return true;
+  }
+  const parts = [];
+  for (let i = 0; i < payload.length; i += MODEL_CHUNK) parts.push(payload.slice(i, i + MODEL_CHUNK));
+  if (parts.length > MODEL_MAX_CHUNKS) {
+    addSystemLine('model too big to share — try a lower sculpt detail');
+    return false;
+  }
+  try { net.sendModelShare({ tid, name, by, n: parts.length }); } catch (e) { return false; }
+  parts.forEach((chunk, i) => { try { net.sendModelChunk({ tid, i, chunk }); } catch (e) {} });
+  return true;
+}
+function wsBroadcastModelDel(name) {
+  if (!net.enabled || !net.sendModelDel) return;
+  try { net.sendModelDel({ name: String(name).slice(0, 24) }); } catch (e) {}
+}
+function wsShelfApply(peerId, name, by, specs) {
+  if (!Array.isArray(specs) || !specs.length || specs.length > 24) return false;
+  const clean = specs.map(wsSanitizeSpec).filter(Boolean);
+  if (!clean.length) return false;
+  wsShelf.set(wsShelfKey(peerId, name), {
+    name: String(name).slice(0, 24),
+    by: String(by || 'drifter').slice(0, 16) || 'drifter',
+    specs: clean,
+    peerId: String(peerId),
+  });
+  // shelf cap: drop the oldest entries first
+  while (wsShelf.size > 60) wsShelf.delete(wsShelf.keys().next().value);
+  wsShelfRender();
+  return true;
+}
+function handleModelShare(peerId, d) {
+  if (!d) return;
+  const tid = String(d.tid || '');
+  const name = String(d.name || '').slice(0, 24);
+  if (!name || !tid) return;
+  // drop stale pending transfers (a minute without all chunks = dead)
+  const now = Date.now();
+  for (const [k, p] of wsPendingModels) if (now - p.t > 60000) wsPendingModels.delete(k);
+  if (typeof d.n === 'number' && d.n > 1 && d.n <= MODEL_MAX_CHUNKS) {
+    wsPendingModels.set(String(peerId) + ':' + tid, {
+      name, by: String(d.by || 'drifter').slice(0, 16), parts: new Array(Math.floor(d.n)).fill(null),
+      n: Math.floor(d.n), t: now,
+    });
+    return;
+  }
+  wsShelfApply(peerId, name, d.by, d.specs);
+}
+function handleModelChunk(peerId, d) {
+  if (!d) return;
+  const p = wsPendingModels.get(String(peerId) + ':' + String(d.tid || ''));
+  if (!p) return;
+  const i = Math.floor(+d.i);
+  if (!(i >= 0 && i < p.n) || typeof d.chunk !== 'string' || d.chunk.length > MODEL_CHUNK + 64) return;
+  p.parts[i] = d.chunk;
+  if (p.parts.some((x) => x == null)) return;
+  wsPendingModels.delete(String(peerId) + ':' + String(d.tid || ''));
+  try {
+    const payload = JSON.parse(p.parts.join(''));
+    if (payload && String(payload.name || '').slice(0, 24) === p.name) wsShelfApply(peerId, p.name, p.by, payload.specs);
+  } catch (e) {}
+}
+function handleModelDel(peerId, d) {
+  if (!d) return;
+  const name = String(d.name || '').slice(0, 24);
+  if (wsShelf.delete(wsShelfKey(peerId, name))) wsShelfRender();
+}
+function handleModelReq(peerId, d) {
+  if (!net.enabled) return;
+  // late joiner asks — answer with each of my models, one message each
+  const models = wsLoadModels();
+  for (const name of Object.keys(models)) wsBroadcastModel(name);
+}
+/* Tap a shelf model: it loads as a COPY into my workbench. */
+function wsShelfLoadEntry(entry) {
+  if (!entry || !Array.isArray(entry.specs)) return false;
+  wsPushUndo();
+  wsRebuild(entry.specs);
+  if (ws.pieces.length) wsSelect(ws.pieces[0].id);
+  addSystemLine(`"${entry.name}" by ${entry.by} is on your bench — sculpt away`);
+  return true;
+}
+function wsRosterNames() {
+  const out = [];
+  for (const pv of peerVisuals.values()) if (pv && pv.name) out.push(pv.name);
+  return out;
+}
+function wsShelfRender() {
+  if (wsRosterEl) {
+    const names = wsRosterNames();
+    wsRosterEl.textContent = names.length
+      ? `· ${names.length + 1} here: you, ${names.join(', ')}`
+      : (net.enabled ? '· just you here' : '· offline');
+  }
+  if (!wsShelfEl) return;
+  wsShelfEl.innerHTML = '';
+  const entries = [...wsShelf.values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (!entries.length) {
+    const d = document.createElement('div');
+    d.className = 'ws-empty';
+    d.textContent = net.enabled ? 'room shelf is empty — save a model to share it' : 'offline — the shelf needs a connection';
+    wsShelfEl.appendChild(d);
+    return;
+  }
+  for (const e of entries) {
+    const row = document.createElement('div');
+    row.className = 'ws-shelf-row';
+    const load = document.createElement('button');
+    load.className = 'ws-model-load';
+    const nm = document.createElement('span');
+    nm.textContent = `${e.name} (${e.specs.length})`;
+    const by = document.createElement('span');
+    by.className = 'ws-shelf-by';
+    by.textContent = 'by ' + e.by;
+    load.appendChild(nm);
+    load.appendChild(by);
+    load.setAttribute('aria-label', `load ${e.name} by ${e.by} into workbench`);
+    load.addEventListener('click', () => { wsShelfLoadEntry(e); load.blur(); });
+    row.appendChild(load);
+    wsShelfEl.appendChild(row);
+  }
+}
+
+/* ---------------- sculpt mode (build 68) ----------------
+   Nomad-style touch sculpting on the selected workbench piece.
+   The piece's geometry is swapped for a dense subdivided base; finger
+   drags displace verts with dab spacing and a cosine falloff. Sculpting
+   edits geometry in the piece's local space — the workbench sliders keep
+   owning the piece transform. Saved models carry the displaced verts
+   (base64 Float32Array) so they round-trip through the stage builder. */
+
+/* Detail -> per-primitive segment counts. Vert budgets stay phone-sane:
+   low ~1.6k, med ~6.3k, high ~18k on the sphere (cap 25k everywhere). */
+const SCULPT_DETAIL = {
+  low:  { sphere: [48, 32],   box: [10, 10, 10], cylinder: [40, 20],  cone: [40, 20],  torus: [40, 20],  plane: [40, 40] },
+  med:  { sphere: [96, 64],   box: [22, 22, 22], cylinder: [80, 40],  cone: [80, 40],  torus: [80, 40],  plane: [80, 80] },
+  high: { sphere: [160, 112], box: [34, 34, 34], cylinder: [120, 60], cone: [120, 60], torus: [120, 60], plane: [120, 120] },
+};
+const SCULPT_BRUSHES = ['grab', 'clay', 'smooth', 'flatten', 'pinch', 'inflate'];
+
+function sculptBaseGeo(type, detail) {
+  const lv = SCULPT_DETAIL[detail] || SCULPT_DETAIL.med;
+  const d = lv[type] || lv.sphere;
+  switch (type) {
+    case 'sphere': return new THREE.SphereGeometry(1, d[0], d[1]);
+    case 'cylinder': return new THREE.CylinderGeometry(1, 1, 2, d[0], d[1]);
+    case 'cone': return new THREE.ConeGeometry(1, 2, d[0], d[1]);
+    case 'torus': return new THREE.TorusGeometry(1, 0.4, d[1], d[0]);
+    case 'plane': return new THREE.PlaneGeometry(2, 2, d[0], d[1]);
+    case 'box':
+    default: return new THREE.BoxGeometry(2, 2, 2, d[0], d[1], d[2]);
+  }
+}
+
+/* Float32Array <-> base64 for the saved-model payload. */
+function sculptF32ToB64(arr) {
+  const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+function sculptB64ToF32(b64, count) {
+  try {
+    const bin = atob(b64);
+    if (bin.length !== count * 4) return null;
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Float32Array(bytes.buffer);
+  } catch (e) { return null; }
+}
+/* Dense geometry rebuilt from saved sculpt data (type + detail + verts). */
+function sculptGeoFromData(type, detail, v) {
+  try {
+    const geo = sculptBaseGeo(type, detail);
+    const arr = sculptB64ToF32(v, geo.attributes.position.count * 3);
+    if (!arr) { geo.dispose(); return null; }
+    geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+    geo.computeVertexNormals();
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 4);
+    return geo;
+  } catch (e) { return null; }
+}
+/* Rebuild a mesh from a sanitized sculpted spec ({t, detail, v, c}). */
+function sculptMeshFromSpec(s) {
+  const geo = sculptGeoFromData(s.t, s.detail, s.v);
+  if (!geo) return null;
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(s.c || '#7ae0ff'), roughness: 0.45, metalness: 0.35,
+  });
+  return new THREE.Mesh(geo, mat);
+}
+
+const sculpt = {
+  active: false, pieceId: null, ptype: 'sphere', mesh: null,
+  brush: 'clay', size: 0.55, intensity: 0.5,
+  sym: true, invert: false, detail: 'med',
+  stroke: null, strokeId: null, undo: [], strokeCount: 0,
+  orbit: { theta: 0.7, phi: 1.12, radius: 7, target: new THREE.Vector3() },
+  orbiting: null, orbitLast: null, pinching: false, pinchDist: 0,
+  pointers: new Map(),
+  mouseDown: false, mouseRole: null,
+  neighbors: null, lastNormalAt: 0,
+};
+const sculptHud = document.getElementById('sculpt-hud');
+const scNameEl = document.getElementById('sc-name');
+const scDetailEl = document.getElementById('sc-detail');
+const scBrushesEl = document.getElementById('sc-brushes');
+const scSizeEl = document.getElementById('sc-size');
+const scIntEl = document.getElementById('sc-int');
+const scSymEl = document.getElementById('sc-sym');
+const scInvertEl = document.getElementById('sc-invert');
+const scUndoEl = document.getElementById('sc-undo');
+const scDoneEl = document.getElementById('sc-done');
+const wsSculptEl = document.getElementById('ws-sculpt');
+
+const _scA = new THREE.Vector3(), _scB = new THREE.Vector3(), _scC = new THREE.Vector3();
+const _scQ = new THREE.Quaternion();
+const _scD = { x: 0, y: 0, z: 0 }; // scratch displacement, written by sculptDispInto
+
+/* Vertex adjacency from the index — built once per sculpt geometry. */
+function sculptBuildNeighbors(geo) {
+  const n = geo.attributes.position.count;
+  if (!geo.index) return Array.from({ length: n }, () => []);
+  const idx = geo.index.array;
+  const sets = new Array(n);
+  for (let i = 0; i < n; i++) sets[i] = new Set();
+  for (let i = 0; i < idx.length; i += 3) {
+    const a = idx[i], b = idx[i + 1], c = idx[i + 2];
+    sets[a].add(b); sets[a].add(c);
+    sets[b].add(a); sets[b].add(c);
+    sets[c].add(a); sets[c].add(b);
+  }
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = [...sets[i]];
+  return out;
+}
+
+function sculptLocalRadius() {
+  const s = (sculpt.mesh && sculpt.mesh.scale.x) || 1;
+  return Math.max(0.04, sculpt.size / Math.max(0.05, s));
+}
+/* One vert's displacement from one dab — writes into _scD (no allocs).
+   g: local-space grab delta (grab brush only). */
+function sculptDispInto(brush, cx, cy, cz, nx, ny, nz, px, py, pz, vi, arr, nrm, kClay, kSmooth, inten, g) {
+  const D = _scD;
+  if (brush === 'clay') { D.x = nx * kClay; D.y = ny * kClay; D.z = nz * kClay; }
+  else if (brush === 'inflate') {
+    if (nrm) { D.x = nrm[vi] * kClay; D.y = nrm[vi + 1] * kClay; D.z = nrm[vi + 2] * kClay; }
+    else { D.x = nx * kClay; D.y = ny * kClay; D.z = nz * kClay; }
+  }
+  else if (brush === 'flatten') {
+    const a = (px - cx) * nx + (py - cy) * ny + (pz - cz) * nz;
+    const k = -0.9 * inten * a;
+    D.x = nx * k; D.y = ny * k; D.z = nz * k;
+  }
+  else if (brush === 'pinch') {
+    const tx = cx - px, ty = cy - py, tz = cz - pz;
+    const a = tx * nx + ty * ny + tz * nz;
+    const k = 0.9 * inten;
+    D.x = (tx - nx * a) * k; D.y = (ty - ny * a) * k; D.z = (tz - nz * a) * k;
+  }
+  else if (brush === 'smooth') {
+    const nb = sculpt.neighbors[vi / 3];
+    let ax = 0, ay = 0, az = 0;
+    for (let j = 0; j < nb.length; j++) { const jx = nb[j] * 3; ax += arr[jx]; ay += arr[jx + 1]; az += arr[jx + 2]; }
+    const m = 1 / Math.max(1, nb.length);
+    D.x = (ax * m - px) * kSmooth; D.y = (ay * m - py) * kSmooth; D.z = (az * m - pz) * kSmooth;
+  }
+  else if (brush === 'grab' && g) { D.x = g.x; D.y = g.y; D.z = g.z; }
+  else { D.x = 0; D.y = 0; D.z = 0; }
+}
+/* The heart: apply one dab. c/n in local space; g is the local grab delta.
+   Symmetry mirrors the whole dab across local X (second dab at -cx). */
+function sculptApplyDab(c, n, g) {
+  const mesh = sculpt.mesh;
+  if (!mesh) return;
+  const posA = mesh.geometry.attributes.position;
+  const nrmA = mesh.geometry.attributes.normal;
+  const arr = posA.array, nrm = nrmA ? nrmA.array : null;
+  const count = posA.count;
+  const r = sculptLocalRadius();
+  const brush = sculpt.brush;
+  let inten = sculpt.intensity;
+  if (sculpt.invert && brush !== 'smooth' && brush !== 'grab') inten = -inten;
+  const kClay = 0.11 * inten;
+  const kSmooth = 0.55 * Math.abs(inten);
+  const cx = c.x, cy = c.y, cz = c.z;
+  const nx = n.x, ny = n.y, nz = n.z;
+  const gM = g ? { x: -g.x, y: g.y, z: g.z } : null;
+  for (let i = 0; i < count; i++) {
+    const vi = i * 3;
+    const px = arr[vi], py = arr[vi + 1], pz = arr[vi + 2];
+    let dx = px - cx, dy = py - cy, dz = pz - cz;
+    const d1 = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const f1 = d1 < r ? (Math.cos(Math.PI * d1 / r) + 1) * 0.5 : 0;
+    let f2 = 0;
+    if (sculpt.sym) {
+      dx = px + cx; dy = py - cy; dz = pz - cz;
+      const d2 = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d2 < r) f2 = (Math.cos(Math.PI * d2 / r) + 1) * 0.5;
+    }
+    if (f1 === 0 && f2 === 0) continue;
+    let ox = 0, oy = 0, oz = 0;
+    if (f1 > 0) {
+      sculptDispInto(brush, cx, cy, cz, nx, ny, nz, px, py, pz, vi, arr, nrm, kClay, kSmooth, inten, g);
+      ox += _scD.x * f1; oy += _scD.y * f1; oz += _scD.z * f1;
+    }
+    if (f2 > 0) {
+      sculptDispInto(brush, -cx, cy, cz, -nx, ny, nz, px, py, pz, vi, arr, nrm, kClay, kSmooth, inten, gM);
+      ox += _scD.x * f2; oy += _scD.y * f2; oz += _scD.z * f2;
+    }
+    arr[vi] = px + ox; arr[vi + 1] = py + oy; arr[vi + 2] = pz + oz;
+  }
+  posA.needsUpdate = true;
+}
+function sculptTouchNormals(force) {
+  if (!sculpt.mesh) return;
+  const now = performance.now();
+  if (!force && now - sculpt.lastNormalAt < 90) return;
+  sculpt.lastNormalAt = now;
+  try {
+    sculpt.mesh.geometry.computeVertexNormals();
+    sculpt.mesh.geometry.attributes.normal.needsUpdate = true;
+  } catch (e) {}
+}
+
+/* ---------- strokes ---------- */
+function sculptBeginStroke(hit) {
+  const mesh = sculpt.mesh;
+  if (!mesh || !hit) return false;
+  sculptUndoPush();
+  const local = mesh.worldToLocal(hit.point.clone());
+  const n = hit.face && hit.face.normal ? hit.face.normal.clone().normalize() : new THREE.Vector3(0, 1, 0);
+  const st = { last: local, lastN: n, plane: null, lastPlanePt: null, brush: sculpt.brush };
+  if (sculpt.brush === 'grab') {
+    camera.getWorldDirection(_scA);
+    st.plane = new THREE.Plane().setFromNormalAndCoplanarPoint(_scA.clone(), hit.point);
+    st.lastPlanePt = hit.point.clone();
+  }
+  sculpt.stroke = st;
+  sculptApplyDab(local, n, null); // a tap still makes a mark
+  sculptTouchNormals(false);
+  return true;
+}
+function sculptStrokeTo(nx, ny) {
+  const st = sculpt.stroke;
+  if (!st || !sculpt.mesh) return false;
+  _raycaster.setFromCamera({ x: nx, y: ny }, camera);
+  const hits = _raycaster.intersectObject(sculpt.mesh, false);
+  if (!hits.length) return false; // dragged off the clay — the stroke stays alive
+  const hit = hits[0];
+  const local = sculpt.mesh.worldToLocal(hit.point.clone());
+  const n = hit.face && hit.face.normal ? hit.face.normal.clone().normalize() : st.lastN;
+  let g = null;
+  if (st.brush === 'grab' && st.plane && _raycaster.ray.intersectPlane(st.plane, _scB)) {
+    _scC.copy(_scB).sub(st.lastPlanePt);
+    st.lastPlanePt.copy(_scB);
+    sculpt.mesh.getWorldQuaternion(_scQ).invert();
+    g = _scC.applyQuaternion(_scQ).divideScalar(Math.max(0.05, sculpt.mesh.scale.x));
+  }
+  // dab spacing: walk the segment so fast drags can't skip
+  const r = sculptLocalRadius();
+  const step = Math.max(0.03, r * 0.3);
+  const dist = st.last.distanceTo(local);
+  const steps = Math.max(1, Math.min(32, Math.floor(dist / step)));
+  const gd = g ? g.clone().multiplyScalar(1 / steps) : null;
+  for (let k = 1; k <= steps; k++) {
+    const t = k / steps;
+    _scA.copy(st.last).lerp(local, t);
+    _scB.copy(st.lastN).lerp(n, t).normalize();
+    sculptApplyDab(_scA, _scB, gd);
+  }
+  st.last.copy(local);
+  st.lastN.copy(n);
+  sculptTouchNormals(false);
+  return true;
+}
+function sculptEndStroke() {
+  if (!sculpt.stroke) return;
+  sculpt.stroke = null;
+  sculpt.strokeCount++;
+  sculptTouchNormals(true);
+  sculptPersistPiece();
+  sculptRenderUndo();
+}
+function sculptUndoPush() {
+  if (!sculpt.mesh) return;
+  sculpt.undo.push(sculpt.mesh.geometry.attributes.position.array.slice());
+  if (sculpt.undo.length > 12) sculpt.undo.shift();
+}
+function sculptUndo() {
+  if (!sculpt.active || !sculpt.mesh || !sculpt.undo.length) return false;
+  const snap = sculpt.undo.pop();
+  const posA = sculpt.mesh.geometry.attributes.position;
+  if (snap.length !== posA.array.length) return false; // topology changed — can't restore
+  posA.array.set(snap);
+  posA.needsUpdate = true;
+  sculptTouchNormals(true);
+  sculptPersistPiece();
+  sculptRenderUndo();
+  return true;
+}
+/* The piece remembers its clay: detail + displaced verts live on the piece
+   so workbench undo, save/load and the stage builder all round-trip it. */
+function sculptPersistPiece() {
+  const p = wsFind(sculpt.pieceId);
+  if (!p || !sculpt.mesh) return;
+  try {
+    p.sculpt = { detail: sculpt.detail, v: sculptF32ToB64(sculpt.mesh.geometry.attributes.position.array) };
+  } catch (e) { /* quota pressure surfaces at save time */ }
+}
+
+/* ---------- session ---------- */
+function sculptEnter() {
+  if (sculpt.active) return true;
+  if (!active || active.key !== WORKSHOP_ROOM_KEY || !wsGroup) return false;
+  const p = wsFind(ws.sel);
+  if (!p) { addSystemLine('tap a piece first, then hit sculpt'); return false; }
+  wsPushUndo();
+  const detail = (p.sculpt && SCULPT_DETAIL[p.sculpt.detail]) ? p.sculpt.detail : 'med';
+  let geo = (p.sculpt && p.sculpt.v) ? sculptGeoFromData(p.type, detail, p.sculpt.v) : null;
+  if (!geo) geo = sculptBaseGeo(p.type, detail);
+  try { p.mesh.geometry.dispose(); } catch (e) {}
+  p.mesh.geometry = geo;
+  sculpt.active = true;
+  sculpt.pieceId = p.id;
+  sculpt.ptype = p.type;
+  sculpt.mesh = p.mesh;
+  sculpt.detail = detail;
+  sculpt.stroke = null; sculpt.strokeId = null;
+  sculpt.undo = []; sculpt.strokeCount = 0;
+  sculpt.pointers.clear();
+  sculpt.orbiting = null; sculpt.orbitLast = null;
+  sculpt.pinching = false; sculpt.pinchDist = 0;
+  sculpt.mouseDown = false; sculpt.mouseRole = null;
+  sculpt.neighbors = sculptBuildNeighbors(geo);
+  sculpt.base = geo.attributes.position.array.slice(); // build 68: displacement baseline
+  const wp = new THREE.Vector3();
+  p.mesh.getWorldPosition(wp);
+  sculpt.orbit.target.copy(wp);
+  _scA.copy(camera.position).sub(wp);
+  const len = _scA.length() || 7;
+  sculpt.orbit.radius = Math.max(3.5, Math.min(18, len));
+  sculpt.orbit.theta = Math.atan2(_scA.x, _scA.z);
+  sculpt.orbit.phi = Math.max(0.2, Math.min(Math.PI - 0.2,
+    Math.acos(Math.max(-1, Math.min(1, _scA.y / len)))));
+  chatFocused = true; // keys never fly the wisp mid-sculpt (same guard as paint/jam)
+  sculptSetHud(true);
+  sculptRenderUI();
+  return true;
+}
+function sculptExit() {
+  if (!sculpt.active) return;
+  if (sculpt.stroke) sculptEndStroke();
+  sculptPersistPiece();
+  sculpt.active = false;
+  sculpt.pieceId = null; sculpt.mesh = null;
+  sculpt.stroke = null; sculpt.strokeId = null;
+  sculpt.undo = []; sculpt.neighbors = null;
+  sculpt.pointers.clear();
+  sculpt.orbiting = null; sculpt.orbitLast = null;
+  sculpt.pinching = false; sculpt.mouseDown = false; sculpt.mouseRole = null;
+  chatFocused = false;
+  sculptSetHud(false);
+  wsRenderPieces(); wsRenderEdit();
+}
+function sculptSetBrush(b) {
+  if (!SCULPT_BRUSHES.includes(b)) return false;
+  sculpt.brush = b;
+  sculptRenderUI();
+  return true;
+}
+function sculptSetDetail(d) {
+  if (!sculpt.active || !SCULPT_DETAIL[d] || d === sculpt.detail) return false;
+  // a detail change re-subdivides, which resets the clay — the bench undo
+  // snapshot below (with the current verts) brings it all back in one tap
+  sculptPersistPiece();
+  wsPushUndo();
+  const old = sculpt.mesh.geometry;
+  const geo = sculptBaseGeo(sculpt.ptype, d);
+  sculpt.mesh.geometry = geo;
+  try { old.dispose(); } catch (e) {}
+  sculpt.detail = d;
+  sculpt.neighbors = sculptBuildNeighbors(geo);
+  sculpt.base = geo.attributes.position.array.slice(); // fresh baseline for the new topology
+  sculpt.undo = [];
+  sculpt.stroke = null; sculpt.strokeId = null;
+  sculptPersistPiece();
+  sculptTouchNormals(true);
+  sculptRenderUI();
+  return true;
+}
+function sculptSetSym(v) {
+  sculpt.sym = v == null ? !sculpt.sym : !!v;
+  sculptRenderUI();
+  return sculpt.sym;
+}
+function sculptSetInvert(v) {
+  sculpt.invert = v == null ? !sculpt.invert : !!v;
+  sculptRenderUI();
+  return sculpt.invert;
+}
+
+/* ---------- picking ---------- */
+function sculptNdcFromClient(cx, cy) {
+  return { x: (cx / window.innerWidth) * 2 - 1, y: -(cy / window.innerHeight) * 2 + 1 };
+}
+function sculptPickNdc(nx, ny) {
+  if (!sculpt.active || !sculpt.mesh) return null;
+  _raycaster.setFromCamera({ x: nx, y: ny }, camera);
+  const hits = _raycaster.intersectObject(sculpt.mesh, false);
+  return hits.length ? hits[0] : null;
+}
+
+/* ---------- camera: orbit the clay ---------- */
+function sculptOrbitBy(dx, dy) {
+  const o = sculpt.orbit;
+  o.theta -= dx * 0.0085;
+  o.phi = Math.max(0.12, Math.min(Math.PI - 0.12, o.phi - dy * 0.0085));
+}
+function sculptCameraUpdate() {
+  const o = sculpt.orbit, t = o.target;
+  const sp = Math.sin(o.phi);
+  camera.position.set(
+    t.x + o.radius * sp * Math.sin(o.theta),
+    t.y + o.radius * Math.cos(o.phi),
+    t.z + o.radius * sp * Math.cos(o.theta)
+  );
+  camera.lookAt(t);
+}
+
+/* ---------- touch: clay on the model, orbit on the background ---------- */
+function sculptTouchStart(e) {
+  if (!sculpt.active) return false;
+  for (const t of e.changedTouches) {
+    if (!sculpt.pointers.has(t.identifier)) {
+      sculpt.pointers.set(t.identifier, { x: t.clientX, y: t.clientY, lx: t.clientX, ly: t.clientY });
+    }
+  }
+  if (sculpt.pointers.size === 1) {
+    const t = e.changedTouches[0];
+    const n = sculptNdcFromClient(t.clientX, t.clientY);
+    const hit = sculptPickNdc(n.x, n.y);
+    if (hit && sculptBeginStroke(hit)) sculpt.strokeId = t.identifier;
+    else sculpt.orbiting = t.identifier;
+  } else if (sculpt.pointers.size === 2) {
+    if (sculpt.stroke) { sculptEndStroke(); sculpt.strokeId = null; }
+    sculpt.orbiting = null;
+    const pts = [...sculpt.pointers.values()];
+    sculpt.pinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    sculpt.pinching = true;
+  }
+  return true;
+}
+function sculptTouchMove(e) {
+  if (!sculpt.active) return false;
+  for (const t of e.changedTouches) {
+    const rec = sculpt.pointers.get(t.identifier);
+    if (rec) { rec.x = t.clientX; rec.y = t.clientY; }
+  }
+  if (sculpt.pinching && sculpt.pointers.size >= 2) {
+    const pts = [...sculpt.pointers.values()];
+    const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    if (d > 12 && sculpt.pinchDist > 12) {
+      sculpt.orbit.radius = Math.max(2.2, Math.min(26, sculpt.orbit.radius * sculpt.pinchDist / d));
+    }
+    sculpt.pinchDist = d;
+  } else if (sculpt.stroke && sculpt.strokeId != null) {
+    const rec = sculpt.pointers.get(sculpt.strokeId);
+    if (rec) { const n = sculptNdcFromClient(rec.x, rec.y); sculptStrokeTo(n.x, n.y); }
+  } else if (sculpt.orbiting != null) {
+    const rec = sculpt.pointers.get(sculpt.orbiting);
+    if (rec) {
+      sculptOrbitBy(rec.x - rec.lx, rec.y - rec.ly);
+      rec.lx = rec.x; rec.ly = rec.y;
+    }
+  }
+  return true;
+}
+function sculptTouchEnd(e) {
+  if (!sculpt.active) return false;
+  for (const t of e.changedTouches) sculpt.pointers.delete(t.identifier);
+  if (sculpt.stroke && (sculpt.strokeId == null || !sculpt.pointers.has(sculpt.strokeId))) {
+    sculptEndStroke(); sculpt.strokeId = null;
+  }
+  if (sculpt.pinching && sculpt.pointers.size < 2) {
+    sculpt.pinching = false;
+    const ent = [...sculpt.pointers.entries()][0];
+    if (ent) { sculpt.orbiting = ent[0]; ent[1].lx = ent[1].x; ent[1].ly = ent[1].y; }
+    else sculpt.orbiting = null;
+  }
+  if (sculpt.orbiting != null && !sculpt.pointers.has(sculpt.orbiting)) sculpt.orbiting = null;
+  return true;
+}
+/* ---------- mouse (desktop + headless tests) ---------- */
+function sculptMouseDown(e) {
+  const n = sculptNdcFromClient(e.clientX, e.clientY);
+  const hit = sculptPickNdc(n.x, n.y);
+  sculpt.mouseDown = true;
+  if (hit && sculptBeginStroke(hit)) sculpt.mouseRole = 'stroke';
+  else { sculpt.mouseRole = 'orbit'; sculpt.orbitLast = { x: e.clientX, y: e.clientY }; }
+}
+function sculptMouseMove(e) {
+  if (!sculpt.mouseDown) return;
+  if (sculpt.mouseRole === 'stroke') {
+    const n = sculptNdcFromClient(e.clientX, e.clientY);
+    sculptStrokeTo(n.x, n.y);
+  } else if (sculpt.orbitLast) {
+    sculptOrbitBy(e.clientX - sculpt.orbitLast.x, e.clientY - sculpt.orbitLast.y);
+    sculpt.orbitLast = { x: e.clientX, y: e.clientY };
+  }
+}
+function sculptMouseUp() {
+  if (sculpt.stroke) sculptEndStroke();
+  sculpt.mouseDown = false; sculpt.mouseRole = null; sculpt.orbitLast = null;
+}
+
+/* ---------- HUD ---------- */
+function sculptSetHud(show) {
+  if (sculptHud) sculptHud.style.display = show ? '' : 'none';
+  if (workshopPanel) workshopPanel.style.display = show ? 'none' : (ws.open ? '' : 'none');
+}
+function sculptRenderUI() {
+  const p = wsFind(sculpt.pieceId);
+  if (scNameEl) scNameEl.textContent = p ? `${p.type} — sculpt` : 'sculpt';
+  if (scBrushesEl) scBrushesEl.querySelectorAll('button').forEach((b) =>
+    b.classList.toggle('sel', b.dataset.brush === sculpt.brush));
+  if (scDetailEl) scDetailEl.querySelectorAll('button').forEach((b) =>
+    b.classList.toggle('sel', b.dataset.detail === sculpt.detail));
+  if (scSymEl) scSymEl.classList.toggle('on', sculpt.sym);
+  if (scInvertEl) scInvertEl.classList.toggle('on', sculpt.invert);
+  sculptRenderUndo();
+}
+function sculptRenderUndo() {
+  if (scUndoEl) scUndoEl.classList.toggle('off', !sculpt.undo.length);
+}
+/* Test seam: per-side displacement stats vs the detail baseline. */
+function sculptDispStats() {
+  if (!sculpt.active || !sculpt.mesh || !sculpt.base) return null;
+  const arr = sculpt.mesh.geometry.attributes.position.array;
+  const base = sculpt.base;
+  if (arr.length !== base.length) return null;
+  let moved = 0, leftMoved = 0, rightMoved = 0;
+  for (let i = 0; i < arr.length; i += 3) {
+    const dx = arr[i] - base[i], dy = arr[i + 1] - base[i + 1], dz = arr[i + 2] - base[i + 2];
+    if (dx * dx + dy * dy + dz * dz > 1e-10) {
+      moved++;
+      if (base[i] < -0.05) leftMoved++;
+      else if (base[i] > 0.05) rightMoved++;
+    }
+  }
+  return { moved, leftMoved, rightMoved };
+}
+/* Test seam: drag a stroke through NDC space on the real stroke path. */
+function sculptChecksum() {
+  if (!sculpt.mesh) return 'none';
+  const arr = sculpt.mesh.geometry.attributes.position.array;
+  let s = 0;
+  for (let i = 0; i < arr.length; i += 7) s += arr[i];
+  return s.toFixed(3);
+}
+function sculptNdcStroke(x1, y1, x2, y2, steps) {
+  if (!sculpt.active) return { ok: false, why: 'inactive' };
+  const hit = sculptPickNdc(x1, y1);
+  if (!hit) return { ok: false, why: 'miss' };
+  const before = sculptChecksum();
+  sculptBeginStroke(hit);
+  const n = Math.max(1, Math.min(40, steps | 0 || 10));
+  for (let k = 1; k <= n; k++) {
+    const t = k / n;
+    sculptStrokeTo(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+  }
+  sculptEndStroke();
+  return { ok: true, moved: sculptChecksum() !== before };
+}
+
+if (wsSculptEl) wsSculptEl.addEventListener('click', () => { sculptEnter(); wsSculptEl.blur(); });
+if (scBrushesEl) scBrushesEl.querySelectorAll('button').forEach((b) => {
+  b.addEventListener('click', () => { sculptSetBrush(b.dataset.brush); b.blur(); });
+});
+if (scDetailEl) scDetailEl.querySelectorAll('button').forEach((b) => {
+  b.addEventListener('click', () => { sculptSetDetail(b.dataset.detail); b.blur(); });
+});
+if (scSizeEl) scSizeEl.addEventListener('input', () => { sculpt.size = Math.max(0.08, (+scSizeEl.value || 55) / 100); });
+if (scIntEl) scIntEl.addEventListener('input', () => { sculpt.intensity = Math.max(0.05, Math.min(1, (+scIntEl.value || 50) / 100)); });
+if (scSymEl) scSymEl.addEventListener('click', () => { sculptSetSym(); scSymEl.blur(); });
+if (scInvertEl) scInvertEl.addEventListener('click', () => { sculptSetInvert(); scInvertEl.blur(); });
+if (scUndoEl) scUndoEl.addEventListener('click', () => { sculptUndo(); scUndoEl.blur(); });
+if (scDoneEl) scDoneEl.addEventListener('click', () => { sculptExit(); scDoneEl.blur(); });
 if (workshopBtn) workshopBtn.addEventListener('click', () => { setWorkshopPanel(!ws.open); workshopBtn.blur(); });
 if (workshopCloseBtn) workshopCloseBtn.addEventListener('click', () => setWorkshopPanel(false));
 if (wsAddEl) {
@@ -7808,7 +8549,9 @@ function stageRebuild() {
     for (const spec of specs) {
       const s = wsSanitizeSpec(spec);
       if (!s) continue;
-      const mesh = modelPieceMesh(s.t, s.c);
+      // build 68: sculpted pieces keep their clay on stage
+      let mesh = (s.v && s.detail) ? sculptMeshFromSpec(s) : null;
+      if (!mesh) mesh = modelPieceMesh(s.t, s.c);
       mesh.position.set(s.p[0], s.p[1], s.p[2]);
       mesh.rotation.y = s.ry;
       mesh.scale.setScalar(s.s);
@@ -10090,7 +10833,7 @@ nameInput.addEventListener('keydown', (e) => {
 /* ---------------- input: mouse drag-look (no pointer lock) ---------------- */
 
 let dragging = false, lastX = 0, lastY = 0;
-canvas.addEventListener('mousedown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener('mousedown', (e) => { if (sculpt.active) return; dragging = true; lastX = e.clientX; lastY = e.clientY; });
 window.addEventListener('mousemove', (e) => {
   if (!dragging) return;
   yaw -= (e.clientX - lastX) * 0.0032;
@@ -10108,6 +10851,7 @@ const look = { id: null, lx: 0, ly: 0 };              // look drag
    tap, routed to the journey's ray caller. Drags keep steering. */
 let tapCand = null;
 canvas.addEventListener('touchstart', (e) => {
+  if (sculptTouchStart(e)) { e.preventDefault(); return; } // build 68: sculpt mode owns the canvas
   for (const t of e.changedTouches) {
     if (!tapCand) tapCand = { id: t.identifier, x: t.clientX, y: t.clientY, at: performance.now() };
     if (t.clientX < window.innerWidth / 2 && joy.id === null) {
@@ -10123,6 +10867,7 @@ canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
 }, { passive: false });
 canvas.addEventListener('touchmove', (e) => {
+  if (sculptTouchMove(e)) { e.preventDefault(); return; } // build 68: sculpt strokes / orbit / pinch
   for (const t of e.changedTouches) {
     if (tapCand && t.identifier === tapCand.id &&
         Math.hypot(t.clientX - tapCand.x, t.clientY - tapCand.y) > 16) tapCand = null; // it's a drag, not a tap
@@ -10140,6 +10885,7 @@ canvas.addEventListener('touchmove', (e) => {
   e.preventDefault();
 }, { passive: false });
 function endTouch(e) {
+  if (sculptTouchEnd(e)) return; // build 68: sculpt mode owns the canvas
   for (const t of e.changedTouches) {
     if (tapCand && e.type === 'touchend' && t.identifier === tapCand.id) {
       const quick = performance.now() - tapCand.at < 350;
@@ -10158,9 +10904,15 @@ canvas.addEventListener('touchcancel', endTouch);
 // desktop: same tap-a-ray via the mouse
 let mouseTap = null;
 canvas.addEventListener('pointerdown', (e) => {
-  if (e.pointerType === 'mouse') mouseTap = { x: e.clientX, y: e.clientY, at: performance.now() };
+  if (e.pointerType !== 'mouse') return;
+  if (sculpt.active) { sculptMouseDown(e); return; } // build 68: sculpt mode owns the mouse
+  mouseTap = { x: e.clientX, y: e.clientY, at: performance.now() };
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerType === 'mouse' && sculpt.active) sculptMouseMove(e); // build 68
 });
 canvas.addEventListener('pointerup', (e) => {
+  if (e.pointerType === 'mouse' && sculpt.active) { sculptMouseUp(); return; } // build 68
   if (e.pointerType === 'mouse' && mouseTap) {
     const quick = performance.now() - mouseTap.at < 400;
     const still = Math.hypot(e.clientX - mouseTap.x, e.clientY - mouseTap.y) < 10;
@@ -10234,6 +10986,18 @@ function goTo(key) {
     }
     if (key === JOURNEY_ROOM_KEY) journeyOnEnter();
     if (key === WORKSHOP_ROOM_KEY) setWorkshopPanel(true); // the bench opens itself
+    // Build 69: model room late-joiner — clear the shelf and ask the room
+    // for everyone's models. Peers already here answer with modelShare.
+    if (key === WORKSHOP_ROOM_KEY) {
+      wsShelf.clear();
+      wsShelfRender();
+      setTimeout(() => {
+        if (active && active.key === WORKSHOP_ROOM_KEY && net.enabled && net.sendModelReq) {
+          try { net.sendModelReq({}); } catch (e) {}
+        }
+      }, 2000);
+    }
+    if (key !== WORKSHOP_ROOM_KEY && sculpt.active) sculptExit(); // build 68: don't sculpt the void
     // Community wall (build 18): late joiner asks the room for the current
     // canvas. Delayed so the data channel has a moment to connect; peers
     // with ink answer once per reqId (see handleWallSyncReq).
@@ -10432,9 +11196,10 @@ function handleWisp(id, d) {
     peerLayer.add(pv.trailObj.group);
     addSystemLine(`${nm} drifted in`);
     updatePeerCount();
+    if (typeof wsShelfRender === 'function') wsShelfRender(); // build 69: room shelf roster
   } else {
     pv.target.set(d.p[0], d.p[1], d.p[2]);
-    if (pv.name !== nm) { pv.name = nm; retagPeer(pv, nm); }
+    if (pv.name !== nm) { pv.name = nm; retagPeer(pv, nm); if (typeof wsShelfRender === 'function') wsShelfRender(); }
     const s = d.s || null, h = d.h || null;
     if (pv.skin !== s) { pv.skin = s; applyPeerSkin(pv, s); }
     if (pv.hatId !== h) { pv.hatId = h; applyPeerHat(pv, h); }
@@ -10457,6 +11222,13 @@ function handlePeerLeave(id) {
   peerPositions.delete(id);
   peerHeadings.delete(id);
   updatePeerCount();
+  // Build 69: the leaver's models leave the room shelf with them.
+  try {
+    const prefix = String(id) + '::';
+    for (const k of [...wsShelf.keys()]) if (k.startsWith(prefix)) wsShelf.delete(k);
+    for (const k of [...wsPendingModels.keys()]) if (k.startsWith(prefix)) wsPendingModels.delete(k);
+  } catch (e) {}
+  if (typeof wsShelfRender === 'function') wsShelfRender();
 }
 
 // Wire the net callbacks once; rooms are (re)joined on start + portal hops.
@@ -10513,6 +11285,11 @@ net.onStageSyncCb = handleStageSync;
 net.onStageReqCb = handleStageReq;
 net.onFohSyncCb = handleFohSync;
 net.onFohReqCb = handleFohReq;
+// Model room shared shelf (build 69): everyone's saved models, one room.
+net.onModelShareCb = handleModelShare;
+net.onModelDelCb = handleModelDel;
+net.onModelReqCb = handleModelReq;
+net.onModelChunkCb = handleModelChunk;
 /* Build 43: the relay is live — start holder election hellos and ask the
    holder for the line if we're empty (the old blind timer fired too early). */
 net.onRelayUpCb = () => { jukeStartHellos(); jukeMaybeSync(); };
@@ -10773,11 +11550,15 @@ function updatePlayer(dt) {
   const b = 1 + Math.sin(clock.elapsedTime * 2.1) * 0.07;
   wispCore.scale.set(b, b, b);
 
-  // Third-person follow camera with soft lag.
-  _camWant.copy(wisp.position).addScaledVector(_fwd, -7).add(new THREE.Vector3(0, 2.2, 0));
-  camera.position.lerp(_camWant, 1 - Math.exp(-8 * dt));
-  _lookAt.copy(wisp.position).addScaledVector(_fwd, 8);
-  camera.lookAt(_lookAt);
+  if (sculpt.active) {
+    sculptCameraUpdate(); // build 68: orbit the clay — the wisp waits
+  } else {
+    // Third-person follow camera with soft lag.
+    _camWant.copy(wisp.position).addScaledVector(_fwd, -7).add(new THREE.Vector3(0, 2.2, 0));
+    camera.position.lerp(_camWant, 1 - Math.exp(-8 * dt));
+    _lookAt.copy(wisp.position).addScaledVector(_fwd, 8);
+    camera.lookAt(_lookAt);
+  }
 
   pushTrail(dt);
   myFwd.copy(_fwd); // broadcast to the flock in loop()
@@ -11133,6 +11914,30 @@ window.__limbo = {
   workshopModels: () => Object.keys(wsLoadModels()),
   workshopLoad: (n) => wsLoadModel(n),
   workshopState: () => ({ pieces: ws.pieces.length, sel: ws.sel, open: ws.open }),
+  workshopDelete: (n) => wsDeleteModel(n),
+  // build 69: shared shelf seams
+  shelfState: () => [...wsShelf.values()].map((e) => ({ name: e.name, by: e.by, pieces: e.specs.length })),
+  shelfRoster: () => wsRosterNames(),
+  shelfLoadPeer: (name) => { const e = [...wsShelf.values()].find((x) => x.name === name); return e ? wsShelfLoadEntry(e) : false; },
+  shelfPayloadLen: (name) => { const m = wsLoadModels()[name]; return m ? JSON.stringify(m).length : -1; },
+  shelfPending: () => wsPendingModels.size,
+  netRelay: () => { try { return !!net.relayMode; } catch (e) { return false; } },
+  // build 68: sculpt mode seams
+  sculptEnter: () => sculptEnter(),
+  sculptExit: () => sculptExit(),
+  sculptBrush: (b) => sculptSetBrush(b),
+  sculptDetail: (d) => sculptSetDetail(d),
+  sculptSym: (v) => sculptSetSym(v),
+  sculptInvert: (v) => sculptSetInvert(v),
+  sculptStroke: (x1, y1, x2, y2, steps) => sculptNdcStroke(x1, y1, x2, y2, steps),
+  sculptUndoStroke: () => sculptUndo(),
+  sculptDispStats: () => sculptDispStats(),
+  sculptState: () => ({
+    active: sculpt.active, brush: sculpt.brush, detail: sculpt.detail,
+    sym: sculpt.sym, invert: sculpt.invert,
+    verts: sculpt.mesh ? sculpt.mesh.geometry.attributes.position.count : 0,
+    strokes: sculpt.strokeCount, undoDepth: sculpt.undo.length,
+  }),
   stagePlace: (name) => stagePlace(name),
   stageClear: () => stageClear(),
   stageState: () => ({ items: stage.items.length, sel: stage.sel }),
