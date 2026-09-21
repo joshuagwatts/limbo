@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=42';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=43';
 import { CouchNet } from './couch.js?v=41';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
@@ -214,7 +214,43 @@ let selectedServer = 1;
    server, same list on every phone. The server channel follows the pick:
    changing servers leaves the old party (queue resets) and asks the new
    server for its queue + now-playing. */
+/* Build 43: the queue is server-held, not individual-held. One peer per
+   Nexus server is the authoritative holder of the line — elected by lowest
+   election key, with the parked relay peer (?park=1, the one that never
+   sleeps) preferred. The holder answers state requests and broadcasts the
+   canonical line; if it leaves, the next peer takes over seamlessly. */
+const IS_PARK_HOLDER = (() => {
+  try { return new URLSearchParams(location.search).get('park') === '1'; }
+  catch (e) { return false; }
+})();
+/* Build 43: the line caps at 50 tracks — new adds past that are refused
+   with a kind note rather than silently dropping someone's pick. */
+const JUKE_MAX_QUEUE = 50;
 let jukeServerN = 0;
+/* Build 43: catch-up that actually catches up. The old blind 2.5s timer
+   fired before the drift tap (relay not up yet), so the request died
+   unheard and late joiners sat with an empty line. Now we ask only when
+   the relay is live, and retry while we're still empty. */
+let jukeSyncGen = 0; // bumps per server change; stale retry timers no-op
+let jukeLastStateReqAt = 0;
+function jukeMaybeSync() {
+  try {
+    if (!net || !net.relayMode) return; // relay first — earlier asks die unheard
+    if (juke.now || juke.queue.length) return; // already holding the line
+    const now = Date.now();
+    if (now - jukeLastStateReqAt < 8000) return; // one ask per 8s, no storms
+    jukeLastStateReqAt = now;
+    if (net.sendJukeStateReq) {
+      net.sendJukeStateReq({ reqId: 'srv-' + now.toString(36) });
+    }
+  } catch (e) {}
+}
+function jukeScheduleSync() {
+  const gen = ++jukeSyncGen;
+  for (const ms of [1500, 6000, 15000, 30000]) {
+    setTimeout(() => { if (gen === jukeSyncGen) jukeMaybeSync(); }, ms);
+  }
+}
 function syncJukeServer() {
   try {
     if (net && net.setJukeServer) net.setJukeServer(nexusServerKey(selectedServer));
@@ -222,16 +258,241 @@ function syncJukeServer() {
   if (jukeServerN !== selectedServer) {
     jukeServerN = selectedServer;
     jukeLeaveServer(); // fresh party per server — no stale queue
-    // Ask the new server's party for its queue; the channel is already
-    // subscribed, so live messages will also just arrive.
-    setTimeout(() => {
-      try {
-        if (net && net.sendJukeStateReq && !juke.now && !juke.queue.length) {
-          net.sendJukeStateReq({ reqId: 'srv-' + Date.now().toString(36) });
-        }
-      } catch (e) {}
-    }, 2500);
+    jukeResetElection(); // new server, new holder election
+    jukeScheduleSync(); // ask the holder for the line; retries while empty
   }
+}
+
+/* ---------- build 43: server-held queue — holder election ----------
+   The line belongs to the SERVER, not to whoever queued first. Every peer
+   on the server channel says hello; the roster elects the holder by lowest
+   election key (the parked peer first — it never sleeps — then lowest
+   client id). The holder answers state requests and broadcasts the
+   canonical line; everyone else drifts with it. If the holder leaves, its
+   hellos expire and the next peer steps up — the line survives. */
+const JUKE_HELLO_MS = 15000;
+const JUKE_HELLO_TTL_MS = 40000;
+const JUKE_CLAIM_MS = 10000;
+const JUKE_SYNC_MS = 15000;
+const jukeRoster = new Map(); // cid -> {name, park, key, lastSeen}
+let jukeIAmHolder = false;
+let jukeHolderCid = null;
+let jukeHolderKey = null;
+let jukeHolderName = '';
+let jukeSyncRev = 0; // my outgoing snapshot revision (holder only)
+let jukeSyncRevSeen = -1; // newest snapshot revision applied
+let jukeHelloTimer = null;
+let jukeClaimTimer = null;
+let jukeSyncTimer = null;
+let jukeLastClearAt = 0; // Date.now() of the last clear we applied — stale snapshots can't resurrect
+
+function jukeElectionKey(cid, park) {
+  return (park ? '0:' : '1:') + String(cid || '');
+}
+function jukeMyElectionKey() {
+  let cid = '';
+  try { cid = (net && net.clientId) || ''; } catch (e) {}
+  return jukeElectionKey(cid, IS_PARK_HOLDER);
+}
+/* Build 43: every jukebox payload carries its server key (stamped in
+   net.js). Drop anything from another server — a pre-relay world-room
+   broadcast can never contaminate a different server's line. Payloads
+   from older builds lack srv and are accepted (mixed rollout). */
+function jukeSrvOk(d) {
+  try {
+    if (!d || d.srv == null) return true;
+    return String(d.srv) === nexusServerKey(selectedServer);
+  } catch (e) { return true; }
+}
+function jukeSweepRoster() {
+  const now = Date.now();
+  for (const [cid, rec] of jukeRoster) {
+    if (now - rec.lastSeen > JUKE_HELLO_TTL_MS) jukeRoster.delete(cid);
+  }
+}
+function jukeRecomputeHolder() {
+  jukeSweepRoster();
+  const myKey = jukeMyElectionKey();
+  let lowest = myKey;
+  let lowestCid = null;
+  try {
+    for (const [cid, rec] of jukeRoster) {
+      if (rec.key < lowest) { lowest = rec.key; lowestCid = cid; }
+    }
+  } catch (e) {}
+  const prevCid = jukeHolderCid;
+  if (lowestCid === null) {
+    if (!jukeIAmHolder) jukeBecomeHolder();
+    else {
+      try { jukeHolderCid = (net && net.clientId) || null; } catch (e) {}
+      jukeHolderKey = myKey;
+      jukeHolderName = (typeof myName === 'string' && myName) || 'drifter';
+    }
+  } else {
+    if (jukeIAmHolder) jukeStepDown();
+    jukeHolderCid = lowestCid;
+    jukeHolderKey = lowest;
+    const rec = jukeRoster.get(lowestCid);
+    jukeHolderName = (rec && rec.name) || 'a drifter';
+  }
+  if (String(prevCid || '') !== String(jukeHolderCid || '')) jukeSyncRevSeen = -1; // new holder, fresh revisions
+  renderJukeHolder();
+}
+function jukeBecomeHolder() {
+  jukeIAmHolder = true;
+  try { jukeHolderCid = (net && net.clientId) || null; } catch (e) {}
+  jukeHolderKey = jukeMyElectionKey();
+  jukeHolderName = (typeof myName === 'string' && myName) || 'drifter';
+  jukeSyncRev = 0;
+  jukeBroadcastClaim();
+  jukeBroadcastSync();
+  if (jukeClaimTimer) clearInterval(jukeClaimTimer);
+  if (jukeSyncTimer) clearInterval(jukeSyncTimer);
+  jukeClaimTimer = setInterval(() => { try { jukeBroadcastClaim(); } catch (e) {} }, JUKE_CLAIM_MS);
+  jukeSyncTimer = setInterval(() => { try { jukeBroadcastSync(); } catch (e) {} }, JUKE_SYNC_MS);
+}
+function jukeStepDown() {
+  jukeIAmHolder = false;
+  if (jukeClaimTimer) { clearInterval(jukeClaimTimer); jukeClaimTimer = null; }
+  if (jukeSyncTimer) { clearInterval(jukeSyncTimer); jukeSyncTimer = null; }
+}
+function jukeResetElection() {
+  jukeStepDown();
+  jukeRoster.clear();
+  jukeHolderCid = null;
+  jukeHolderKey = null;
+  jukeHolderName = '';
+  jukeSyncRev = 0;
+  jukeSyncRevSeen = -1;
+  renderJukeHolder();
+}
+function jukeBroadcastClaim() {
+  try {
+    if (net && net.sendJukeClaim) {
+      net.sendJukeClaim({ name: (typeof myName === 'string' && myName) || 'drifter', park: IS_PARK_HOLDER });
+    }
+  } catch (e) {}
+}
+/* The canonical line, from the holder. Periodic + on every mutation, so
+   any drift between phones heals within seconds. */
+function jukeBroadcastSync() {
+  try {
+    if (!net || !net.sendJukeSync) return;
+    jukeSyncRev++;
+    net.sendJukeSync({
+      rev: jukeSyncRev,
+      at: Date.now(), // snapshot build time — receivers drop anything older than their last clear
+      park: IS_PARK_HOLDER,
+      name: (typeof myName === 'string' && myName) || 'drifter',
+      queue: juke.queue.slice(0, JUKE_MAX_QUEUE),
+      now: juke.now,
+    });
+  } catch (e) {}
+}
+function jukeNotePeer(cid, d) {
+  const id = String(cid || '');
+  if (!id) return;
+  const park = !!(d && d.park);
+  jukeRoster.set(id, {
+    name: (d && d.name) || 'a drifter',
+    park,
+    key: jukeElectionKey(id, park),
+    lastSeen: Date.now(),
+  });
+  jukeRecomputeHolder();
+}
+/* Say hello on the server channel; starts once the relay is up. */
+function jukeHelloTick() {
+  try {
+    if (net && net.relayMode && net.sendJukeHello) {
+      net.sendJukeHello({ name: (typeof myName === 'string' && myName) || 'drifter', park: IS_PARK_HOLDER });
+    }
+  } catch (e) {}
+  jukeRecomputeHolder();
+}
+function jukeStartHellos() {
+  if (jukeHelloTimer) return;
+  jukeHelloTick();
+  jukeHelloTimer = setInterval(() => { try { jukeHelloTick(); } catch (e) {} }, JUKE_HELLO_MS);
+}
+let jukeHolderEl = null;
+function renderJukeHolder() {
+  try {
+    if (!jukeHolderEl) jukeHolderEl = document.getElementById('juke-holder');
+    if (!jukeHolderEl) return;
+    jukeHolderEl.textContent =
+      jukeIAmHolder ? '· holding the line'
+      : jukeHolderName ? '· line held by ' + jukeHolderName
+      : '';
+  } catch (e) {}
+}
+function handleJukeHello(d, peerId) {
+  if (!jukeSrvOk(d)) return;
+  jukeNotePeer(peerId, d);
+}
+function handleJukeClaim(d, peerId) {
+  if (!jukeSrvOk(d)) return;
+  jukeNotePeer(peerId, d); // a claim is a hello with authority
+}
+/* Canonical snapshot from the holder. A sync doubles as a claim — the
+   sender is alive and asserting the line. */
+function handleJukeSync(d, peerId) {
+  if (!jukeSrvOk(d) || !d || typeof d.rev !== 'number') return;
+  const cid = String(peerId || '');
+  if (!cid) return;
+  const park = !!d.park;
+  jukeRoster.set(cid, {
+    name: d.name || 'a drifter', park,
+    key: jukeElectionKey(cid, park), lastSeen: Date.now(),
+  });
+  jukeRecomputeHolder();
+  if (!jukeHolderCid || cid !== String(jukeHolderCid)) return; // not the elected holder — stale chatter
+  if (d.rev <= jukeSyncRevSeen) return; // stale snapshot
+  if (d.at && jukeLastClearAt && d.at < jukeLastClearAt - 5000) return; // built before our clear — can't resurrect
+  jukeSyncRevSeen = d.rev;
+  const incoming = Array.isArray(d.queue) ? d.queue.filter(jukeValidAdd) : [];
+  const incomingIds = new Set(incoming.map((t) => t.id));
+  /* Keep my own just-added tracks the snapshot hasn't seen yet — my add
+     broadcast is still in flight and will merge into the canonical line
+     on the next round (dedupe by id keeps it single). */
+  const mine = juke.queue.filter((t) => t.addedBy === myName && !incomingIds.has(t.id));
+  juke.queue = incoming.concat(mine).slice(0, JUKE_MAX_QUEUE);
+  jukeSortQueue();
+  const dn = d.now;
+  if (dn && jukeValidPlay(dn) && !dn.stopped) {
+    if (!juke.now || juke.now.id !== dn.id) jukeAdoptPlay(dn); // holder's line rules
+  }
+  /* A null now in a snapshot never stops local playback — real stops and
+     clears arrive as their own broadcasts (jukePlay stopped / jukeClear),
+     so a snapshot racing a just-advanced track can't mute it. */
+  renderJuke();
+}
+/* Build 43: anyone in the server can clear the line. The clear lands
+   locally at once, and the holder rebroadcasts the empty canonical
+   state so every phone converges on empty. */
+function jukeClearQueue() {
+  jukeStopPlayback();
+  juke.now = null;
+  juke.queue = [];
+  jukeLastClearAt = Date.now();
+  renderJuke();
+  jukeHint('the line is clear — drift on');
+  try {
+    if (net && net.enabled && net.sendJukeClear) {
+      net.sendJukeClear({ by: (typeof myName === 'string' && myName) || 'drifter' });
+    }
+  } catch (e) {}
+  if (jukeIAmHolder) jukeBroadcastSync();
+}
+function handleJukeClear(d, peerId) {
+  if (!jukeSrvOk(d)) return;
+  jukeStopPlayback();
+  juke.now = null;
+  juke.queue = [];
+  jukeLastClearAt = Date.now();
+  renderJuke();
+  jukeHint('the line was cleared by ' + ((d && d.by) || 'a drifter'));
+  if (jukeIAmHolder) jukeBroadcastSync();
 }
 function pickServer(n) {
   n = Math.max(1, Math.min(NEXUS_SERVERS, +n || 1));
@@ -3938,6 +4199,10 @@ async function jukeAddTrack(rawUrl, titleHint) {
     videoId: det.videoId || null, title: resolvedTitle || jukeFallbackTitle(det.provider),
     addedBy: myName, addedAt: Date.now(),
   };
+  if (juke.queue.length >= JUKE_MAX_QUEUE) {
+    jukeHint('the line is full at ' + JUKE_MAX_QUEUE + ' — let a track drift off first');
+    return null;
+  }
   juke.queue.push(t);
   jukeSortQueue(); // the adder sorts too — same list as everyone else
   if (net.enabled && net.sendJukeAdd) {
@@ -3990,6 +4255,10 @@ async function jukeAddPlaylist(url, det, titleHint) {
       group: gid, groupTitle, groupCount: tracks.length,
     };
     if (!jukeValidAdd(t)) continue;
+    if (juke.queue.length >= JUKE_MAX_QUEUE) {
+      jukeHint('the line is full at ' + JUKE_MAX_QUEUE + ' — queuing what fits');
+      break;
+    }
     items.push(t);
     juke.queue.push(t);
     jukeSortQueue();
@@ -4028,12 +4297,16 @@ function jukeSortQueue() {
 }
 
 function handleJukeAdd(d, peerId) {
+  if (!jukeSrvOk(d)) return;
   if (!jukeValidAdd(d)) return;
+  if (juke.now && juke.now.id === d.id) return; // the play beat the add here — already spinning
   if (juke.queue.some((t) => t.id === d.id)) return; // dedupe
+  if (juke.queue.length >= JUKE_MAX_QUEUE) return; // line is full — the adder was told
   juke.queue.push(d);
   jukeSortQueue(); // FIFO by queue time, identical on every phone
   renderJuke();
   jukeEnrichTitle(d); // everyone resolves the real title locally
+  if (jukeIAmHolder) jukeBroadcastSync(); // holder confirms the canonical line
 }
 
 /* Remove your own queued track. If it's the one playing, that counts as a
@@ -4056,6 +4329,7 @@ function jukeRemoveTrack(id) {
 }
 
 function handleJukeRemove(d, peerId) {
+  if (!jukeSrvOk(d)) return;
   if (!d || typeof d.id !== 'string') return;
   const i = juke.queue.findIndex((t) => t.id === d.id);
   if (i !== -1) juke.queue.splice(i, 1);
@@ -4066,6 +4340,7 @@ function handleJukeRemove(d, peerId) {
     juke.now = null;
     renderJuke();
   } else renderJuke();
+  if (jukeIAmHolder) jukeBroadcastSync();
 }
 
 /* ---------- instant skip (build 27) ----------
@@ -4084,6 +4359,7 @@ function jukeSkipNow() {
 }
 
 function handleJukeSkip(d, peerId) {
+  if (!jukeSrvOk(d)) return;
   if (!d || typeof d.id !== 'string') return;
   if (!juke.now || juke.now.id !== d.id) return; // stale skip — already moved on
   jukeAdvance();
@@ -4365,6 +4641,7 @@ function jukeAdvance() {
 }
 
 function handleJukePlay(d, peerId) {
+  if (!jukeSrvOk(d)) return;
   if (!jukeValidPlay(d)) return;
   if (d.stopped) {
     jukeStopPlayback();
@@ -4372,12 +4649,14 @@ function handleJukePlay(d, peerId) {
     juke.nowStartedAt = 0;
     juke.lastPlaySeenAt = Math.max(juke.lastPlaySeenAt, d.startedAt || Date.now());
     renderJuke();
+    if (jukeIAmHolder) jukeBroadcastSync();
     return;
   }
   const inContention = Date.now() - juke.adoptedAt < JUKE_CONTENTION_MS;
   if (juke.now && d.id === juke.now.id && !inContention) return; // duplicate
   if (inContention && juke.now && d.startedAt >= juke.nowStartedAt) return; // we hold the earlier claim
   jukeAdoptPlay(d);
+  if (jukeIAmHolder) jukeBroadcastSync();
 }
 
 function jukeAdoptPlay(d) {
@@ -5340,6 +5619,10 @@ function jukeStopPlayback() {
 /* ---------- late-joiner state sync ---------- */
 
 function handleJukeStateReq(d, peerId) {
+  if (!jukeSrvOk(d)) return;
+  /* Build 43: one canonical answer — the holder's. (Pre-relay, before any
+     election can run, fall back to anyone-answers like before.) */
+  if (!jukeIAmHolder && net.relayMode) return;
   if (!d || typeof d.reqId !== 'string' || !d.reqId) return;
   if (juke.answeredReq.has(d.reqId)) return;
   if (!juke.now && juke.queue.length === 0) return; // nothing to share
@@ -5350,15 +5633,17 @@ function handleJukeStateReq(d, peerId) {
   }
   if (!net.enabled || !net.sendJukeState) return;
   try {
-    net.sendJukeState({ reqId: d.reqId, now: juke.now, queue: juke.queue.slice(0, 20) });
+    net.sendJukeState({ reqId: d.reqId, at: Date.now(), now: juke.now, queue: juke.queue.slice(0, JUKE_MAX_QUEUE) });
   } catch (e) { /* best effort */ }
 }
 
 function handleJukeState(d, peerId) {
+  if (!jukeSrvOk(d)) return;
   if (!d || typeof d.reqId !== 'string') return;
   if (juke.now || juke.queue.length) return; // we already have state; first answer wins
+  if (d.at && jukeLastClearAt && d.at < jukeLastClearAt - 5000) return; // built before our clear
   const q = Array.isArray(d.queue) ? d.queue.filter(jukeValidAdd) : [];
-  juke.queue = q.slice(0, 20);
+  juke.queue = q.slice(0, JUKE_MAX_QUEUE);
   if (d.now && jukeValidPlay(d.now) && !d.now.stopped) {
     jukeAdoptPlay(d.now); // offset math puts us in sync mid-track
   } else renderJuke();
@@ -5617,6 +5902,10 @@ if (jukeBtn) {
 }
 const jukeCloseBtn = document.getElementById('juke-close');
 if (jukeCloseBtn) jukeCloseBtn.addEventListener('click', () => setJukePanel(false));
+// Build 43: anyone in the server can clear the line — the holder
+// rebroadcasts the empty canonical state.
+const jukeClearBtn = document.getElementById('juke-clear');
+if (jukeClearBtn) jukeClearBtn.addEventListener('click', () => { jukeClearQueue(); jukeClearBtn.blur(); });
 const jukeAddBtn = document.getElementById('juke-add-btn');
 const jukeAddInput = document.getElementById('juke-add-url');
 if (jukeAddBtn) {
@@ -8691,6 +8980,13 @@ net.onJukePlayCb = handleJukePlay;
 net.onJukeSkipVoteCb = handleJukeSkip; // wire name is legacy; semantics are instant-skip
 net.onJukeStateReqCb = handleJukeStateReq;
 net.onJukeStateCb = handleJukeState;
+net.onJukeHelloCb = handleJukeHello; // build 43: holder election presence
+net.onJukeClaimCb = handleJukeClaim; // build 43: "I hold this server's line"
+net.onJukeSyncCb = handleJukeSync; // build 43: canonical queue snapshot
+net.onJukeClearCb = handleJukeClear; // build 43: anyone may clear the line
+/* Build 43: the relay is live — start holder election hellos and ask the
+   holder for the line if we're empty (the old blind timer fired too early). */
+net.onRelayUpCb = () => { jukeStartHellos(); jukeMaybeSync(); };
 net.onJukeFileReqCb = handleJukeFileReq; // build 27: phone-file P2P
 net.onJukeFileChunkCb = handleJukeFileChunk;
 net.onJukeFileHaveCb = handleJukeFileHave;

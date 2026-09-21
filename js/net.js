@@ -100,7 +100,7 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '42';
+const BUILD = '43';
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
@@ -158,6 +158,10 @@ const ACTION_CBS = {
   jukeFileChunk: 'onJukeFileChunkCb',
   jukeFileHave: 'onJukeFileHaveCb',
   jukeLike: 'onJukeLikeCb', // build 33: P2P likes for the jukebox track
+  jukeHello: 'onJukeHelloCb', // build 43: server-channel presence for holder election
+  jukeClaim: 'onJukeClaimCb', // build 43: "I hold this server's line"
+  jukeSync: 'onJukeSyncCb', // build 43: canonical queue snapshot from the holder
+  jukeClear: 'onJukeClearCb', // build 43: anyone may clear the server's line
   voiceChunk: 'onVoiceChunkCb', // build 40: live room voice over the relay
   voiceTalk: 'onVoiceTalkCb',
 };
@@ -174,6 +178,11 @@ const TARGETED_ACTIONS = ['jukeFileReq', 'jukeFileChunk'];
 const JUKE_SERVER_ACTIONS = new Set([
   'jukeAdd', 'jukeRemove', 'jukePlay', 'jukeSkipVote',
   'jukeStateReq', 'jukeState', 'jukeLike',
+  /* Build 43: the queue is server-held. One peer per server is the
+     authoritative holder — elected, not assumed. Hellos track who's on
+     the server channel, claims announce the holder, syncs carry the
+     canonical line, and anyone can ask for a clear. */
+  'jukeHello', 'jukeClaim', 'jukeSync', 'jukeClear',
 ]);
 
 /* OpenRelay static-auth (no signup): time-limited HMAC-SHA1 credentials. */
@@ -524,6 +533,11 @@ export class LimboNet {
     this.onJukeFileHaveCb = null; // (data, peerId)
     this.onJukeStateReqCb = null; // (data, peerId)
     this.onJukeStateCb = null; // (data, peerId)
+    this.onJukeHelloCb = null; // (data, peerId) — build 43 holder election
+    this.onJukeClaimCb = null; // (data, peerId)
+    this.onJukeSyncCb = null; // (data, peerId)
+    this.onJukeClearCb = null; // (data, peerId)
+    this.onRelayUpCb = null; // () — build 43: relay engaged, safe to sync
     this.onVoiceChunkCb = null; // (data, peerId)
     this.onVoiceTalkCb = null; // (data, peerId)
     // send functions are installed by _joinAll(); null when no rooms
@@ -1034,6 +1048,10 @@ export class LimboNet {
     } catch (e) {
       out = { cid: this.clientId };
     }
+    /* Build 43: stamp every jukebox payload with its server key. Receivers
+       drop payloads from other servers, so a pre-relay world-room broadcast
+       (or any stray) can never contaminate another server's line. */
+    if (this._jukeServerKey) out.srv = this._jukeServerKey;
     if (this.relayMode && this.relayLink) {
       const tag = this._jukeServerTag || this._relayRoomTag;
       if (tag) { this._relayPublishTo(tag, actionName, out, null); return; }
@@ -1484,6 +1502,12 @@ export class LimboNet {
       this._relayLobbyHandler
     );
     this._presenceTickRelay();
+    /* Build 43: the relay is live — safe moment for the jukebox to ask the
+       server's holder for the line (the old blind boot timer fired before
+       the drift tap, so late joiners never caught up). */
+    if (this.onRelayUpCb) {
+      try { this.onRelayUpCb(); } catch (e) {}
+    }
   }
 
   /* Publish one action payload over the relay. Same envelope the data
