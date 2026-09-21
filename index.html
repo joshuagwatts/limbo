@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=48">
+<link rel="stylesheet" href="css/style.css?v=49">
 <script type="importmap">
 {
   "imports": {
@@ -136,6 +136,8 @@ if ('serviceWorker' in navigator) {
   <button id="journey-home-btn" aria-label="return to the nexus">&#8962; nexus</button>
   <button id="journey-jammute" aria-label="mute the jam in the journey" aria-pressed="false">&#127925; jam on</button>
   <canvas id="journey-minimap" width="132" height="132" aria-label="journey minimap"></canvas>
+  <!-- build 49: manta-ray tap feedback -->
+  <div id="journey-toast" aria-hidden="true"></div>
 </div>
 <!-- build 30: iOS Safari can lock audio until a user gesture. This one
      floating pill covers both audio paths (WebAudio jam + jukebox media
@@ -412,6 +414,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=48"></script>
+<script type="module" src="js/game.js?v=49"></script>
 </body>
 </html>

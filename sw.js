@@ -14,7 +14,7 @@
  * successful (ok) responses).
  */
 
-const BUILD = '48';
+const BUILD = '49';
 const CACHE = `limbo-v${BUILD}`;
 
 /* Same version stamps the page uses (?v=40). query strings are part of
