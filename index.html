@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=42">
+<link rel="stylesheet" href="css/style.css?v=43">
 <script type="importmap">
 {
   "imports": {
@@ -63,7 +63,7 @@ if ('serviceWorker' in navigator) {
 <!-- jukebox — synced queue playback, only visible inside the sound room (build 21) -->
 <button id="juke-btn" style="display:none">&#127925; jukebox</button>
 <div id="juke-panel" style="display:none">
-  <div class="juke-head"><span>&#127925; JUKEBOX</span><button id="juke-close" aria-label="close">&#10005;</button></div>
+  <div class="juke-head"><span>&#127925; JUKEBOX</span><span style="display:flex;align-items:center;gap:2px"><span id="juke-holder" class="juke-holder"></span><button id="juke-clear" aria-label="clear the queue">clear</button><button id="juke-close" aria-label="close">&#10005;</button></span></div>
   <div class="juke-now">
     <div id="juke-now-title" class="juke-now-title">nothing playing</div>
     <div class="juke-now-sub"><span id="juke-now-provider"></span><span id="juke-now-by"></span></div>
@@ -409,6 +409,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=42"></script>
+<script type="module" src="js/game.js?v=43"></script>
 </body>
 </html>
