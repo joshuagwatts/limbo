@@ -215,6 +215,19 @@ if ('serviceWorker' in navigator) {
       <label>echo <input id="jam-echo" type="range" min="0" max="100" value="30"></label>
       <label>glide <input id="jam-glide" type="range" min="0" max="30" value="2"></label>
     </div>
+    <div class="jam-sub jam-knob-sub">PEDALBOARD</div>
+    <div class="jam-knobs cols3">
+      <label>drive <input id="jam-drive" type="range" min="0" max="100" value="0"></label>
+      <label>delay mix <input id="jam-dlymix" type="range" min="0" max="100" value="25"></label>
+      <label>delay fb <input id="jam-dlyfb" type="range" min="0" max="92" value="35"></label>
+    </div>
+    <div class="jam-synth-row jam-dlydiv-row">
+      <span class="jam-preset-label">delay</span>
+      <button class="jam-dlydiv" data-div="0.5">1/8</button>
+      <button class="jam-dlydiv sel" data-div="0.75">1/8.</button>
+      <button class="jam-dlydiv" data-div="1">1/4</button>
+    </div>
+    <div class="jam-fx-note">clipper &rarr; delay &rarr; limiter, always on the synth</div>
     <div class="jam-synth-row jam-scales">
       <span class="jam-preset-label">keys</span>
       <button class="jam-scale sel" data-scale="chromatic">chromatic</button>
@@ -449,6 +462,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=63"></script>
+<script type="module" src="js/game.js?v=64"></script>
 </body>
 </html>

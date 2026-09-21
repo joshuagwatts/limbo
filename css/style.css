@@ -1059,6 +1059,20 @@ html, body {
 .drum-picker-hint { margin-top: 10px; font-size: 10px; letter-spacing: 0.1em; color: var(--ink-dim); text-align: center; }
 /* build 63: the undo button dims when there's no layer to peel off */
 #jam-loop-undo.off { opacity: 0.25; }
+/* build 64: delay note-value buttons + the pedalboard footnote */
+.jam-dlydiv-row { margin-top: 8px; }
+.jam-dlydiv {
+  background: rgba(122, 224, 255, 0.06);
+  border: 1px solid rgba(122, 224, 255, 0.3); border-radius: 8px;
+  color: #bfeaff; font-family: inherit; font-size: 12px;
+  padding: 6px 12px; cursor: pointer; touch-action: manipulation;
+}
+.jam-dlydiv.sel {
+  background: rgba(122, 224, 255, 0.22);
+  border-color: rgba(122, 224, 255, 0.8);
+  box-shadow: 0 0 12px -2px rgba(122, 224, 255, 0.6);
+}
+.jam-fx-note { margin-top: 6px; font-size: 10px; letter-spacing: 0.12em; color: var(--ink-dim); }
 #jam-chords { display: flex; gap: 10px; margin-top: 2px; }
 .jam-chord {
   flex: 1; min-height: 84px; border-radius: 14px;
