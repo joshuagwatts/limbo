@@ -84,6 +84,11 @@ const SOUND_ROOM_KEY = SOUND_DEF.key; // world key used by goTo()
    slipstream faster. Its own P2P room, like the sound room. */
 const JOURNEY_DEF = { key: 'journey', name: 'ENDLESS JOURNEY', accent: 0x7af2ff, root: 110.0 };
 const JOURNEY_ROOM_KEY = JOURNEY_DEF.key;
+/* The model room (build 66): a workshop realm with an in-browser mini
+   3D modeler. Saved models feed the sound room's stage builder. Its own
+   P2P room, like the sound room. */
+const WORKSHOP_DEF = { key: 'workshop', name: 'MODEL ROOM', accent: 0x9fd8ff, root: 146.83 };
+const WORKSHOP_ROOM_KEY = WORKSHOP_DEF.key;
 const NEXUS_BOUND = 40;       // horizontal leash in the hub
 const PORTAL_TRIGGER = 3.0;   // wisp-to-portal distance that teleports
 const ECHO_TRIGGER = 2.6;     // wisp-to-echo distance that collects
@@ -217,6 +222,7 @@ function roomKeyFor(worldKey) {
   if (worldKey === 'nexus') return nexusServerKey(selectedServer);
   if (worldKey === SOUND_ROOM_KEY) return 'limbo-realm-5';
   if (worldKey === JOURNEY_ROOM_KEY) return 'limbo-realm-6';
+  if (worldKey === WORKSHOP_ROOM_KEY) return 'limbo-realm-7';
   return 'limbo-realm-' + worldKey.replace('realm', '');
 }
 
@@ -1309,6 +1315,7 @@ function realmDisplayName(key) {
   if (key === 'nexus') return NEXUS_DEF.name;
   if (key === SOUND_ROOM_KEY) return SOUND_DEF.name;
   if (key === JOURNEY_ROOM_KEY) return JOURNEY_DEF.name;
+  if (key === WORKSHOP_ROOM_KEY) return WORKSHOP_DEF.name;
   const d = REALM_DEFS.find((r) => r.key === key);
   return d ? d.name : String(key || '').toUpperCase();
 }
@@ -1454,11 +1461,15 @@ function inMusicRoom() {
 }
 function renderRoomChrome() {
   const inSound = !!(active && active.key === SOUND_ROOM_KEY);
+  const inWorkshop = !!(active && active.key === WORKSHOP_ROOM_KEY);
   if (jamBtn) jamBtn.style.display = inSound ? '' : 'none';
   if (paintBtn) paintBtn.style.display = inSound ? '' : 'none';
   if (jukeBtn) jukeBtn.style.display = ''; // build 41: the server jukebox rides everywhere
+  if (workshopBtn) workshopBtn.style.display = inWorkshop ? '' : 'none';
   if (!inSound && paint.open) setPaintOpen(false); // paint mode can't leave the room
+  if (!inWorkshop) setWorkshopPanel(false); // the workbench can't leave the room
   renderJourneyChrome(); // build 41: journey-only buttons + minimap
+  renderJamStageFoh(); // build 66: stage + FOH sections only live in the sound room
 }
 
 /* Build 41: the endless journey's own chrome — return-to-nexus, jam mute,
@@ -1640,36 +1651,30 @@ const jamQueue = []; // pending {beat, play(audioTime)} — the lookahead schedu
 let jamVoicesSpawned = 0; // diagnostic counter for the test hook
 let jamTaps = []; // tap-tempo timestamps
 
-/* ---------------- overdub looper (build 39) ----------------
- * A sound-on-sound loop of the room mix. Tap ● : the next bar boundary
- * starts a stereo capture of exactly `bars` bars off the post-limiter bus
- * (what the room hears); at the cycle end the take starts looping through
- * the jam bus, gapless. Tap ● again while it plays: the next whole cycle
- * is captured and folded into the loop (sound-on-sound — the take holds
- * the loop's own playback plus your new playing, so layers accumulate and
- * gently settle instead of doubling). Tap ■ to rest the loop, ▶ to drift
- * it again, ✕ to clear. The loop keeps its own tempo snapshot — if the
- * room's bpm moves, the loop holds its line (note the drift, re-grab).
- * Free-time works too: with no clock the loop is bars × the bpm readout. */
+/* ---------------- the loop (build 66: simplified) ----------------
+ * One big button at the top of the jam UI, four moves, no thinking:
+ *   empty     -> tap  = start recording
+ *   recording -> tap  = close the loop, start it looping
+ *   playing   -> tap  = stop (rest)
+ *   stopped   -> tap  = play again
+ *   anytime   -> hold = clear it all
+ * Recording starts the instant you tap and closes the instant you tap
+ * again -- the loop is exactly what you played, captured off the
+ * post-limiter bus (what the room hears). No bar alignment, no layers,
+ * no double-taps. The pedal flow (builds 39/63) is retired. */
 const dub = {
-  state: 'empty', // empty|arming|recording|playing|dubbing|stopped
-  bars: 2,
-  buf: null, // AudioBuffer (stereo) — the loop itself
-  history: [], // build 63: previous bounces for undo (peel layers off)
+  state: 'empty', // empty|recording|playing|stopped
+  buf: null, // AudioBuffer (stereo) -- the loop itself
   src: null, // looping BufferSource
   srcGain: null,
-  t0: 0, // ctx.currentTime of the current cycle start
+  t0: 0, // ctx.currentTime of the current playback cycle start
   dur: 0, // loop duration in seconds
-  bpm: 120, // tempo snapshot taken at record time
-  take: null, // {proc,tap,sink,bufL,bufR,idx,len} while capturing
-  armAt: 0, // ctx.currentTime when an armed record/dub begins
-  armFrom: 0, // ctx.currentTime when arming started (ring progress)
-  armMode: null, // 'record' | 'play' | 'dub' while arming
-  pendingBuf: null, // AudioBuffer being filled by a record capture
-  dubAt: 0, // cycle start of an in-flight dub capture (watchdog)
-  pendingDub: false, // armed overdub waiting on the cycle boundary
+  take: null, // {proc,tap,sink,L,R,idx,len} while capturing
   uiRaf: 0,
 };
+/* Longest take the loop will hold -- a take that runs past this closes
+   itself instead of eating memory. */
+const LOOP_MAX_SEC = 30;
 
 /* Current beat on the shared clock, or null when the clock is stopped. */
 function jamBeatNow() {
@@ -3218,35 +3223,14 @@ function jamTriggerPad(i) {
   return true;
 }
 
-/* ---------------- overdub looper (build 39) ---------------- */
+/* ---------------- the loop (build 66: simplified) ---------------- */
 
 const loopBtnEl = document.getElementById('jam-loop-btn');
 const loopGlyphEl = document.getElementById('jam-loop-glyph');
 const loopRingEl = document.getElementById('jam-loop-ring');
 const loopStateEl = document.getElementById('jam-loop-state');
 const loopMetaEl = document.getElementById('jam-loop-meta');
-const loopStopEl = document.getElementById('jam-loop-stop');
-const loopClearEl = document.getElementById('jam-loop-clear');
-const loopLenEl = document.getElementById('jam-loop-len');
 const LOOP_RING_C = 2 * Math.PI * 27;
-
-function loopDurSec() {
-  const bpm = Math.max(40, Math.min(220, Number(jam.bpm) || 120));
-  return (dub.bars * 4 * 60) / bpm;
-}
-
-/* Next bar line as an AudioContext timestamp. With the clock off, the
-   loop runs free-time off the bpm readout. */
-function loopNextBarAt() {
-  const ctx = audio.ctx;
-  if (!ctx) return 0;
-  const bn = jamBeatNow();
-  if (bn != null) {
-    const at = jamAudioTimeForBeat(Math.floor(bn / 4) * 4 + 4);
-    if (at != null && at > ctx.currentTime + 0.03) return at;
-  }
-  return ctx.currentTime + 0.08;
-}
 
 function loopStopCapture() {
   const tk = dub.take;
@@ -3286,8 +3270,8 @@ function loopStartCapture(startAt, len, done) {
       const c1 = ib.numberOfChannels > 1 ? ib.getChannelData(1) : c0;
       const sr = ctx.sampleRate;
       let skip = 0;
-      // Without a usable playbackTime we can't trim to the bar line —
-      // record from the first block instead of dropping everything.
+      // Without a usable playbackTime we can't trim to the start -- record
+      // from the first block instead of dropping everything.
       if (Number.isFinite(bt) && bt < startAt) {
         skip = Math.min(c0.length, Math.round((startAt - bt) * sr));
         if (skip >= c0.length) return; // whole block is before the start
@@ -3350,341 +3334,138 @@ function loopStopPlayback() {
   try { src.disconnect(); } catch (e) {}
 }
 
-/* The ● button. Empty → record; playing → overdub a layer; stopped →
-   drift the loop again. Recording/dubbing taps are ignored (the cycle
-   closes itself on the bar line — predictable, no partial loops). */
-/* Build 63: the looper-pedal flow. One big button, no thinking:
- * empty -> tap ● = record (starts next bar)
- * recording -> tap ● = close the loop early (rounds to whole bars)
- * playing -> tap ● = layer more (starts next round)
- * dubbing -> tap ● = stop layering, keep playing
- * playing -> double-tap ● = stop (rest)
- * stopped -> tap ▶ = play again
- * hold ● = clear it all
- * Layers stack; undo peels the last one off. */
-let loopTapTimer = 0, loopTapCount = 0;
-let loopHoldTimer = 0, loopHoldFired = false;
+/* The big button. Four moves, that's the whole looper. */
 function loopMainButton() {
   audioEnsureRunning();
   if (!audio.ctx || !jamEnsureChain()) return false;
-  if (dub.state === 'empty') return loopArmRecord();
-  if (dub.state === 'recording') return loopFinishRecord();
-  if (dub.state === 'dubbing') return loopStopDub();
-  if (dub.state === 'stopped' && dub.buf) return loopArmPlay();
-  if (dub.state === 'arming') return loopCancelArm();
-  if (dub.state === 'playing' && dub.buf) {
-    // Single tap = layer, double tap = rest. Decided in 300ms — the layer
-    // arms on the next cycle boundary anyway, so no audible delay.
-    loopTapCount++;
-    clearTimeout(loopTapTimer);
-    loopTapTimer = setTimeout(() => {
-      const n = loopTapCount;
-      loopTapCount = 0;
-      if (n >= 2) loopStop();
-      else loopArmDub();
-    }, 300);
-    return true;
-  }
+  if (dub.state === 'empty') return loopRecord();
+  if (dub.state === 'recording') return loopClose();
+  if (dub.state === 'playing') return loopStop();
+  if (dub.state === 'stopped' && dub.buf) return loopPlay();
   return false;
 }
-/* Tap ● while recording: close the loop at the next bar line instead of
- * waiting out the full bar count. Rounds to whole bars at record tempo. */
-function loopFinishRecord() {
-  if (dub.state !== 'recording' || !dub.take || !audio.ctx) return false;
+
+/* Start a capture of the room mix. `done` fires when the take is full
+   (ran the LOOP_MAX_SEC cap) -- a tap shuts it early via loopClose. */
+function loopBeginCapture() {
   const ctx = audio.ctx;
-  const take = dub.take;
-  loopStopCapture();
-  const idx = take.idx;
-  if (idx < ctx.sampleRate * 0.25) return false; // too short — keep going
-  try {
-    const barSec = (60 / dub.bpm) * 4;
-    const bars = Math.max(1, Math.round((idx / ctx.sampleRate) / barSec));
-    const len = Math.max(1, Math.round(bars * barSec * ctx.sampleRate));
-    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
-    const n = Math.min(idx, len);
-    buf.getChannelData(0).set(take.L.subarray(0, n));
-    buf.getChannelData(1).set(take.R.subarray(0, n));
-    const at = loopNextBarAt();
-    if (!loopStartPlayback(buf, at)) return false;
-    dub.buf = buf;
-    dub.history = [];
-    dub.dur = len / ctx.sampleRate;
-    dub.bars = bars;
-    dub.t0 = at;
-    dub.pendingBuf = null;
-    dub.state = 'playing';
-    loopRenderUI();
-    return true;
-  } catch (e) { return false; }
+  const len = Math.max(1, Math.round(LOOP_MAX_SEC * ctx.sampleRate));
+  return loopStartCapture(ctx.currentTime + 0.05, len, (L, R) => {
+    if (dub.state === 'recording') loopFinishFromArrays(L, R, L.length);
+  });
 }
-/* Tap ● while layering: drop the in-flight take, keep playing. */
-function loopStopDub() {
-  if (dub.state !== 'dubbing') return false;
-  loopStopCapture();
-  dub.pendingDub = false;
-  dub.dubAt = 0;
-  dub.state = 'playing';
+
+/* Tap on empty: start recording, right now. */
+function loopRecord() {
+  if (dub.state !== 'empty' || !audio.ctx || !jamEnsureChain()) return false;
+  if (!loopBeginCapture()) return false;
+  dub.state = 'recording';
   loopRenderUI();
   return true;
 }
-/* Tap while arming: stand down. */
-function loopCancelArm() {
-  if (dub.state !== 'arming') return false;
+
+/* Tap while recording: close the loop and start it looping. */
+function loopClose() {
+  if (dub.state !== 'recording' || !dub.take || !audio.ctx) return false;
+  const take = dub.take;
   loopStopCapture();
-  dub.armMode = null;
-  dub.pendingDub = false;
+  const idx = take.idx;
+  if (idx < Math.floor(audio.ctx.sampleRate * 0.25)) {
+    // A blip, not a loop -- keep recording.
+    if (!loopBeginCapture()) { dub.state = 'empty'; loopRenderUI(); }
+    return true;
+  }
+  return loopFinishFromArrays(take.L, take.R, idx);
+}
+
+/* Slice the take to what was actually played and start it looping. */
+function loopFinishFromArrays(L, R, n) {
+  const ctx = audio.ctx;
+  if (!ctx) { dub.state = 'empty'; loopRenderUI(); return false; }
+  try {
+    const len = Math.max(1, n | 0);
+    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    buf.getChannelData(0).set(L.subarray(0, len));
+    buf.getChannelData(1).set(R.subarray(0, len));
+    const at = ctx.currentTime + 0.05;
+    if (!loopStartPlayback(buf, at)) { dub.state = 'empty'; loopRenderUI(); return false; }
+    dub.buf = buf;
+    dub.dur = len / ctx.sampleRate;
+    dub.t0 = at;
+    dub.state = 'playing';
+  } catch (e) {
+    dub.state = 'empty';
+  }
+  loopRenderUI();
+  return dub.state === 'playing';
+}
+
+/* Tap while playing: rest the loop, keep the take. */
+function loopStop() {
+  loopStopCapture();
+  loopStopPlayback();
   dub.state = dub.buf ? 'stopped' : 'empty';
   loopRenderUI();
   return true;
 }
-/* Undo: peel the last layered take off, swap the previous bounce in on
- * the next cycle boundary. */
-function loopUndo() {
-  if (!dub.history || !dub.history.length || !audio.ctx) return false;
-  const prev = dub.history.pop();
-  if (!prev) return false;
-  if (dub.state === 'dubbing') loopStopDub();
-  const ctx = audio.ctx;
-  const at = (dub.t0 + dub.dur > ctx.currentTime + 0.05) ? dub.t0 + dub.dur : ctx.currentTime + 0.05;
-  if (!loopStartPlayback(prev, at)) return false;
-  dub.buf = prev;
+
+/* Tap while stopped: drift the loop again. */
+function loopPlay() {
+  if (!dub.buf || !audio.ctx) return false;
+  const at = audio.ctx.currentTime + 0.05;
+  if (!loopStartPlayback(dub.buf, at)) return false;
   dub.t0 = at;
-  if (dub.state !== 'playing') dub.state = 'playing';
+  dub.state = 'playing';
   loopRenderUI();
   return true;
 }
 
-function loopArmRecord() {
-  if (dub.state !== 'empty') return false;
-  const ctx = audio.ctx;
-  dub.bpm = Math.max(40, Math.min(220, Number(jam.bpm) || 120));
-  dub.dur = loopDurSec();
-  dub.armAt = loopNextBarAt();
-  dub.armMode = 'record';
-  dub.state = 'arming';
-  loopRenderUI();
-  return true;
-}
-
-function loopArmPlay() {
-  if (!dub.buf || (dub.state !== 'stopped' && dub.state !== 'empty')) return false;
-  dub.armAt = loopNextBarAt();
-  dub.armMode = 'play';
-  dub.state = 'arming';
-  loopRenderUI();
-  return true;
-}
-
-function loopArmDub() {
-  if (dub.state !== 'playing' || !dub.buf) return false;
-  dub.armAt = dub.t0 + dub.dur; // the next cycle boundary
-  if (dub.armAt < audio.ctx.currentTime + 0.05) dub.armAt = loopNextBarAt();
-  dub.armMode = 'dub';
-  dub.pendingDub = true;
-  dub.state = 'arming';
-  loopRenderUI();
-  return true;
-}
-
-/* Fires armed record/play/dub transitions. Polled on a 25ms tick — the
-   capture itself is sample-aligned inside the ScriptProcessor. */
-function loopArmTick() {
-  if (dub.state !== 'arming' || !audio.ctx) return;
-  if (audio.ctx.currentTime < dub.armAt - 0.02) return;
-  const ctx = audio.ctx;
-  if (dub.armMode === 'record') {
-    const len = Math.max(1, Math.round(dub.dur * ctx.sampleRate));
-    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
-    dub.pendingBuf = buf; // filled by the capture; watchdog finalizes if it stalls
-    const ok = loopStartCapture(dub.armAt, len, (L, R) => {
-      // Take complete: the buffer was filled live during the cycle.
-      try {
-        buf.getChannelData(0).set(L);
-        buf.getChannelData(1).set(R);
-      } catch (e) { /* a partial take still loops */ }
-      dub.pendingBuf = null;
-      dub.history = []; // a fresh record starts a fresh layer stack
-      if (dub.state === 'recording') { dub.state = 'playing'; loopRenderUI(); }
-    });
-    if (!ok) { dub.pendingBuf = null; dub.state = 'empty'; loopRenderUI(); return; }
-    // Gapless handoff: the source is scheduled NOW for the cycle end; the
-    // capture fills the buffer it will read.
-    if (!loopStartPlayback(buf, dub.armAt + dub.dur)) {
-      loopStopCapture(); dub.state = 'empty'; loopRenderUI(); return;
-    }
-    dub.buf = buf;
-    dub.t0 = dub.armAt + dub.dur;
-    dub.state = 'recording';
-  } else if (dub.armMode === 'play') {
-    if (!loopStartPlayback(dub.buf, dub.armAt)) { dub.state = 'stopped'; }
-    else { dub.t0 = dub.armAt; dub.state = 'playing'; }
-  } else if (dub.armMode === 'dub') {
-    const len = Math.max(1, Math.round(dub.dur * ctx.sampleRate));
-    dub.dubAt = dub.armAt;
-    const ok = loopStartCapture(dub.armAt, len, (L, R) => {
-      dub.dubAt = 0;
-      loopFoldDub(L, R);
-    });
-    if (!ok) { dub.dubAt = 0; dub.pendingDub = false; dub.state = 'playing'; }
-    else dub.state = 'dubbing';
-  }
-  dub.armMode = null;
-  loopRenderUI();
-}
-setInterval(() => { if (jam.open) loopArmTick(); }, 25);
-
-/* Watchdog: if a capture stalls (throttled tab, starved audio thread), the
-   loop must not hang in recording/dubbing forever. Finalize from whatever
-   was captured — a partial take still loops. */
-function loopWatchdog() {
-  if (!audio.ctx) return;
-  const now = audio.ctx.currentTime;
-  if (dub.state === 'recording' && dub.pendingBuf && now > dub.t0 + 0.75) {
-    const tk = dub.take;
-    try {
-      if (tk && tk.idx > 0) {
-        dub.pendingBuf.getChannelData(0).set(tk.L.subarray(0, tk.idx));
-        dub.pendingBuf.getChannelData(1).set(tk.R.subarray(0, tk.idx));
-      }
-    } catch (e) { /* silence tail is fine */ }
-    loopStopCapture();
-    dub.pendingBuf = null;
-    dub.state = 'playing';
-    loopRenderUI();
-  } else if (dub.state === 'dubbing' && dub.dubAt && now > dub.dubAt + dub.dur + 0.75) {
-    const tk = dub.take;
-    loopStopCapture();
-    dub.dubAt = 0;
-    dub.pendingDub = false;
-    if (tk && tk.idx > tk.len * 0.5) {
-      // Enough of a take to fold: pad the tail and mix it in.
-      const L = new Float32Array(tk.len), R = new Float32Array(tk.len);
-      L.set(tk.L.subarray(0, tk.idx)); R.set(tk.R.subarray(0, tk.idx));
-      loopFoldDub(L, R);
-    } else {
-      dub.state = 'playing'; // too little — keep the old loop drifting
-      loopRenderUI();
-    }
-  }
-}
-setInterval(() => { if (jam.open) loopWatchdog(); }, 500);
-
-/* Sound-on-sound fold: the take holds the loop's own playback plus the new
-   playing, so the new loop IS the take (scaled for headroom, soft-clipped).
-   Layers settle instead of doubling — like a real looper pedal. The buffer
-   swap happens exactly on the cycle boundary: old source stops, new source
-   starts, no seam. */
-function loopFoldDub(L, R) {
-  const ctx = audio.ctx;
-  const len = L.length;
-  try {
-    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
-    for (let chI = 0; chI < 2; chI++) {
-      const src = chI === 0 ? L : R;
-      const out = buf.getChannelData(chI);
-      for (let i = 0; i < len; i++) {
-        const v = src[i] * 0.85;
-        out[i] = v > 1 ? 1 : v < -1 ? -1 : v;
-      }
-    }
-    const at = dub.t0 + dub.dur;
-    if (loopStartPlayback(buf, at)) {
-      if (dub.buf) dub.history.push(dub.buf); // keep the pre-layer bounce for undo
-      dub.buf = buf;
-      dub.t0 = at;
-    }
-  } catch (e) { /* keep the old loop drifting */ }
-  dub.pendingDub = false;
-  dub.dubAt = 0;
-  if (dub.state === 'dubbing') dub.state = 'playing';
-  loopRenderUI();
-}
-
-/* ■ — rest the loop (kept, tap ▶/● to drift again). */
-function loopStop() {
-  if (dub.state === 'arming') {
-    dub.state = dub.buf ? 'stopped' : 'empty';
-    dub.armMode = null;
-    dub.pendingDub = false;
-    loopRenderUI();
-    return true;
-  }
-  loopStopCapture();
-  loopStopPlayback();
-  dub.pendingDub = false;
-  dub.pendingBuf = null;
-  dub.dubAt = 0;
-  dub.armFrom = 0;
-  if (dub.buf && (dub.state === 'playing' || dub.state === 'dubbing' || dub.state === 'recording')) {
-    dub.state = 'stopped';
-  }
-  loopRenderUI();
-  return true;
-}
-
-/* ✕ — clear the loop entirely. */
+/* Hold: clear the loop entirely. */
 function loopClear() {
   loopStopCapture();
   loopStopPlayback();
   dub.buf = null;
-  dub.history = [];
-  dub.pendingBuf = null;
-  dub.dubAt = 0;
-  dub.armFrom = 0;
-  dub.pendingDub = false;
-  dub.armMode = null;
+  dub.dur = 0;
+  dub.t0 = 0;
   dub.state = 'empty';
   loopRenderUI();
   return true;
 }
 
-function loopSetBars(n) {
-  n = Math.max(1, Math.min(8, Number(n) || 2));
-  if (n === dub.bars) return true;
-  dub.bars = n;
-  // A loop's length is baked into its buffer — a new length starts fresh.
-  if (dub.buf) loopClear();
-  else loopRenderUI();
-  if (loopLenEl) {
-    loopLenEl.querySelectorAll('button').forEach((b) =>
-      b.classList.toggle('sel', Number(b.dataset.bars) === n));
-  }
-  return true;
-}
-
 function loopRenderUI() {
   if (loopGlyphEl) {
-    loopGlyphEl.innerHTML = dub.state === 'stopped' ? '&#9654;' : '&#9679;';
+    loopGlyphEl.innerHTML =
+      dub.state === 'playing' ? '&#9632;' : // stop
+      dub.state === 'stopped' ? '&#9654;' : // play
+      '&#9679;';                            // record
   }
   if (loopBtnEl) {
-    loopBtnEl.classList.toggle('rec', dub.state === 'recording' || (dub.state === 'arming' && dub.armMode === 'record'));
-    loopBtnEl.classList.toggle('dub', dub.state === 'dubbing' || (dub.state === 'arming' && dub.armMode === 'dub'));
+    loopBtnEl.classList.toggle('rec', dub.state === 'recording');
+    const aria = {
+      empty: 'loop: tap to record',
+      recording: 'loop: tap to close the loop',
+      playing: 'loop: tap to stop',
+      stopped: 'loop: tap to play again',
+    };
+    loopBtnEl.setAttribute('aria-label', aria[dub.state] || 'loop');
   }
   if (loopStateEl) {
-    const layers = dub.history ? dub.history.length : 0;
     const m = {
-      empty: 'the loop is empty — play, then tap &#9679;',
-      arming: dub.armMode === 'dub' ? 'layering on the next round…'
-        : dub.armMode === 'play' ? 'joining the bar…' : 'catching the next bar — tap &#9679; to cancel',
-      recording: 'recording — tap &#9679; to close the loop',
-      playing: layers
-        ? `loop drifting (${layers + 1} layers) — tap &#9679; to layer, double-tap to rest`
-        : 'loop drifting — tap &#9679; to layer more, double-tap to rest',
-      dubbing: 'layering — tap &#9679; to stop layering',
-      stopped: 'loop resting — tap &#9654; to drift again',
+      empty: 'tap &#9679; to record a loop',
+      recording: 'recording &mdash; tap &#9679; to close the loop',
+      playing: 'looping &mdash; tap &#9632; to stop',
+      stopped: 'resting &mdash; tap &#9654; to play again',
     };
     loopStateEl.innerHTML = m[dub.state] || '';
   }
   if (loopMetaEl) {
     loopMetaEl.textContent = dub.buf
-      ? `${dub.bars} bars · ${Math.round(dub.bpm)} bpm · ${dub.dur.toFixed(1)}s`
-      : `${dub.bars} bars · ${Math.round(jam.bpm)} bpm`;
+      ? `${dub.dur.toFixed(1)}s loop`
+      : 'hold the button to clear';
   }
-  const undoEl = document.getElementById('jam-loop-undo');
-  if (undoEl) undoEl.classList.toggle('off', !(dub.history && dub.history.length));
 }
 
-/* Progress ring + countdowns, while the jam panel is open. */
+/* Progress ring, while the jam panel is open. */
 function loopUiTick() {
   if (!jam.open) return;
   if (!loopRingEl || !audio.ctx) return;
@@ -3692,16 +3473,10 @@ function loopUiTick() {
   const now = audio.ctx.currentTime;
   if (dub.state === 'recording' && dub.take) {
     pos = Math.min(1, dub.take.idx / Math.max(1, dub.take.len));
-  } else if ((dub.state === 'playing' || dub.state === 'dubbing') && dub.dur > 0) {
+  } else if (dub.state === 'playing' && dub.dur > 0) {
     pos = ((now - dub.t0) / dub.dur) % 1;
     if (pos < 0) pos += 1;
-  } else if (dub.state === 'arming') {
-    const span = Math.max(0.001, dub.armAt - (dub.armFrom || (dub.armFrom = now)));
-    pos = Math.min(1, Math.max(0, 1 - (dub.armAt - now) / span));
-  } else {
-    dub.armFrom = 0;
   }
-  if (dub.state !== 'arming') dub.armFrom = 0;
   loopRingEl.style.strokeDashoffset = String(LOOP_RING_C * (1 - pos));
 }
 function loopUiEnsure() {
@@ -3715,8 +3490,9 @@ function loopUiEnsure() {
   dub.uiRaf = requestAnimationFrame(tick);
 }
 
+/* Hold the big button to clear the loop; a plain tap runs the 4 moves. */
+let loopHoldTimer = 0, loopHoldFired = false;
 if (loopBtnEl) {
-  // Hold the big button to clear the loop; a plain tap runs the pedal flow.
   loopBtnEl.addEventListener('pointerdown', () => {
     loopHoldFired = false;
     clearTimeout(loopHoldTimer);
@@ -3728,15 +3504,6 @@ if (loopBtnEl) {
   loopBtnEl.addEventListener('click', () => {
     if (loopHoldFired) { loopHoldFired = false; loopBtnEl.blur(); return; }
     loopMainButton(); loopBtnEl.blur();
-  });
-}
-if (loopStopEl) loopStopEl.addEventListener('click', () => { loopStop(); loopStopEl.blur(); });
-if (loopClearEl) loopClearEl.addEventListener('click', () => { loopClear(); loopClearEl.blur(); });
-const loopUndoEl = document.getElementById('jam-loop-undo');
-if (loopUndoEl) loopUndoEl.addEventListener('click', () => { loopUndo(); loopUndoEl.blur(); });
-if (loopLenEl) {
-  loopLenEl.querySelectorAll('button').forEach((b) => {
-    b.addEventListener('click', () => { loopSetBars(Number(b.dataset.bars)); b.blur(); });
   });
 }
 
@@ -6789,6 +6556,7 @@ function setJamPanel(open) {
     jamRenderRoomNote();
     loopRenderUI(); // looper state text + ring
     loopUiEnsure(); // progress ring rAF while the panel is open
+    renderJamStageFoh(); // build 66: stage + FOH sections only in the sound room
   } else {
     try { applySkin(equipped.skin); } catch (e) {} // wisp glow back to the skin
   }
@@ -7503,6 +7271,12 @@ function buildSoundRoom(textures) {
   const dust = makeDust(200, 40, accent, 0.6);
   scene.add(dust.pts);
 
+  // Build 66: the stage — placed models live in this group, in front of
+  // the DJ booth (booth sits at z=-24, spawn faces -Z from z=20).
+  const stageGroup = new THREE.Group();
+  stageGroup.position.set(0, 0, -10);
+  scene.add(stageGroup);
+
   // Community wall (build 18; doubled to 32x16 in build 19 after the
   // north-wall gallery piece was removed): a monumental shared paint
   // canvas on the north wall behind the booth. MeshBasicMaterial so the
@@ -7538,6 +7312,7 @@ function buildSoundRoom(textures) {
       dust, lightA, lightB, boothGlow, bass: 0,
       amb, wallMesh, wallSampleAt: 0, wallPulse: 0,
       wallTarget: new THREE.Color(WALL_AMB_BASE),
+      scene, stageGroup, foh, // build 66: stage builder + front of house
     },
     attunedShown: true, // n/a: no echoes here, nothing to attune
     setBass(v) { this.anim.bass = Math.max(0, Math.min(1, v)); },
@@ -7569,9 +7344,773 @@ function buildSoundRoom(textures) {
       const gs = 16 + bass * 6;
       boothGlow.scale.set(gs, gs * 0.62, 1);
       scene.fog.density = 0.012 + bass * 0.008;
+      // Build 66: front of house overrides the light rig when touched.
+      soundFohApply(this.anim, t);
     },
   };
 }
+
+/* ================= the model room (build 66) =================
+   A workshop realm: an in-browser mini 3D modeler in the #workshop-panel
+   overlay. Primitives drop onto the workbench, sliders move / spin / size
+   them, models save to localStorage and feed the sound room's stage
+   builder. Its own P2P room, like the sound room. */
+
+/* Procedural portal art for the model room: a blueprint cube on dark. */
+function makeWorkshopTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#060b16';
+  g.fillRect(0, 0, 256, 256);
+  g.strokeStyle = 'rgba(159, 216, 255, 0.18)';
+  g.lineWidth = 1;
+  for (let i = 0; i <= 16; i++) {
+    const p = (i / 16) * 256;
+    g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 256); g.stroke();
+    g.beginPath(); g.moveTo(0, p); g.lineTo(256, p); g.stroke();
+  }
+  // Isometric cube outline.
+  const cx = 128, cy = 128, s = 52;
+  const P = [
+    [cx - s, cy - s * 0.5], [cx, cy - s], [cx + s, cy - s * 0.5],
+    [cx + s, cy + s * 0.5], [cx, cy + s], [cx - s, cy + s * 0.5],
+  ];
+  g.strokeStyle = '#9fd8ff';
+  g.lineWidth = 5;
+  g.beginPath();
+  g.moveTo(...P[0]); g.lineTo(...P[1]); g.lineTo(...P[2]);
+  g.lineTo(...P[3]); g.lineTo(...P[4]); g.lineTo(...P[5]);
+  g.closePath(); g.stroke();
+  g.beginPath();
+  g.moveTo(...P[5]); g.lineTo(...P[3]); g.moveTo(...P[4]); g.lineTo(...P[1]);
+  g.moveTo(...P[0]); g.lineTo(...P[2]); g.stroke();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function buildWorkshop() {
+  const accent = WORKSHOP_DEF.accent;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x04060c);
+  scene.fog = new THREE.FogExp2(0x060a14, 0.014);
+  scene.add(new THREE.AmbientLight(0xbfd4ff, 0.7));
+  const key = new THREE.DirectionalLight(0xd8ecff, 1.1);
+  key.position.set(8, 14, 6);
+  scene.add(key);
+
+  // Floor.
+  const floor = new THREE.Mesh(
+    new THREE.CircleGeometry(30, 48),
+    new THREE.MeshStandardMaterial({ color: 0x0a0e18, roughness: 0.85, metalness: 0.15 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  scene.add(floor);
+
+  // Workbench: a glowing platform in the middle where pieces land.
+  const bench = new THREE.Mesh(
+    new THREE.CylinderGeometry(9, 9, 0.6, 48),
+    new THREE.MeshStandardMaterial({ color: 0x111826, roughness: 0.5, metalness: 0.5 })
+  );
+  bench.position.y = 0.3;
+  scene.add(bench);
+  const benchRing = new THREE.Mesh(
+    new THREE.TorusGeometry(9, 0.12, 12, 72),
+    new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 0.8 })
+  );
+  benchRing.rotation.x = Math.PI / 2;
+  benchRing.position.y = 0.62;
+  scene.add(benchRing);
+
+  const dust = makeDust(160, 34, accent, 0.5);
+  scene.add(dust.pts);
+
+  // Pieces built in the workbench live here (pieces-only group).
+  wsGroup = new THREE.Group();
+  scene.add(wsGroup);
+
+  // Return portal to the Nexus, off to the side where the drifter can see it.
+  const { group, ring } = makePortal(makeWorkshopTexture(), accent, 'NEXUS', 1.7, 0.14);
+  group.position.set(13, 3, 10);
+  group.lookAt(0, 3, 16);
+  scene.add(group);
+  const portals = [{ group, ring, pos: group.position.clone(), target: 'nexus', phase: 0.6, baseY: 3 }];
+
+  return {
+    key: WORKSHOP_DEF.key, name: WORKSHOP_DEF.name, root: WORKSHOP_DEF.root,
+    scene, portals, echoes: [],
+    spawn: new THREE.Vector3(0, 2, 16), spawnYaw: 0, // face the bench (-Z)
+    bound: 'realm',
+    anim: { dust, benchRing },
+    attunedShown: true, // n/a: no echoes here, nothing to attune
+    update(dt, t) {
+      const { dust, benchRing } = this.anim;
+      dust.pts.rotation.y += dt * 0.02;
+      benchRing.material.emissiveIntensity = 0.6 + Math.sin(t * 1.6) * 0.25;
+      for (const pt of this.portals) {
+        pt.group.position.y = pt.baseY + Math.sin(t * 0.8 + pt.phase) * 0.3;
+        pt.ring.rotation.z -= dt * 0.15;
+        pt.pos.copy(pt.group.position);
+      }
+    },
+  };
+}
+
+/* ---------------- shared piece factory (build 66) ----------------
+   The workshop and the stage builder both instantiate saved models
+   through this — one geometry per primitive, MeshStandardMaterial so
+   the FOH lights play on them. */
+function modelPieceMesh(type, colorHex) {
+  let geo;
+  switch (type) {
+    case 'sphere': geo = new THREE.SphereGeometry(1, 24, 18); break;
+    case 'cylinder': geo = new THREE.CylinderGeometry(1, 1, 2, 24); break;
+    case 'cone': geo = new THREE.ConeGeometry(1, 2, 24); break;
+    case 'torus': geo = new THREE.TorusGeometry(1, 0.4, 16, 32); break;
+    case 'plane': geo = new THREE.PlaneGeometry(2, 2); break;
+    case 'box':
+    default: geo = new THREE.BoxGeometry(2, 2, 2); break;
+  }
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(colorHex || '#7ae0ff'),
+    roughness: 0.45, metalness: 0.35,
+  });
+  return new THREE.Mesh(geo, mat);
+}
+function modelDisposeGroup(group) {
+  group.traverse((o) => {
+    if (o.isMesh) {
+      try { o.geometry.dispose(); } catch (e) {}
+      try { o.material.dispose(); } catch (e) {}
+    }
+  });
+  group.clear();
+}
+
+/* ---------------- the workbench (build 66) ----------------
+   In-browser mini modeler. Pieces are {id, type, mesh}; the saved
+   format is JSON-serializable: type + position + spin + size + color. */
+const ws = {
+  pieces: [], // {id, type, mesh}
+  sel: null, // selected piece id
+  nextId: 1,
+  undoStack: [],
+  undoArmed: false,
+  open: false,
+};
+let wsGroup = null; // pieces-only group, set by buildWorkshop()
+const WS_MAX_PIECES = 60;
+
+const workshopBtn = document.getElementById('workshop-btn');
+const workshopPanel = document.getElementById('workshop-panel');
+const workshopCloseBtn = document.getElementById('workshop-close');
+const wsAddEl = document.getElementById('ws-add');
+const wsPiecesEl = document.getElementById('ws-pieces');
+const wsEditEl = document.getElementById('ws-edit');
+const wsEditNameEl = document.getElementById('ws-edit-name');
+const wsXEl = document.getElementById('ws-x');
+const wsYEl = document.getElementById('ws-y');
+const wsZEl = document.getElementById('ws-z');
+const wsRotEl = document.getElementById('ws-rot');
+const wsSizeEl = document.getElementById('ws-size');
+const wsColorEl = document.getElementById('ws-color');
+const wsUndoEl = document.getElementById('ws-undo');
+const wsDeleteEl = document.getElementById('ws-delete');
+const wsNameEl = document.getElementById('ws-name');
+const wsSaveEl = document.getElementById('ws-save');
+const wsModelsEl = document.getElementById('ws-models');
+
+function wsLoadModels() {
+  try { return JSON.parse(localStorage.getItem('limbo_models_v1') || '{}') || {}; }
+  catch (e) { return {}; }
+}
+function wsSaveModels(m) {
+  try { localStorage.setItem('limbo_models_v1', JSON.stringify(m)); } catch (e) {}
+}
+function wsPieceSpec(p) {
+  return {
+    t: p.type,
+    p: [+p.mesh.position.x.toFixed(3), +p.mesh.position.y.toFixed(3), +p.mesh.position.z.toFixed(3)],
+    ry: +p.mesh.rotation.y.toFixed(3),
+    s: +p.mesh.scale.x.toFixed(3),
+    c: '#' + p.mesh.material.color.getHexString(),
+  };
+}
+function wsSerialize() { return ws.pieces.map(wsPieceSpec); }
+function wsSanitizeSpec(s) {
+  if (!s || typeof s !== 'object') return null;
+  const t = ['box', 'sphere', 'cylinder', 'cone', 'torus', 'plane'].includes(s.t) ? s.t : 'box';
+  const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+  const p = Array.isArray(s.p) ? s.p : [0, 1.6, 0];
+  return {
+    t,
+    p: [num(p[0], 0), num(p[1], 1.6), num(p[2], 0)],
+    ry: num(s.ry, 0),
+    s: Math.max(0.05, Math.min(8, num(s.s, 1))),
+    c: typeof s.c === 'string' && /^#[0-9a-fA-F]{6}$/.test(s.c) ? s.c : '#7ae0ff',
+  };
+}
+function wsInstantiate(spec) {
+  const s = wsSanitizeSpec(spec);
+  if (!s) return null;
+  const mesh = modelPieceMesh(s.t, s.c);
+  mesh.position.set(s.p[0], s.p[1], s.p[2]);
+  mesh.rotation.y = s.ry;
+  mesh.scale.setScalar(s.s);
+  return { id: ws.nextId++, type: s.t, mesh };
+}
+/* Rebuild the bench from a serialized list. */
+function wsRebuild(list) {
+  if (wsGroup) modelDisposeGroup(wsGroup);
+  ws.pieces = [];
+  ws.sel = null;
+  for (const spec of (Array.isArray(list) ? list : [])) {
+    const p = wsInstantiate(spec);
+    if (p) { ws.pieces.push(p); if (wsGroup) wsGroup.add(p.mesh); }
+  }
+  wsRenderPieces();
+  wsRenderEdit();
+}
+function wsPushUndo() {
+  ws.undoStack.push(JSON.stringify(wsSerialize()));
+  if (ws.undoStack.length > 40) ws.undoStack.shift();
+}
+function wsUndo() {
+  const snap = ws.undoStack.pop();
+  if (snap == null) return false;
+  try { wsRebuild(JSON.parse(snap)); } catch (e) { return false; }
+  return true;
+}
+function wsFind(id) { return ws.pieces.find((p) => p.id === id) || null; }
+
+function wsAdd(type) {
+  if (!wsGroup) return false;
+  if (ws.pieces.length >= WS_MAX_PIECES) {
+    addSystemLine('the bench is full — delete something first');
+    return false;
+  }
+  wsPushUndo();
+  const p = wsInstantiate({ t: type, p: [0, 1.6, 0], ry: 0, s: 1, c: '#7ae0ff' });
+  if (!p) return false;
+  ws.pieces.push(p);
+  wsGroup.add(p.mesh);
+  ws.sel = p.id;
+  wsRenderPieces();
+  wsRenderEdit();
+  return true;
+}
+function wsSelect(id) {
+  ws.sel = wsFind(id) ? id : null;
+  wsRenderPieces();
+  wsRenderEdit();
+}
+function wsDelete() {
+  const p = wsFind(ws.sel);
+  if (!p) return false;
+  wsPushUndo();
+  if (wsGroup) wsGroup.remove(p.mesh);
+  try { p.mesh.geometry.dispose(); p.mesh.material.dispose(); } catch (e) {}
+  ws.pieces = ws.pieces.filter((q) => q.id !== p.id);
+  ws.sel = null;
+  wsRenderPieces();
+  wsRenderEdit();
+  return true;
+}
+/* Sliders -> the selected piece, live. */
+function wsApplyEdit() {
+  const p = wsFind(ws.sel);
+  if (!p || !wsXEl) return false;
+  p.mesh.position.set(+wsXEl.value, +wsYEl.value, +wsZEl.value);
+  p.mesh.rotation.y = (+wsRotEl.value * Math.PI) / 180;
+  p.mesh.scale.setScalar(Math.max(0.05, +wsSizeEl.value / 100));
+  try { p.mesh.material.color.set(wsColorEl.value); } catch (e) {}
+  return true;
+}
+/* One undo snapshot per slider gesture. */
+function wsArmUndo() {
+  if (!ws.undoArmed) { wsPushUndo(); ws.undoArmed = true; }
+}
+function wsSaveModel(name) {
+  const nm = String(name != null ? name : (wsNameEl && wsNameEl.value) || '').trim().slice(0, 24) || 'model';
+  if (!ws.pieces.length) { addSystemLine('nothing built yet — add a piece first'); return false; }
+  const models = wsLoadModels();
+  models[nm] = wsSerialize();
+  wsSaveModels(models);
+  if (wsNameEl) wsNameEl.value = '';
+  wsRenderModels();
+  stageRenderModels(); // the jam room's stage list sees it immediately
+  addSystemLine(`model "${nm}" saved — place it from the jam room stage`);
+  return true;
+}
+function wsLoadModel(name) {
+  const models = wsLoadModels();
+  const list = models[name];
+  if (!Array.isArray(list)) return false;
+  wsPushUndo();
+  wsRebuild(list);
+  if (ws.pieces.length) wsSelect(ws.pieces[0].id);
+  return true;
+}
+function wsDeleteModel(name) {
+  const models = wsLoadModels();
+  if (!(name in models)) return false;
+  delete models[name];
+  wsSaveModels(models);
+  wsRenderModels();
+  stageRenderModels();
+  return true;
+}
+function wsRenderPieces() {
+  if (!wsPiecesEl) return;
+  wsPiecesEl.innerHTML = '';
+  if (!ws.pieces.length) {
+    const d = document.createElement('div');
+    d.className = 'ws-empty';
+    d.textContent = 'nothing built yet — add a piece above';
+    wsPiecesEl.appendChild(d);
+    return;
+  }
+  for (const p of ws.pieces) {
+    const b = document.createElement('button');
+    b.textContent = `${p.type} ${p.id}`;
+    b.classList.toggle('sel', p.id === ws.sel);
+    b.setAttribute('aria-label', `select ${p.type} ${p.id}`);
+    b.addEventListener('click', () => { wsSelect(p.id); b.blur(); });
+    wsPiecesEl.appendChild(b);
+  }
+}
+function wsRenderEdit() {
+  const p = wsFind(ws.sel);
+  if (wsEditEl) wsEditEl.hidden = !p;
+  if (!p || !wsXEl) return;
+  wsEditNameEl.textContent = `${p.type} ${p.id}`;
+  wsXEl.value = p.mesh.position.x.toFixed(2);
+  wsYEl.value = p.mesh.position.y.toFixed(2);
+  wsZEl.value = p.mesh.position.z.toFixed(2);
+  wsRotEl.value = Math.round(((p.mesh.rotation.y * 180) / Math.PI % 360 + 360) % 360);
+  wsSizeEl.value = Math.round(p.mesh.scale.x * 100);
+  try { wsColorEl.value = '#' + p.mesh.material.color.getHexString(); } catch (e) {}
+  if (wsUndoEl) wsUndoEl.classList.toggle('off', !ws.undoStack.length);
+}
+function wsRenderModels() {
+  if (!wsModelsEl) return;
+  wsModelsEl.innerHTML = '';
+  const models = wsLoadModels();
+  const names = Object.keys(models).sort();
+  if (!names.length) {
+    const d = document.createElement('div');
+    d.className = 'ws-empty';
+    d.textContent = 'no saved models yet';
+    wsModelsEl.appendChild(d);
+    return;
+  }
+  for (const name of names) {
+    const row = document.createElement('div');
+    row.className = 'ws-model-row';
+    const load = document.createElement('button');
+    load.className = 'ws-model-load';
+    const count = Array.isArray(models[name]) ? models[name].length : 0;
+    load.textContent = `${name} (${count})`;
+    load.setAttribute('aria-label', `load model ${name}`);
+    load.addEventListener('click', () => { wsLoadModel(name); load.blur(); });
+    const del = document.createElement('button');
+    del.className = 'ws-model-del';
+    del.innerHTML = '&#10005;';
+    del.setAttribute('aria-label', `delete model ${name}`);
+    del.addEventListener('click', () => { wsDeleteModel(name); del.blur(); });
+    row.appendChild(load);
+    row.appendChild(del);
+    wsModelsEl.appendChild(row);
+  }
+}
+function setWorkshopPanel(open) {
+  ws.open = !!open;
+  if (workshopPanel) workshopPanel.style.display = ws.open ? '' : 'none';
+  if (ws.open) { wsRenderPieces(); wsRenderEdit(); wsRenderModels(); }
+}
+if (workshopBtn) workshopBtn.addEventListener('click', () => { setWorkshopPanel(!ws.open); workshopBtn.blur(); });
+if (workshopCloseBtn) workshopCloseBtn.addEventListener('click', () => setWorkshopPanel(false));
+if (wsAddEl) {
+  wsAddEl.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => { wsAdd(b.dataset.prim); b.blur(); });
+  });
+}
+if (wsUndoEl) wsUndoEl.addEventListener('click', () => { wsUndo(); wsRenderEdit(); wsUndoEl.blur(); });
+if (wsDeleteEl) wsDeleteEl.addEventListener('click', () => { wsDelete(); wsDeleteEl.blur(); });
+if (wsSaveEl) wsSaveEl.addEventListener('click', () => { wsSaveModel(); wsSaveEl.blur(); });
+for (const el of [wsXEl, wsYEl, wsZEl, wsRotEl, wsSizeEl, wsColorEl]) {
+  if (!el) continue;
+  el.addEventListener('pointerdown', wsArmUndo);
+  el.addEventListener('input', () => { wsApplyEdit(); });
+  el.addEventListener('change', () => { ws.undoArmed = false; });
+}
+
+/* ---------------- the stage builder (build 66) ----------------
+   In the jam UI: saved models (built ONLY in the model room — no
+   modeling here) drop onto the sound room stage in front of the DJ
+   booth. The layout persists and rides to everyone in the room. */
+const stage = {
+  items: [], // {id, model, p:[x,y,z], ry, s}
+  sel: null,
+  nextId: 1,
+};
+const STAGE_MAX_ITEMS = 24;
+
+const jamStageModelsEl = document.getElementById('jam-stage-models');
+const jamStagePlacedEl = document.getElementById('jam-stage-placed');
+const jamStageEditEl = document.getElementById('jam-stage-edit');
+const jamStageEditNameEl = document.getElementById('jam-stage-edit-name');
+const jamStageXEl = document.getElementById('jam-stage-x');
+const jamStageYEl = document.getElementById('jam-stage-y');
+const jamStageZEl = document.getElementById('jam-stage-z');
+const jamStageRotEl = document.getElementById('jam-stage-rot');
+const jamStageSizeEl = document.getElementById('jam-stage-size');
+const jamStageDeleteEl = document.getElementById('jam-stage-delete');
+const jamStageClearEl = document.getElementById('jam-stage-clear');
+
+function stagePersist() {
+  try { localStorage.setItem('limbo_stage_v1', JSON.stringify(stage.items)); } catch (e) {}
+}
+function stageLoad() {
+  let list = [];
+  try { list = JSON.parse(localStorage.getItem('limbo_stage_v1') || '[]'); } catch (e) {}
+  stage.items = (Array.isArray(list) ? list : []).map(stageSanitizeItem).filter(Boolean);
+  stage.sel = null;
+  stage.nextId = stage.items.reduce((m, it) => Math.max(m, it.id || 0), 0) + 1;
+}
+function stageSanitizeItem(it) {
+  if (!it || typeof it !== 'object' || typeof it.model !== 'string') return null;
+  const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+  const p = Array.isArray(it.p) ? it.p : [0, 0, 0];
+  return {
+    id: Math.max(1, Math.round(num(it.id, 0)) || 0),
+    model: it.model.slice(0, 24),
+    p: [num(p[0], 0), num(p[1], 0), num(p[2], 0)],
+    ry: num(it.ry, 0),
+    s: Math.max(0.05, Math.min(8, num(it.s, 1))),
+  };
+}
+function stageGroup() {
+  return worlds && worlds.soundroom && worlds.soundroom.anim
+    ? worlds.soundroom.anim.stageGroup : null;
+}
+/* Rebuild the 3D stage from the layout. */
+function stageRebuild() {
+  const g = stageGroup();
+  if (!g) return;
+  modelDisposeGroup(g);
+  const models = wsLoadModels();
+  for (const it of stage.items) {
+    const specs = models[it.model];
+    if (!Array.isArray(specs) || !specs.length) continue; // model deleted — skip
+    const item = new THREE.Group();
+    for (const spec of specs) {
+      const s = wsSanitizeSpec(spec);
+      if (!s) continue;
+      const mesh = modelPieceMesh(s.t, s.c);
+      mesh.position.set(s.p[0], s.p[1], s.p[2]);
+      mesh.rotation.y = s.ry;
+      mesh.scale.setScalar(s.s);
+      item.add(mesh);
+    }
+    item.position.set(it.p[0], it.p[1], it.p[2]);
+    item.rotation.y = it.ry;
+    item.scale.setScalar(it.s);
+    g.add(item);
+  }
+}
+function stageFind(id) { return stage.items.find((it) => it.id === id) || null; }
+function stagePlace(modelName, quiet) {
+  if (stage.items.length >= STAGE_MAX_ITEMS) {
+    addSystemLine('the stage is full — remove something first');
+    return false;
+  }
+  const models = wsLoadModels();
+  if (!models[modelName] || !models[modelName].length) return false;
+  const it = {
+    id: stage.nextId++, model: modelName,
+    p: [0, 0, 0], ry: 0, s: 1,
+  };
+  stage.items.push(it);
+  stage.sel = it.id;
+  stagePersist();
+  stageRebuild();
+  stageRenderPlaced();
+  stageRenderEdit();
+  if (!quiet) stageBroadcast();
+  return true;
+}
+function stageSelect(id) {
+  stage.sel = stageFind(id) ? id : null;
+  stageRenderPlaced();
+  stageRenderEdit();
+}
+function stageApplyEdit() {
+  const it = stageFind(stage.sel);
+  if (!it || !jamStageXEl) return false;
+  it.p = [+jamStageXEl.value, +jamStageYEl.value, +jamStageZEl.value];
+  it.ry = (+jamStageRotEl.value * Math.PI) / 180;
+  it.s = Math.max(0.05, +jamStageSizeEl.value / 100);
+  stagePersist();
+  stageRebuild();
+  return true;
+}
+function stageDelete(quiet) {
+  const it = stageFind(stage.sel);
+  if (!it) return false;
+  stage.items = stage.items.filter((q) => q.id !== it.id);
+  stage.sel = null;
+  stagePersist();
+  stageRebuild();
+  stageRenderPlaced();
+  stageRenderEdit();
+  if (!quiet) stageBroadcast();
+  return true;
+}
+function stageClear(quiet) {
+  if (!stage.items.length) return false;
+  stage.items = [];
+  stage.sel = null;
+  stagePersist();
+  stageRebuild();
+  stageRenderPlaced();
+  stageRenderEdit();
+  if (!quiet) stageBroadcast();
+  return true;
+}
+/* The room shares one stage: layout changes ride a room broadcast. */
+function stageBroadcast() {
+  if (net.enabled && net.sendStageSync && active && active.key === SOUND_ROOM_KEY) {
+    try { net.sendStageSync({ layout: stage.items }); } catch (e) {}
+  }
+}
+function handleStageSync(peerId, d) {
+  if (!d || !Array.isArray(d.layout)) return;
+  stage.items = d.layout.map(stageSanitizeItem).filter(Boolean);
+  stage.nextId = stage.items.reduce((m, it) => Math.max(m, it.id || 0), 0) + 1;
+  stage.sel = null;
+  stagePersist();
+  stageRebuild();
+  stageRenderPlaced();
+  stageRenderEdit();
+}
+function handleStageReq(peerId, d) {
+  if (stage.items.length && net.enabled && net.sendStageSync) {
+    try { net.sendStageSync({ layout: stage.items }); } catch (e) {}
+  }
+}
+function stageRenderModels() {
+  if (!jamStageModelsEl) return;
+  jamStageModelsEl.innerHTML = '';
+  const names = Object.keys(wsLoadModels()).sort();
+  if (!names.length) {
+    const d = document.createElement('div');
+    d.className = 'jam-stage-empty';
+    d.textContent = 'no saved models — build one in the model room';
+    jamStageModelsEl.appendChild(d);
+    return;
+  }
+  for (const name of names) {
+    const b = document.createElement('button');
+    b.textContent = '+ ' + name;
+    b.setAttribute('aria-label', `place ${name} on the stage`);
+    b.addEventListener('click', () => { stagePlace(name); b.blur(); });
+    jamStageModelsEl.appendChild(b);
+  }
+}
+function stageRenderPlaced() {
+  if (!jamStagePlacedEl) return;
+  jamStagePlacedEl.innerHTML = '';
+  if (!stage.items.length) {
+    const d = document.createElement('div');
+    d.className = 'jam-stage-empty';
+    d.textContent = 'the stage is empty';
+    jamStagePlacedEl.appendChild(d);
+    return;
+  }
+  for (const it of stage.items) {
+    const b = document.createElement('button');
+    b.textContent = it.model;
+    b.classList.toggle('sel', it.id === stage.sel);
+    b.setAttribute('aria-label', `tweak ${it.model} on the stage`);
+    b.addEventListener('click', () => { stageSelect(it.id); b.blur(); });
+    jamStagePlacedEl.appendChild(b);
+  }
+}
+function stageRenderEdit() {
+  const it = stageFind(stage.sel);
+  if (jamStageEditEl) jamStageEditEl.hidden = !it;
+  if (!it || !jamStageXEl) return;
+  jamStageEditNameEl.textContent = it.model;
+  jamStageXEl.value = it.p[0];
+  jamStageYEl.value = it.p[1];
+  jamStageZEl.value = it.p[2];
+  jamStageRotEl.value = Math.round(((it.ry * 180) / Math.PI % 360 + 360) % 360);
+  jamStageSizeEl.value = Math.round(it.s * 100);
+}
+if (jamStageDeleteEl) jamStageDeleteEl.addEventListener('click', () => { stageDelete(); jamStageDeleteEl.blur(); });
+if (jamStageClearEl) jamStageClearEl.addEventListener('click', () => { stageClear(); jamStageClearEl.blur(); });
+for (const el of [jamStageXEl, jamStageYEl, jamStageZEl, jamStageRotEl, jamStageSizeEl]) {
+  if (!el) continue;
+  el.addEventListener('input', () => { stageApplyEdit(); });
+  el.addEventListener('change', () => { stageBroadcast(); }); // one broadcast per gesture
+}
+/* Stage + FOH sections live only in the sound room. */
+function renderJamStageFoh() {
+  const inSound = !!(active && active.key === SOUND_ROOM_KEY);
+  for (const id of ['jam-stage-sub', 'jam-stage', 'jam-foh-sub', 'jam-foh']) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = inSound ? '' : 'none';
+  }
+  if (inSound) { stageRenderModels(); stageRenderPlaced(); stageRenderEdit(); }
+}
+
+/* ---------------- front of house (build 66) ----------------
+   Lighting + room FX for the sound room: ambient color/glow, two colored
+   spotlights, haze color/thickness, strobe, booth glow. Live on the rig,
+   persisted, and riding to everyone in the room. */
+const FOH_DEFAULTS = {
+  ambColor: '#99aacc', ambInt: 0.5,          // matches the room's original look
+  spot1: '#ffc24d', spot2: '#ffc24d', spotInt: 1.2,
+  fogColor: '#0a0610', fogDensity: 0.012,
+  strobe: false, strobeRate: 8,
+  glowInt: 0.58,
+  touched: false, // the community wall tints the room until FOH is touched
+};
+const foh = { ...FOH_DEFAULTS };
+
+const fohAmbColorEl = document.getElementById('foh-amb-color');
+const fohAmbIntEl = document.getElementById('foh-amb-int');
+const fohSpot1El = document.getElementById('foh-spot1');
+const fohSpot2El = document.getElementById('foh-spot2');
+const fohSpotIntEl = document.getElementById('foh-spot-int');
+const fohFogColorEl = document.getElementById('foh-fog-color');
+const fohFogDensityEl = document.getElementById('foh-fog-density');
+const fohStrobeEl = document.getElementById('foh-strobe');
+const fohStrobeRateEl = document.getElementById('foh-strobe-rate');
+const fohGlowEl = document.getElementById('foh-glow');
+const fohResetEl = document.getElementById('foh-reset');
+
+function fohPersist() {
+  try { localStorage.setItem('limbo_foh_v1', JSON.stringify(foh)); } catch (e) {}
+}
+function fohRestore() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem('limbo_foh_v1') || 'null'); } catch (e) {}
+  if (saved && typeof saved === 'object') {
+    for (const k of Object.keys(FOH_DEFAULTS)) {
+      if (saved[k] !== undefined) foh[k] = saved[k];
+    }
+  }
+  fohSyncUI();
+  soundFohApplyLive();
+}
+/* Push the foh object into the inputs. */
+function fohSyncUI() {
+  if (!fohAmbColorEl) return;
+  fohAmbColorEl.value = foh.ambColor;
+  fohAmbIntEl.value = Math.round(foh.ambInt * 100);
+  fohSpot1El.value = foh.spot1;
+  fohSpot2El.value = foh.spot2;
+  fohSpotIntEl.value = Math.round(foh.spotInt * 100);
+  fohFogColorEl.value = foh.fogColor;
+  fohFogDensityEl.value = Math.round((foh.fogDensity / 0.04) * 100);
+  fohStrobeEl.checked = !!foh.strobe;
+  fohStrobeRateEl.value = foh.strobeRate;
+  fohGlowEl.value = Math.round(foh.glowInt * 100);
+}
+/* Read the inputs into the foh object. */
+function fohReadUI() {
+  if (!fohAmbColorEl) return;
+  foh.ambColor = fohAmbColorEl.value;
+  foh.ambInt = +fohAmbIntEl.value / 100;
+  foh.spot1 = fohSpot1El.value;
+  foh.spot2 = fohSpot2El.value;
+  foh.spotInt = +fohSpotIntEl.value / 100;
+  foh.fogColor = fohFogColorEl.value;
+  foh.fogDensity = (+fohFogDensityEl.value / 100) * 0.04;
+  foh.strobe = !!fohStrobeEl.checked;
+  foh.strobeRate = Math.max(1, Math.min(20, +fohStrobeRateEl.value || 8));
+  foh.glowInt = +fohGlowEl.value / 100;
+  foh.touched = true;
+}
+function fohApplyPatch(patch, broadcast) {
+  if (patch && typeof patch === 'object') Object.assign(foh, patch);
+  foh.touched = true;
+  fohSyncUI();
+  soundFohApplyLive();
+  fohPersist();
+  if (broadcast) fohBroadcast();
+}
+function fohReset() {
+  Object.assign(foh, FOH_DEFAULTS, { touched: true });
+  fohSyncUI();
+  soundFohApplyLive();
+  fohPersist();
+  fohBroadcast();
+}
+function fohBroadcast() {
+  if (net.enabled && net.sendFohSync && active && active.key === SOUND_ROOM_KEY) {
+    try { net.sendFohSync({ foh: { ...foh } }); } catch (e) {}
+  }
+}
+function handleFohSync(peerId, d) {
+  if (!d || !d.foh || typeof d.foh !== 'object') return;
+  for (const k of Object.keys(FOH_DEFAULTS)) {
+    if (d.foh[k] !== undefined) foh[k] = d.foh[k];
+  }
+  foh.touched = true;
+  fohSyncUI();
+  soundFohApplyLive();
+  fohPersist();
+}
+function handleFohReq(peerId, d) {
+  if (foh.touched && net.enabled && net.sendFohSync) {
+    try { net.sendFohSync({ foh: { ...foh } }); } catch (e) {}
+  }
+}
+/* FOH wins over the community-wall tint and the idle light code, but only
+   once the drifter has touched the board. */
+function soundFohApply(anim, t) {
+  const f = anim && anim.foh;
+  if (!f || !f.touched) return;
+  try {
+    anim.amb.color.set(f.ambColor);
+    anim.lightA.color.set(f.spot1);
+    anim.lightB.color.set(f.spot2);
+    const bassPulse = 1 + (anim.bass || 0) * 2.2;
+    let dim = 1, ambDim = 1;
+    if (f.strobe) {
+      const on = Math.sin(t * f.strobeRate * Math.PI * 2) > 0;
+      dim = on ? 1 : 0.08;
+      ambDim = on ? 1 : 0.25;
+    }
+    anim.amb.intensity = f.ambInt * ambDim;
+    anim.lightA.intensity = f.spotInt * bassPulse * dim;
+    anim.lightB.intensity = f.spotInt * bassPulse * dim;
+    anim.scene.fog.color.set(f.fogColor);
+    anim.scene.fog.density = f.fogDensity + (anim.bass || 0) * 0.008;
+    anim.boothGlow.material.opacity = 0.15 + f.glowInt * 0.6;
+  } catch (e) {}
+}
+function soundFohApplyLive() {
+  const a = worlds && worlds.soundroom && worlds.soundroom.anim;
+  if (a) soundFohApply(a, performance.now() / 1000);
+}
+function fohUiChanged(broadcast) {
+  fohReadUI();
+  soundFohApplyLive();
+  fohPersist();
+  if (broadcast) fohBroadcast();
+}
+for (const el of [fohAmbColorEl, fohAmbIntEl, fohSpot1El, fohSpot2El, fohSpotIntEl,
+                  fohFogColorEl, fohFogDensityEl, fohStrobeEl, fohStrobeRateEl, fohGlowEl]) {
+  if (!el) continue;
+  el.addEventListener('input', () => fohUiChanged(false));   // live, local
+  el.addEventListener('change', () => fohUiChanged(true)); // one broadcast per gesture
+}
+if (fohResetEl) fohResetEl.addEventListener('click', () => { fohReset(); fohResetEl.blur(); });
 
 /* ================= the endless journey (build 33; open field in 36) =================
    Album-release room: free flight like the Nexus across one big open field
@@ -8802,7 +9341,7 @@ function buildNexus(textures) {
 
   const portals = [];
   // The 4 realm portals + the sound room portal (build 12) + the endless
-  // journey portal (build 33).
+  // journey portal (build 33) + the model room portal (build 66).
   const portalDefs = REALM_DEFS.map((def) => ({
     key: def.key, name: def.name, accent: def.accent, tex: textures[def.key],
   })).concat([{
@@ -8811,6 +9350,9 @@ function buildNexus(textures) {
   }, {
     key: JOURNEY_DEF.key, name: JOURNEY_DEF.name, accent: JOURNEY_DEF.accent,
     tex: makeJourneyTexture(),
+  }, {
+    key: WORKSHOP_DEF.key, name: WORKSHOP_DEF.name, accent: WORKSHOP_DEF.accent,
+    tex: makeWorkshopTexture(),
   }]);
   portalDefs.forEach((def, i) => {
     const a = (i / portalDefs.length) * Math.PI * 2;
@@ -9009,6 +9551,9 @@ function finishBoot() {
     for (const def of REALM_DEFS) worlds[def.key] = buildRealm(def, textures[def.key]);
     worlds[SOUND_DEF.key] = buildSoundRoom(textures);
     worlds[JOURNEY_DEF.key] = buildJourneyRoom();
+    worlds[WORKSHOP_DEF.key] = buildWorkshop();
+    try { stageLoad(); stageRebuild(); } catch (e) { /* stage starts empty */ }
+    try { fohRestore(); } catch (e) { /* FOH starts at defaults */ }
   } catch (err) {
     // Last resort: say so on screen instead of a dead "loading…" hang.
     loadingEl.firstElementChild.textContent = 'limbo failed to wake — reload to try again';
@@ -9688,6 +10233,7 @@ function goTo(key) {
       }, 2000);
     }
     if (key === JOURNEY_ROOM_KEY) journeyOnEnter();
+    if (key === WORKSHOP_ROOM_KEY) setWorkshopPanel(true); // the bench opens itself
     // Community wall (build 18): late joiner asks the room for the current
     // canvas. Delayed so the data channel has a moment to connect; peers
     // with ink answer once per reqId (see handleWallSyncReq).
@@ -9701,6 +10247,10 @@ function goTo(key) {
           if (net.sendWallSyncReq) {
             try { net.sendWallSyncReq({ reqId, ts: wall.ts }); } catch (e) { /* best effort */ }
           }
+          // Build 66: same late-joiner pattern for the stage + FOH lights —
+          // peers already in the room answer with the current layout.
+          if (net.sendStageReq) { try { net.sendStageReq({}); } catch (e) {} }
+          if (net.sendFohReq) { try { net.sendFohReq({}); } catch (e) {} }
         }
         // Jukebox (build 21): same late-joiner pattern — ask the room for
         // the current queue + now-playing so we land in sync mid-track.
@@ -9958,6 +10508,11 @@ net.onJukeHelloCb = handleJukeHello; // build 43: holder election presence
 net.onJukeClaimCb = handleJukeClaim; // build 43: "I hold this server's line"
 net.onJukeSyncCb = handleJukeSync; // build 43: canonical queue snapshot
 net.onJukeClearCb = handleJukeClear; // build 43: anyone may clear the line
+// Stage builder + front of house (build 66): layout + light rig ride the room.
+net.onStageSyncCb = handleStageSync;
+net.onStageReqCb = handleStageReq;
+net.onFohSyncCb = handleFohSync;
+net.onFohReqCb = handleFohReq;
 /* Build 43: the relay is live — start holder election hellos and ask the
    holder for the line if we're empty (the old blind timer fired too early). */
 net.onRelayUpCb = () => { jukeStartHellos(); jukeMaybeSync(); };
@@ -10417,6 +10972,8 @@ window.__limbo = {
   couchSnapshot: () => couchNet.getDebugSnapshot(),
   // sound room (build 12)
   SOUND_DEF,
+  // model room (build 66)
+  WORKSHOP_DEF,
   // endless journey (build 33)
   JOURNEY_DEF,
   JOURNEY_ROOM_KEY,
@@ -10557,16 +11114,33 @@ window.__limbo = {
   },
   jamKeyCount: () => (jamKeysEl ? jamKeysEl.children.length : 0),
   loopState: () => ({
-    state: dub.state, bars: dub.bars, bpm: Math.round(dub.bpm),
+    state: dub.state,
     dur: dub.dur, hasBuf: !!dub.buf,
     bufLen: dub.buf ? dub.buf.length : 0, sampleRate: audio.ctx ? audio.ctx.sampleRate : 0,
     takeIdx: dub.take ? dub.take.idx : 0,
   }),
   loopMain: () => loopMainButton(),
+  loopRecord: () => loopRecord(),
+  loopClose: () => loopClose(),
+  loopPlay: () => loopPlay(),
   loopStop: () => loopStop(),
   loopClear: () => loopClear(),
-  loopSetBars: (n) => loopSetBars(n),
   loopRenderUI: () => loopRenderUI(),
+  // build 66: workshop / stage / FOH seams
+  workshopAdd: (t) => wsAdd(t),
+  workshopPieces: () => ws.pieces.map((p) => p.type),
+  workshopSave: (n) => wsSaveModel(n),
+  workshopModels: () => Object.keys(wsLoadModels()),
+  workshopLoad: (n) => wsLoadModel(n),
+  workshopState: () => ({ pieces: ws.pieces.length, sel: ws.sel, open: ws.open }),
+  stagePlace: (name) => stagePlace(name),
+  stageClear: () => stageClear(),
+  stageState: () => ({ items: stage.items.length, sel: stage.sel }),
+  fohSet: (patch) => fohApplyPatch(patch, true),
+  fohReset: () => fohReset(),
+  fohState: () => ({ ...foh }),
+  soundAnim: () => (worlds && worlds.soundroom && worlds.soundroom.anim) || null,
+  wsGroupCount: () => (wsGroup ? wsGroup.children.length : -1),
   // build 39: rhythm sequencer hooks
   seqOn: (on) => seqSetOn(on),
   seqToggle: () => seqSetOn(!seq.on),
