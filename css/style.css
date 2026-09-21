@@ -625,6 +625,75 @@ html, body {
 }
 .jam-knobs label { display: flex; align-items: center; gap: 8px; flex: 1; }
 .jam-knobs input[type="range"] { flex: 1; accent-color: #7ae0ff; }
+/* build 39: the deeper synth gets a compact 3-column knob grid. */
+.jam-knobs.cols3 {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 10px 14px;
+}
+.jam-knobs.cols3 label { min-width: 0; }
+.jam-knobs.cols3 input[type="range"] { min-width: 0; }
+/* build 39: patch presets + key-scale lock. */
+.jam-presets, .jam-scales { align-items: center; margin-top: 10px; }
+.jam-preset-label {
+  font-size: 11px; letter-spacing: 0.15em; color: var(--ink-dim);
+  text-transform: uppercase; margin-right: 2px;
+}
+.jam-preset, .jam-scale {
+  flex: 1; background: rgba(122, 224, 255, 0.06);
+  border: 1px solid rgba(122, 224, 255, 0.3); border-radius: 10px;
+  color: #bfeaff; font-family: inherit; font-size: 11px;
+  letter-spacing: 0.15em; text-transform: uppercase;
+  min-height: 40px; cursor: pointer; touch-action: manipulation;
+}
+.jam-preset.sel, .jam-scale.sel { background: rgba(122, 224, 255, 0.22); border-color: #7ae0ff; }
+.jam-preset:active, .jam-scale:active { filter: brightness(1.25); }
+/* ---------- overdub looper (build 39) ---------- */
+.jam-loop-row { display: flex; gap: 10px; align-items: center; }
+.jam-loop-len { display: flex; gap: 8px; flex: 1; }
+.jam-loop-len button {
+  flex: 1; background: rgba(122, 224, 255, 0.06);
+  border: 1px solid rgba(122, 224, 255, 0.3); border-radius: 10px;
+  color: #bfeaff; font-family: inherit; font-size: 12px;
+  min-height: 40px; cursor: pointer; touch-action: manipulation;
+}
+.jam-loop-len button.sel { background: rgba(122, 224, 255, 0.22); border-color: #7ae0ff; }
+.jam-loop-len-label {
+  font-size: 11px; letter-spacing: 0.15em; color: var(--ink-dim);
+  text-transform: uppercase;
+}
+.jam-loop-main { display: flex; gap: 12px; align-items: center; margin-top: 10px; }
+.jam-loop-btn {
+  position: relative; width: 72px; height: 72px; flex: 0 0 72px;
+  background: rgba(122, 224, 255, 0.05); border: none; border-radius: 50%;
+  cursor: pointer; touch-action: manipulation; padding: 0;
+}
+.jam-loop-btn svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+.loop-ring-bg {
+  fill: none; stroke: rgba(122, 224, 255, 0.18); stroke-width: 5;
+}
+.loop-ring {
+  fill: none; stroke: #7ae0ff; stroke-width: 5; stroke-linecap: round;
+  stroke-dasharray: 169.6; stroke-dashoffset: 169.6;
+  transition: stroke 0.2s;
+}
+.jam-loop-btn.rec .loop-ring { stroke: #ff5d5d; }
+.jam-loop-btn.dub .loop-ring { stroke: #ffc24d; }
+.loop-glyph {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: #bfeaff; font-size: 22px;
+}
+.jam-loop-btn.rec .loop-glyph { color: #ff5d5d; }
+.jam-loop-info { flex: 1; min-width: 0; }
+.jam-loop-state { font-size: 12px; color: #bfeaff; letter-spacing: 0.04em; }
+.jam-loop-meta { font-size: 11px; color: var(--ink-dim); letter-spacing: 0.1em; margin-top: 4px; }
+.jam-loop-side { display: flex; flex-direction: column; gap: 8px; }
+.jam-loop-side button {
+  background: rgba(122, 224, 255, 0.06);
+  border: 1px solid rgba(122, 224, 255, 0.3); border-radius: 10px;
+  color: #bfeaff; font-family: inherit; font-size: 14px;
+  width: 44px; min-height: 44px; cursor: pointer; touch-action: manipulation;
+}
+.jam-loop-side button:active { filter: brightness(1.3); }
 #jam-keys {
   display: flex; height: 118px; margin-top: 10px;
   border: 1px solid rgba(122, 224, 255, 0.25); border-radius: 10px;
@@ -1438,3 +1507,64 @@ html, body {
   border-radius: 8px; color: var(--ink-dim); cursor: pointer;
   touch-action: manipulation;
 }
+
+/* ---------- lead chord pads + rhythm sequencer (build 39) ---------- */
+/* multi-touch surfaces: the finger lands and the note fires — no gesture
+   arbitration stealing the second finger on these strips. */
+#jam-keys, #jam-bass-keys, #jam-drums, #jam-chords, #jam-lead-chords, #jam-seq-grid { touch-action: none; }
+.jam-chords-sub { margin-top: 10px; }
+.jam-lead-chords { display: flex; gap: 8px; margin-top: 2px; }
+.jam-lead-chord {
+  flex: 1; min-height: 52px; border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(100% 100% at 50% 0%, rgba(122, 224, 255, 0.16), rgba(122, 224, 255, 0.04));
+  border: 1px solid rgba(122, 224, 255, 0.45);
+  color: #cfeeff; font-family: inherit; font-size: 15px; letter-spacing: 0.08em;
+  cursor: pointer; touch-action: none;
+  transition: transform 0.06s ease, box-shadow 0.06s ease;
+}
+.jam-lead-chord:active {
+  transform: scale(0.92);
+  box-shadow: 0 0 20px -2px rgba(122, 224, 255, 0.8);
+  background: radial-gradient(100% 100% at 50% 0%, rgba(122, 224, 255, 0.4), rgba(122, 224, 255, 0.1));
+}
+#jam-panel.onbeat .jam-lead-chord { transform: scale(1.04); filter: brightness(1.25); }
+.jam-seq-head { display: flex; align-items: center; gap: 12px; }
+#jam-seq-toggle {
+  padding: 10px 18px; border-radius: 12px; font-family: inherit; font-size: 14px;
+  letter-spacing: 0.1em; cursor: pointer; touch-action: manipulation;
+  background: rgba(122, 224, 255, 0.06); border: 1px solid rgba(122, 224, 255, 0.4);
+  color: #cfeeff;
+}
+#jam-seq-toggle.sel {
+  background: radial-gradient(100% 100% at 50% 0%, rgba(122, 224, 255, 0.35), rgba(122, 224, 255, 0.1));
+  box-shadow: 0 0 18px -2px rgba(122, 224, 255, 0.7); color: #fff;
+}
+.jam-seq-state { font-size: 12px; color: #bfeaff; letter-spacing: 0.04em; }
+#jam-seq-grid { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.jam-seq-row { display: flex; align-items: center; gap: 3px; }
+.jam-seq-label {
+  flex: 0 0 42px; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink-dim);
+}
+.jam-seq-step {
+  flex: 1; min-height: 36px; border-radius: 6px; padding: 0;
+  background: rgba(122, 224, 255, 0.05); border: 1px solid rgba(122, 224, 255, 0.18);
+  cursor: pointer; touch-action: none;
+}
+.jam-seq-step.bar { margin-left: 5px; }
+.jam-seq-step.on {
+  background: rgba(122, 224, 255, 0.45); border-color: rgba(122, 224, 255, 0.8);
+}
+.jam-seq-step.now { box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.65); }
+.jam-seq-step.on.now { background: rgba(160, 235, 255, 0.75); }
+.jam-seq-presets { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.jam-seq-preset, #jam-seq-clear {
+  padding: 8px 14px; border-radius: 10px; font-family: inherit; font-size: 12px;
+  letter-spacing: 0.08em; cursor: pointer; touch-action: manipulation;
+  background: rgba(122, 224, 255, 0.06); border: 1px solid rgba(122, 224, 255, 0.35);
+  color: #cfeeff;
+}
+.jam-seq-preset:active, #jam-seq-clear:active { transform: scale(0.94); }
+.jam-seq-swing { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-dim); margin-left: auto; }
+.jam-seq-swing input { width: 90px; }
