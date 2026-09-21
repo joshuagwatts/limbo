@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=48';
-import { CouchNet } from './couch.js?v=48';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=49';
+import { CouchNet } from './couch.js?v=49';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
 
@@ -7110,11 +7110,14 @@ function buildSoundRoom(textures) {
    pad's root — drifting into a new land, never a loading screen. */
 
 const J_SLIPSTREAM = 1.35;    // flock speed multiplier — the whole V surges
-const J_CRUISE = 34;          // constant forward drift accel (~14 u/s terminal, like the old rail)
+const J_CRUISE = 8;           // build 49: a whisper of forward drift — flight is
+                              // nexus-style free-fly now; you only go where you steer
 const J_MIN_Y = 2.5, J_MAX_Y = 60;
 const J_FIELD_R = 560;        // hard edge of the open field (safety clamp)
 const J_FIELD_SOFT = 440;     // soft push-back begins here — fog wall, never a hard stop
 const J_ZONE_BAND = 25;       // hysteresis half-width around zone borders (no flicker)
+const J_ZONE_BLEND = 70;      // build 49: half-width of the dissolve band — the
+                              // lands bleed into each other across the borders
 /* The field is one 1120x1120 map; each quadrant is a zone.
    x<0,z<0 spires · x>0,z<0 city · x<0,z>0 dunes · x>0,z>0 grid */
 const J_ZONES = ['spires', 'city', 'dunes', 'grid'];
@@ -7131,7 +7134,13 @@ const J_ZONE_STYLE = {
   dunes:  { bg: 0x201009, fog: 0x33200f, fogD: 0.010 },
   grid:   { bg: 0x020208, fog: 0x0a0618, fogD: 0.013 },
 };
-const J_HINT = 'DRAG \u2014 STEER \u00b7 LEFT SIDE \u2014 FLY \u00b7 FLY CLOSE, FLOCK FASTER \u00b7 THE GATE AT THE CROSSROADS FLIES YOU HOME';
+// build 49: precomputed colors so the border dissolve can mix the lands
+for (const _zk of J_ZONES) {
+  const _st = J_ZONE_STYLE[_zk];
+  _st._bg = new THREE.Color(_st.bg);
+  _st._fog = new THREE.Color(_st.fog);
+}
+const J_HINT = 'DRAG \u2014 STEER \u00b7 LEFT SIDE \u2014 FLY \u00b7 FLY CLOSE, FLOCK FASTER \u00b7 TAP A RAY TO CALL IT \u00b7 THE GATE AT THE CROSSROADS FLIES YOU HOME';
 const J_SPAWN = { x: -60, y: 10, z: 140 }; // dunes, facing the crossroads gate
 
 /* Shared materials — built once when the field is built. */
@@ -7331,6 +7340,7 @@ const journey = {
   hintPrev: '',
   rings: null,        // build 41: fly-through speed rings on 3 circuits
   gems: null,         // build 41: boost gems
+  rays: null,         // build 49: manta rays — tap one nearby to call it
   boost: 1,           // build 41: proximity-graded speed multiplier
   ringBoost: 0, gemBoost: 0, // decaying bursts
   lastRing: null,     // circuit combo tracking
@@ -7587,6 +7597,9 @@ function buildJourneyRoom() {
   else for (const r of journey.rings) { r.cooldown = 0; r.flash = 0; scene.add(r.mesh); }
   if (!journey.gems) buildJourneyGems(scene);
   else for (const g of journey.gems) scene.add(g.mesh);
+  // build 49: manta rays, built once with the field
+  if (!journey.rays) buildJourneyRays(scene);
+  else for (const r of journey.rays) scene.add(r.group);
   // spawn in the dunes, facing the crossroads gate
   const spawnYaw = Math.atan2(-(0 - J_SPAWN.x), -(0 - J_SPAWN.z));
   return {
@@ -7687,6 +7700,166 @@ function buildJourneyGems(scene) {
   journey.gems = gems;
 }
 
+/* ---------------- manta rays (build 49) ----------------
+   Seven rays glide the open field on lazy seeded circles — the same
+   circles on every phone, so multiplayer shares one sky. Tap a ray when
+   you're close and it leaves its circle to follow you; tap it again (or
+   tap another ray) to let it go. Never automatic — the call is yours. */
+const J_RAYS_N = 7;
+const J_RAY_TAP_RANGE = 34; // how close you must be to call a ray
+const _raycaster = new THREE.Raycaster();
+const _raySlot = new THREE.Vector3();
+const _rayRight = new THREE.Vector3();
+const _rayUp = new THREE.Vector3(0, 1, 0);
+
+function buildJourneyRays(scene) {
+  const rnd = mulberry32(4901);
+  const bodyGeo = new THREE.SphereGeometry(1, 10, 8);
+  bodyGeo.scale(1.5, 0.38, 2.6);
+  const tailGeo = new THREE.ConeGeometry(0.14, 7, 6);
+  tailGeo.rotateX(-Math.PI / 2); // point -Z: trails behind the +Z nose
+  tailGeo.translate(0, 0, -5.2);
+  // wing: swept triangle; inner edge at the body, tip swept back.
+  // shape +Y maps to world -Z after rotateX(-90°), so the nose-ward edge
+  // sits at -Y to land at +Z (the nose).
+  const wingShape = new THREE.Shape();
+  wingShape.moveTo(0.4, -1.4);
+  wingShape.lineTo(7.2, 0.6);
+  wingShape.lineTo(5.0, 2.4);
+  wingShape.lineTo(0.4, 1.8);
+  wingShape.closePath();
+  const wingGeo = new THREE.ShapeGeometry(wingShape);
+  wingGeo.rotateX(-Math.PI / 2);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x9db8dd, roughness: 0.55, metalness: 0.15,
+    emissive: 0x14263f, emissiveIntensity: 0.5,
+    flatShading: true, side: THREE.DoubleSide,
+  });
+  const rays = [];
+  for (let i = 0; i < J_RAYS_N; i++) {
+    const g = new THREE.Group();
+    const wingR = new THREE.Mesh(wingGeo, mat);
+    const wingL = new THREE.Mesh(wingGeo, mat);
+    wingL.scale.x = -1;
+    const hit = new THREE.Mesh(
+      new THREE.SphereGeometry(7, 8, 6),
+      new THREE.MeshBasicMaterial({ visible: false }));
+    g.add(new THREE.Mesh(bodyGeo, mat), wingR, wingL,
+      new THREE.Mesh(tailGeo, mat), hit);
+    g.scale.setScalar(1.1 + rnd() * 0.7);
+    const ray = {
+      group: g, wingR, wingL, hit,
+      cx: (rnd() - 0.5) * 700, cz: (rnd() - 0.5) * 700,
+      r: 45 + rnd() * 70,
+      w: (0.05 + rnd() * 0.07) * (rnd() < 0.5 ? 1 : -1),
+      phase: rnd() * Math.PI * 2,
+      yBase: 10 + rnd() * 22,
+      bobA: 1.5 + rnd() * 2.5,
+      flapSpd: 1.6 + rnd() * 0.9,
+      following: false,
+    };
+    hit.userData.ray = ray;
+    g.position.set(ray.cx + Math.cos(ray.phase) * ray.r, ray.yBase,
+      ray.cz + Math.sin(ray.phase) * ray.r);
+    scene.add(g);
+    rays.push(ray);
+  }
+  journey.rays = rays;
+}
+
+function releaseRay(ray) {
+  ray.following = false;
+  // resume the wander from right here — no snapping back to an old circle
+  ray.cx = ray.group.position.x;
+  ray.cz = ray.group.position.z;
+  ray.r = 50;
+  ray.yBase = Math.max(6, Math.min(40, ray.group.position.y));
+}
+
+function updateJourneyRays(dt, t) {
+  if (!journey.rays) return;
+  for (const ray of journey.rays) {
+    const g = ray.group;
+    let hx, hy, hz;
+    if (ray.following) {
+      // a slot off the wisp's shoulder — a damped chase, never glued on
+      _rayRight.crossVectors(myFwd, _rayUp).normalize();
+      _raySlot.copy(wisp.position).addScaledVector(myFwd, -10)
+        .addScaledVector(_rayRight, 5);
+      _raySlot.y = Math.max(3.5, wisp.position.y + 3.5);
+      g.position.lerp(_raySlot, 1 - Math.exp(-1.7 * dt));
+      _jTmpA.copy(_raySlot).sub(g.position);
+      if (_jTmpA.lengthSq() > 0.01) _jTmpA.normalize();
+      else _jTmpA.copy(myFwd);
+      hx = _jTmpA.x; hy = _jTmpA.y; hz = _jTmpA.z;
+    } else {
+      ray.phase += ray.w * dt;
+      const dir = Math.sign(ray.w);
+      const px = ray.cx + Math.cos(ray.phase) * ray.r;
+      const pz = ray.cz + Math.sin(ray.phase) * ray.r;
+      const py = ray.yBase + Math.sin(t * 0.5 + ray.phase * 3) * ray.bobA;
+      const k = 1 - Math.exp(-3 * dt);
+      g.position.x += (px - g.position.x) * k;
+      g.position.y += (py - g.position.y) * k;
+      g.position.z += (pz - g.position.z) * k;
+      hx = -Math.sin(ray.phase) * dir; hy = 0; hz = Math.cos(ray.phase) * dir;
+    }
+    // nose toward the heading, bank into the turn
+    const wantYaw = Math.atan2(hx, hz);
+    let dy = wantYaw - g.rotation.y;
+    while (dy > Math.PI) dy -= Math.PI * 2;
+    while (dy < -Math.PI) dy += Math.PI * 2;
+    const turn = Math.max(-0.9, Math.min(0.9, dy * 2.2));
+    g.rotation.y += dy * (1 - Math.exp(-3.2 * dt));
+    const wantBank = Math.max(-0.5, Math.min(0.5, -turn * 0.55));
+    g.rotation.z += (wantBank - g.rotation.z) * (1 - Math.exp(-2.5 * dt));
+    // wingbeat — harder when it's keeping up with you
+    const spd = ray.following ? ray.flapSpd * 1.7 : ray.flapSpd;
+    const flap = Math.sin(t * spd + ray.phase * 5) * (ray.following ? 0.5 : 0.36);
+    // wingL is mirrored (scale.x = -1), so the same sign lifts both tips
+    ray.wingR.rotation.z = flap;
+    ray.wingL.rotation.z = flap;
+  }
+}
+
+/* Tap a ray: raycast the tap through the hit proxies. Only a ray within
+   call range answers — anything farther just asks you to drift closer. */
+function journeyTapRay(cx, cy) {
+  if (!journey.rays || !journey.rays.length) return;
+  if (!active || active.key !== JOURNEY_ROOM_KEY || transitioning) return;
+  _raycaster.setFromCamera({
+    x: (cx / window.innerWidth) * 2 - 1,
+    y: -(cy / window.innerHeight) * 2 + 1,
+  }, camera);
+  const hits = _raycaster.intersectObjects(journey.rays.map((r) => r.hit), false);
+  if (!hits.length) return;
+  const ray = hits[0].object.userData.ray;
+  if (!ray) return;
+  if (ray.group.position.distanceTo(wisp.position) > J_RAY_TAP_RANGE) {
+    journeyToast('drift closer to call the ray');
+    return;
+  }
+  if (ray.following) {
+    releaseRay(ray);
+    journeyToast('the ray drifts on');
+  } else {
+    const cur = journey.rays.find((r) => r.following);
+    if (cur) releaseRay(cur);
+    ray.following = true;
+    journeyToast('the ray follows you — tap it again to let go');
+  }
+}
+
+let journeyToastT = null;
+function journeyToast(msg) {
+  const el = document.getElementById('journey-toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  if (journeyToastT) clearTimeout(journeyToastT);
+  journeyToastT = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
 /* Ring pass / gem pickup: bursts, chimes, combo on the circuit path. */
 function journeyRingPass(ring) {
   ring.cooldown = 3;
@@ -7764,7 +7937,9 @@ function journeyBoostCalc(dt) {
   journey.ringBoost = Math.max(0, (journey.ringBoost || 0) - dt * 0.55);
   journey.gemBoost = Math.max(0, (journey.gemBoost || 0) - dt * 0.8);
   boost *= 1 + journey.ringBoost * 0.9 + journey.gemBoost * 0.5;
-  journey.boost = Math.min(2.6, boost);
+  const target = Math.min(2.6, boost);
+  // build 49: the surge glides in — speed never step-changes
+  journey.boost += (target - journey.boost) * (1 - Math.exp(-2.8 * dt));
   return journey.boost;
 }
 
@@ -7849,6 +8024,14 @@ function journeyMinimapDraw() {
       c.beginPath(); c.arc(mx, my, 1.8, 0, Math.PI * 2); c.fill();
     }
   }
+  // build 49: manta rays — the called one draws a touch bigger
+  if (journey.rays) {
+    c.fillStyle = 'rgba(157, 184, 221, 0.85)';
+    for (const r of journey.rays) {
+      const [mx, my] = journeyMapXY(r.group.position.x, r.group.position.z);
+      c.beginPath(); c.arc(mx, my, r.following ? 2.8 : 1.6, 0, Math.PI * 2); c.fill();
+    }
+  }
   // the gate home at the crossroads
   c.fillStyle = '#ffffff';
   c.beginPath(); c.arc(66, 66, 2.6, 0, Math.PI * 2); c.fill();
@@ -7890,6 +8073,8 @@ function journeyOnLeave() {
   albumPause();
   journey.inFlock = false;
   journey.mySlot = null;
+  // build 49: a called ray resumes its wander when you leave
+  if (journey.rays) for (const r of journey.rays) if (r.following) releaseRay(r);
   try { wispGlow.scale.set(3.2, 3.2, 1); } catch (e) {}
   try { wispCore.rotation.z = 0; } catch (e) {}
   if (zoneNameEl) zoneNameEl.classList.remove('show');
@@ -7941,7 +8126,33 @@ function updateJourney(dt, t) {
     wisp.position.lerp(_jTmpA, 1 - Math.exp(-2.2 * dt));
   }
   journey.lastSpeed = vel.length();
-  // --- zones: drifting into a new land cross-fades the world ---
+  // --- manta rays (build 49): wander or follow, wings beating ---
+  updateJourneyRays(dt, t);
+  // --- zones: the lands bleed into each other across the borders.
+  // Atmo is a continuous distance-weighted blend of the four quadrant
+  // styles, so drifting into a new land is a slow dissolve, never a flip.
+  // The banner + the pad's retune still fire once, on the dominant land
+  // (hysteresis, so the border never flickers).
+  const ZB = J_ZONE_BLEND;
+  const wx = Math.max(0, Math.min(1, (wisp.position.x + ZB) / (2 * ZB)));
+  const wz = Math.max(0, Math.min(1, (wisp.position.z + ZB) / (2 * ZB)));
+  _jBgT.setRGB(0, 0, 0);
+  _jFogT.setRGB(0, 0, 0);
+  let fogD = 0;
+  const mixZone = (w, key) => {
+    if (!w) return;
+    const st = J_ZONE_STYLE[key];
+    _jBgT.r += st._bg.r * w; _jBgT.g += st._bg.g * w; _jBgT.b += st._bg.b * w;
+    _jFogT.r += st._fog.r * w; _jFogT.g += st._fog.g * w; _jFogT.b += st._fog.b * w;
+    fogD += st.fogD * w;
+  };
+  mixZone((1 - wx) * (1 - wz), 'spires');
+  mixZone(wx * (1 - wz), 'city');
+  mixZone((1 - wx) * wz, 'dunes');
+  mixZone(wx * wz, 'grid');
+  const kk = 1 - Math.exp(-1.5 * dt);
+  scene.background.lerp(_jBgT, kk);
+  scene.fog.color.lerp(_jFogT, kk);
   const rawZone = journeyZoneAt(wisp.position.x, wisp.position.z);
   if (rawZone !== journey.zone) {
     const inBand = Math.abs(wisp.position.x) < J_ZONE_BAND || Math.abs(wisp.position.z) < J_ZONE_BAND;
@@ -7951,14 +8162,10 @@ function updateJourney(dt, t) {
       audio.setRoot(J_ZONE_ROOT[rawZone] || JOURNEY_DEF.root);
     }
   }
-  const style = J_ZONE_STYLE[journey.zone] || J_ZONE_STYLE.spires;
-  const kk = 1 - Math.exp(-1.5 * dt);
-  scene.background.lerp(_jBgT.setHex(style.bg), kk);
-  scene.fog.color.lerp(_jFogT.setHex(style.fog), kk);
   // the fog wall: the world's edge thickens the air before the soft push-back
   const hd = Math.hypot(wisp.position.x, wisp.position.z);
   const edge = sstep01((hd - J_FIELD_SOFT) / (J_FIELD_R - J_FIELD_SOFT));
-  const targetD = style.fogD + edge * 0.022;
+  const targetD = fogD + edge * 0.022;
   scene.fog.density += (targetD - scene.fog.density) * kk;
   if (journey.stars) journey.stars.position.set(wisp.position.x, 0, wisp.position.z);
   // --- the gate at the crossroads: ring turn + beacon pulse ---
@@ -8784,8 +8991,12 @@ window.addEventListener('mouseup', () => { dragging = false; });
 
 const joy = { id: null, ax: 0, ay: 0, x: 0, y: 0 };   // move stick, -1..1
 const look = { id: null, lx: 0, ly: 0 };              // look drag
+/* build 49: tap-a-ray — a quick still tap (not a drag) on the canvas is a
+   tap, routed to the journey's ray caller. Drags keep steering. */
+let tapCand = null;
 canvas.addEventListener('touchstart', (e) => {
   for (const t of e.changedTouches) {
+    if (!tapCand) tapCand = { id: t.identifier, x: t.clientX, y: t.clientY, at: performance.now() };
     if (t.clientX < window.innerWidth / 2 && joy.id === null) {
       joy.id = t.identifier; joy.ax = t.clientX; joy.ay = t.clientY; joy.x = 0; joy.y = 0;
       joyBase.style.display = 'block';
@@ -8800,6 +9011,8 @@ canvas.addEventListener('touchstart', (e) => {
 }, { passive: false });
 canvas.addEventListener('touchmove', (e) => {
   for (const t of e.changedTouches) {
+    if (tapCand && t.identifier === tapCand.id &&
+        Math.hypot(t.clientX - tapCand.x, t.clientY - tapCand.y) > 16) tapCand = null; // it's a drag, not a tap
     if (t.identifier === joy.id) {
       joy.x = Math.max(-1, Math.min(1, (t.clientX - joy.ax) / 55));
       joy.y = Math.max(-1, Math.min(1, (t.clientY - joy.ay) / 55));
@@ -8815,12 +9028,33 @@ canvas.addEventListener('touchmove', (e) => {
 }, { passive: false });
 function endTouch(e) {
   for (const t of e.changedTouches) {
+    if (tapCand && e.type === 'touchend' && t.identifier === tapCand.id) {
+      const quick = performance.now() - tapCand.at < 350;
+      const tc = tapCand;
+      tapCand = null;
+      if (quick) journeyTapRay(t.clientX, t.clientY);
+    } else if (tapCand && t.identifier === tapCand.id) {
+      tapCand = null;
+    }
     if (t.identifier === joy.id) { joy.id = null; joy.x = 0; joy.y = 0; joyBase.style.display = 'none'; }
     if (t.identifier === look.id) look.id = null;
   }
 }
 canvas.addEventListener('touchend', endTouch);
 canvas.addEventListener('touchcancel', endTouch);
+// desktop: same tap-a-ray via the mouse
+let mouseTap = null;
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse') mouseTap = { x: e.clientX, y: e.clientY, at: performance.now() };
+});
+canvas.addEventListener('pointerup', (e) => {
+  if (e.pointerType === 'mouse' && mouseTap) {
+    const quick = performance.now() - mouseTap.at < 400;
+    const still = Math.hypot(e.clientX - mouseTap.x, e.clientY - mouseTap.y) < 10;
+    mouseTap = null;
+    if (quick && still) journeyTapRay(e.clientX, e.clientY);
+  }
+});
 
 /* ---------------- portal transitions ---------------- */
 
