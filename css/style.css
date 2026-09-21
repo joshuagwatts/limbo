@@ -1568,3 +1568,87 @@ html, body {
 .jam-seq-preset:active, #jam-seq-clear:active { transform: scale(0.94); }
 .jam-seq-swing { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-dim); margin-left: auto; }
 .jam-seq-swing input { width: 90px; }
+
+/* ---------- build 40: iPhone Safari hardening ----------
+   The phone is the whole point. One block, last in the file, so it wins
+   the cascade over the legacy duplicates above. Canvas untouched. */
+
+/* iOS inflates text under ~12px and shifts layouts — lock text scaling. */
+html { -webkit-text-size-adjust: 100%; }
+
+/* iOS Safari zooms the page when a <16px input takes focus (it has ignored
+   user-scalable=no since iOS 10). All text entry rides at 16px so the
+   layout never jumps under the finger. */
+#chat-input, #name-input, #settings-name, #juke-add-url, #friend-add-input,
+#couch-join-code { font-size: 16px; }
+
+/* start overlay: clear the notch / Dynamic Island, and scroll instead of
+   clipping if the column ever runs taller than the phone. */
+#start-overlay {
+  box-sizing: border-box;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
+  overflow-y: auto;
+}
+#drift-btn { touch-action: manipulation; }
+#server-list {
+  max-height: 28vh; max-height: 28dvh; /* real viewport under the toolbar */
+  overscroll-behavior: contain; /* scroll momentum stays inside the sheet */
+}
+.server-row { touch-action: manipulation; } /* no double-tap zoom delay */
+
+/* bottom sheets: clear the home indicator, size against the real viewport. */
+#jam-panel {
+  max-height: 72vh; max-height: 72dvh;
+  padding: 12px 16px calc(28px + env(safe-area-inset-bottom));
+  overscroll-behavior: contain;
+}
+#juke-panel {
+  max-height: 72vh; max-height: 72dvh;
+  padding: 12px 16px calc(28px + env(safe-area-inset-bottom));
+  overscroll-behavior: contain;
+}
+#settings-panel {
+  top: calc(62px + env(safe-area-inset-top));
+  max-height: 72vh; max-height: 72dvh;
+  overscroll-behavior: contain;
+}
+#couch-panel {
+  max-height: 88vh; max-height: 88dvh;
+  overscroll-behavior: contain;
+}
+
+/* fixed chrome clears the notch + home indicator. */
+#gear-btn {
+  top: calc(14px + env(safe-area-inset-top));
+  left: calc(14px + env(safe-area-inset-left));
+}
+#realm-name { top: calc(22px + env(safe-area-inset-top)); }
+#echo-counter { top: calc(22px + env(safe-area-inset-top)); }
+#peer-count { top: calc(46px + env(safe-area-inset-top)); }
+#controls-hint { bottom: calc(26px + env(safe-area-inset-bottom)); }
+#mute-label {
+  bottom: calc(24px + env(safe-area-inset-bottom));
+  right: calc(26px + env(safe-area-inset-right));
+}
+#chat {
+  bottom: calc(22px + env(safe-area-inset-bottom));
+  left: calc(22px + env(safe-area-inset-left));
+}
+#net-log { left: calc(8px + env(safe-area-inset-left)); }
+#zone-name { top: calc(12% + env(safe-area-inset-top)); }
+
+/* links inside panels: no double-tap zoom delay either. */
+#juke-follow-menu a { touch-action: manipulation; }
+
+/* MIC row: the mic + mute buttons never had base styles — iOS rendered
+   them as tiny native buttons. Now they match the jam hardware. */
+#jam-mic-btn, #jam-mic-mute {
+  background: rgba(122, 224, 255, 0.08);
+  border: 1px solid rgba(122, 224, 255, 0.4); border-radius: 10px;
+  color: #bfeaff; font-family: inherit; font-size: 12px;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  min-height: 44px; padding: 10px 16px;
+  cursor: pointer; touch-action: manipulation;
+}
+#jam-mic-btn:active, #jam-mic-mute:active { background: rgba(122, 224, 255, 0.22); }
