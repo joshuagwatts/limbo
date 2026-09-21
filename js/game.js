@@ -1498,6 +1498,8 @@ const jam = {
   detector: null, // OnsetDetector for auto-BPM
   detStable: 0,
   detLast: null,
+  listen: false, // build 46: tempo listens to the jukebox through the mic
+  listenOwnsMic: false, // we opened the mic just for listening
   chain: null, // build 20: jam master bus (bus -> sends -> comp -> master)
   metro: { on: false, vol: 0.5, nextBeat: null, clicks: 0 }, // local-only metronome
   lastVoice: null, // {inst, ...} of the most recently rendered voice (test hook)
@@ -1798,6 +1800,47 @@ async function jamMicToggle() {
   const ok = await jamMicEnsureStream();
   if (ok) addSystemLine('mic is live \u2014 headphones on');
 }
+/* Build 46: "listen" - the tempo listens for the jukebox's BPM through
+   the mic. The mic hears whatever's playing (phone speaker, room PA -
+   source-agnostic, works for SoundCloud/YouTube iframes whose bytes we
+   can't tap). Detection-only: the local monitor is muted so the mic'd
+   music can't feed back through the speaker. The 1s detect tick feeds
+   this analyser to the onset detector and adopts stable estimates. */
+const jamListenEl = document.getElementById('jam-listen');
+function renderJamListen() {
+  if (!jamListenEl) return;
+  jamListenEl.classList.toggle('sel', jam.listen);
+  jamListenEl.textContent = jam.listen ? 'listening' : 'listen';
+}
+async function jamListenToggle() {
+  if (jam.listen) {
+    jam.listen = false;
+    const owned = jam.listenOwnsMic;
+    jam.listenOwnsMic = false;
+    renderJamListen();
+    // We opened the mic just to listen - give it back. If the voice mic
+    // was already live, just unmute its monitor.
+    if (owned) jamMicOff();
+    else if (jamMic.on && jamMic.local && audio.ctx) {
+      try { jamMic.local.gain.setTargetAtTime(1.0, audio.ctx.currentTime, 0.03); } catch (e) {}
+    }
+    return;
+  }
+  // Called from the tap gesture, so iOS grants the mic.
+  const already = jamMic.on;
+  const ok = await jamMicEnsureStream();
+  if (!ok || !jamMic.analyser) return;
+  jam.listenOwnsMic = !already;
+  // Detection only - mute the monitor so the room can't howl.
+  if (jamMic.local && audio.ctx) {
+    try { jamMic.local.gain.setTargetAtTime(0.0, audio.ctx.currentTime, 0.03); } catch (e) {}
+  }
+  jam.listen = true;
+  jam.detStable = 0;
+  jam.detLast = null;
+  renderJamListen();
+}
+
 
 /* Opt-in: let the voice drift into the jam bus (room space + the overdub
    looper can capture it). Off by default — voice stays live-only. */
@@ -1830,6 +1873,7 @@ function jamMicDeny(e) {
 
 function jamMicOff() {
   if (voice.tx.on) voiceTalkStop(); // talking stops when the mic dies
+  if (jam.listen) { jam.listen = false; jam.listenOwnsMic = false; renderJamListen(); }
   if (!jamMic.on && !jamMic.stream) return;
   jamMic.on = false;
   jamMic.muted = false;
@@ -2513,15 +2557,22 @@ function jamTapTempo() {
   }
 }
 
-/* Auto-BPM: once a second, feed the room bus's analyser to the onset
-   detector and adopt a stable new estimate. Runs only while we hold the
-   clock, and only until a manual override. */
+/* Auto-BPM: once a second, feed an analyser to the onset detector and
+   adopt a stable new estimate. Runs only while we hold the clock, and
+   only until a manual override. Build 46: when "listen" is on, the
+   analyser is the mic's — the mic hears the jukebox (phone speaker /
+   room PA), so the tempo follows the track, not just our instruments. */
 function jamDetectTick() {
   if (jam.manual) return;
   if (!(active && active.key === SOUND_ROOM_KEY)) return;
   if (!jamClockOurs()) return; // only the clock holder auto-detects
-  const ra = roomAnalyserGet(true);
-  const an = ra && ra.analyser;
+  let an = null;
+  if (jam.listen && jamMic.on && jamMic.analyser) {
+    an = jamMic.analyser; // listening to the jukebox through the room
+  } else {
+    const ra = roomAnalyserGet(true);
+    an = ra && ra.analyser;
+  }
   if (!an) return;
   if (!jam.detector) jam.detector = new OnsetDetector();
   const est = estimateBpm(jam.detector.process(an));
@@ -6581,6 +6632,7 @@ if (jamBtn) {
 }
 if (jamCloseBtn) jamCloseBtn.addEventListener('click', () => setJamPanel(false));
 if (jamTapEl) jamTapEl.addEventListener('click', () => { jamTapTempo(); jamTapEl.blur(); });
+if (jamListenEl) jamListenEl.addEventListener('click', () => { jamListenToggle(); jamListenEl.blur(); });
 if (jamBpmDownEl) jamBpmDownEl.addEventListener('click', () => { jamSetBpm(jam.bpm - 1, { manual: true }); jamBpmDownEl.blur(); });
 if (jamBpmUpEl) jamBpmUpEl.addEventListener('click', () => { jamSetBpm(jam.bpm + 1, { manual: true }); jamBpmUpEl.blur(); });
 if (jamGrabEl) jamGrabEl.addEventListener('click', () => { jamGrabLoop(); jamGrabEl.blur(); });
@@ -8778,6 +8830,10 @@ function goTo(key) {
     clearTrail();
     realmNameEl.textContent = active.name;
     audio.setRoot(active.root);
+    // Build 46: warm the AudioContext on the way into the sound room, so
+    // the first pad tap doesn't pay the iOS resume cost. (The "tap for
+    // sound" pill stays the honest fallback if the OS still says no.)
+    if (key === SOUND_ROOM_KEY) { try { audioEnsureRunning(); } catch (e) {} }
     // Build 22: the ambient aura ducks out in the sound room (jam,
     // jukebox and metronome all ride the game master and are unaffected).
     audio.setAuraDucked(key === SOUND_ROOM_KEY);
