@@ -252,6 +252,11 @@ class RelayLink {
     this.ready = false;
     this.tx = 0;
     this.rx = 0;
+    /* Build 44: outbox. Relay sockets connect at different times (and can
+       drop), so a page can have zero open sockets while relayMode is on.
+       Publishes in that window used to vanish silently; now they wait here
+       and flush on the next socket open. */
+    this.outbox = []; // [{ tag, obj }] — re-signed at flush time
   }
 
   tagFor(roomKey) {
@@ -310,6 +315,7 @@ class RelayLink {
       this.sockets.set(url, ws);
       this.net._netLog(`relay: socket open (${this._host(url)})`);
       for (const tag of this.subs.keys()) this._sendReq(ws, tag);
+      this._flushOutbox(); // build 44: deliver anything queued with no socket
     });
     ws.addEventListener('message', (ev) => {
       try {
@@ -464,7 +470,19 @@ class RelayLink {
       } catch (e) {}
     }
     if (sent > 0) this.tx++;
+    /* Build 44: no open socket — queue instead of dropping silently.
+       The next socket open flushes the outbox (fresh signature each time).
+       Cap keeps a long outage from growing memory. */
+    if (sent === 0 && this.outbox.length < 30) this.outbox.push({ tag, obj });
     return sent > 0;
+  }
+
+  /* Build 44: deliver anything queued while there was no socket. */
+  _flushOutbox() {
+    if (!this.outbox.length) return;
+    const pending = this.outbox;
+    this.outbox = [];
+    for (const { tag, obj } of pending) this.publish(tag, obj);
   }
 
   socketStates() {
@@ -1519,9 +1537,11 @@ export class LimboNet {
 
   /* Build 41: publish to an explicit relay tag (the server-wide jukebox
      channel). The plain _relayPublish keeps the old room-tag behavior. */
+  /* Build 44: returns true when the envelope left on at least one socket
+     (or was queued in the outbox for the next socket open). */
   _relayPublishTo(tag, actionName, data, targetCid) {
     try {
-      if (!this.relayMode || !this.relayLink || !tag) return;
+      if (!this.relayMode || !this.relayLink || !tag) return false;
       if (RELAY_SKIP_ACTIONS.has(actionName)) {
         if (!this._relaySkipLogged.has(actionName)) {
           this._relaySkipLogged.add(actionName);
@@ -1529,18 +1549,19 @@ export class LimboNet {
             `relay: ${actionName} needs a direct connection — skipped in relay mode`
           );
         }
-        return;
+        return false;
       }
       if (actionName === 'wisp') {
         const now = Date.now();
-        if (now - this._lastRelayWisp < RELAY_WISP_MIN_MS) return;
+        if (now - this._lastRelayWisp < RELAY_WISP_MIN_MS) return false;
         this._lastRelayWisp = now;
       }
       const env = { a: actionName, d: data };
       if (targetCid) env.to = targetCid;
-      this.relayLink.publish(tag, env);
+      return this.relayLink.publish(tag, env);
     } catch (e) {
       /* relay must never break the game loop */
+      return false;
     }
   }
 

@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=43';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=44';
 import { CouchNet } from './couch.js?v=41';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
@@ -285,6 +285,60 @@ let jukeHelloTimer = null;
 let jukeClaimTimer = null;
 let jukeSyncTimer = null;
 let jukeLastClearAt = 0; // Date.now() of the last clear we applied — stale snapshots can't resurrect
+/* Build 44: reliable adds. The relay mesh is best-effort broadcast — a page
+   only hears the relays it's currently socketed to, so a one-shot jukeAdd
+   can miss the holder (and the holder's repeating sync then wipes it from
+   every phone but the adder's). The adder watches the holder's syncs: if its
+   track isn't in the canonical line after a while, it re-sends until the
+   holder confirms it. */
+const jukePendingAck = new Map(); // id -> { track, sentAt, retries }
+const JUKE_ACK_MS = 20000; // wait this long for the holder's sync to confirm
+const JUKE_ACK_RETRIES = 8;
+let jukeAckTimer = null;
+const jukeRemovedIds = new Map(); // id -> Date.now() — stops a sync from resurrecting a pulled track
+function jukeTrackPending(t) {
+  try {
+    if (!t || !t.id || jukeIAmHolder) return; // holder merges locally — already canonical
+    jukePendingAck.set(t.id, { track: t, sentAt: Date.now(), retries: 0 });
+  } catch (e) {}
+}
+/* One send path for user-queued tracks: broadcast + watch for the holder's ack. */
+function jukeSendAdd(t) {
+  try {
+    if (net && net.enabled && net.sendJukeAdd) net.sendJukeAdd(t);
+  } catch (e) { /* best effort — the ack timer retries */ }
+  jukeTrackPending(t);
+}
+function jukeStartAckTimer() {
+  if (jukeAckTimer) return;
+  jukeAckTimer = setInterval(() => {
+    try {
+      if (!net || !net.enabled) return;
+      const now = Date.now();
+      // prune old remove tombstones
+      for (const [id, at] of jukeRemovedIds) {
+        if (now - at > 300000) jukeRemovedIds.delete(id);
+      }
+      if (!jukePendingAck.size) return;
+      for (const [id, p] of jukePendingAck) {
+        // user pulled it, or a clear took it — stop watching
+        if (!juke.queue.some((t) => t.id === id) && !(juke.now && juke.now.id === id)) {
+          jukePendingAck.delete(id);
+          continue;
+        }
+        if (now - p.sentAt < JUKE_ACK_MS) continue;
+        if (p.retries >= JUKE_ACK_RETRIES) {
+          jukePendingAck.delete(id);
+          jukeHint('the line didn\u2019t catch \u2018' + (p.track.title || 'that track') + '\u2019 \u2014 try queuing it again');
+          continue;
+        }
+        p.retries++;
+        p.sentAt = now;
+        try { if (net.sendJukeAdd) net.sendJukeAdd(p.track); } catch (e) {}
+      }
+    } catch (e) {}
+  }, 10000);
+}
 
 function jukeElectionKey(cid, park) {
   return (park ? '0:' : '1:') + String(cid || '');
@@ -340,6 +394,7 @@ function jukeRecomputeHolder() {
 }
 function jukeBecomeHolder() {
   jukeIAmHolder = true;
+  try { jukePendingAck.clear(); } catch (e) {} // build 44: my line is canonical now
   try { jukeHolderCid = (net && net.clientId) || null; } catch (e) {}
   jukeHolderKey = jukeMyElectionKey();
   jukeHolderName = (typeof myName === 'string' && myName) || 'drifter';
@@ -414,6 +469,7 @@ function jukeStartHellos() {
   if (jukeHelloTimer) return;
   jukeHelloTick();
   jukeHelloTimer = setInterval(() => { try { jukeHelloTick(); } catch (e) {} }, JUKE_HELLO_MS);
+  jukeStartAckTimer(); // build 44: retry loop for unconfirmed adds
 }
 let jukeHolderEl = null;
 function renderJukeHolder() {
@@ -452,11 +508,31 @@ function handleJukeSync(d, peerId) {
   jukeSyncRevSeen = d.rev;
   const incoming = Array.isArray(d.queue) ? d.queue.filter(jukeValidAdd) : [];
   const incomingIds = new Set(incoming.map((t) => t.id));
+  /* Build 44: ack pending adds against the canonical line — the holder's
+     sync including my track is the delivery confirmation. */
+  if (jukePendingAck.size) {
+    for (const id of [...jukePendingAck.keys()]) {
+      if (incomingIds.has(id)) jukePendingAck.delete(id);
+    }
+  }
   /* Keep my own just-added tracks the snapshot hasn't seen yet — my add
      broadcast is still in flight and will merge into the canonical line
      on the next round (dedupe by id keeps it single). */
   const mine = juke.queue.filter((t) => t.addedBy === myName && !incomingIds.has(t.id));
-  juke.queue = incoming.concat(mine).slice(0, JUKE_MAX_QUEUE);
+  const mineIds = new Set(mine.map((t) => t.id));
+  /* Build 44: don't let a holder snapshot that hasn't seen a fresh add yet
+     wipe it from the room. Tracks added in the last minute that the snapshot
+     is missing stay as unconfirmed — the adder's retry gets them to the
+     holder, and the next snapshot confirms them. Pulled tracks and anything
+     older than the last clear are never resurrected. */
+  const nowTs = Date.now();
+  const unconfirmed = juke.queue.filter((t) =>
+    t && !incomingIds.has(t.id) && !mineIds.has(t.id) &&
+    typeof t.addedAt === 'number' && (nowTs - t.addedAt) < 60000 &&
+    !(jukeLastClearAt && t.addedAt < jukeLastClearAt - 5000) &&
+    !jukeRemovedIds.has(t.id)
+  );
+  juke.queue = incoming.concat(mine).concat(unconfirmed).slice(0, JUKE_MAX_QUEUE);
   jukeSortQueue();
   const dn = d.now;
   if (dn && jukeValidPlay(dn) && !dn.stopped) {
@@ -475,6 +551,7 @@ function jukeClearQueue() {
   juke.now = null;
   juke.queue = [];
   jukeLastClearAt = Date.now();
+  try { jukePendingAck.clear(); } catch (e) {} // build 44: the line is gone — stop retrying
   renderJuke();
   jukeHint('the line is clear — drift on');
   try {
@@ -490,6 +567,7 @@ function handleJukeClear(d, peerId) {
   juke.now = null;
   juke.queue = [];
   jukeLastClearAt = Date.now();
+  try { jukePendingAck.clear(); } catch (e) {} // build 44: the line is gone — stop retrying
   renderJuke();
   jukeHint('the line was cleared by ' + ((d && d.by) || 'a drifter'));
   if (jukeIAmHolder) jukeBroadcastSync();
@@ -4205,9 +4283,7 @@ async function jukeAddTrack(rawUrl, titleHint) {
   }
   juke.queue.push(t);
   jukeSortQueue(); // the adder sorts too — same list as everyone else
-  if (net.enabled && net.sendJukeAdd) {
-    try { net.sendJukeAdd(t); } catch (e) { /* best effort */ }
-  }
+  jukeSendAdd(t); // build 44: broadcast + watch for the holder's ack
   renderJuke();
   // Room idle: we queued it, we start it — inside the tap gesture.
   if (!juke.now) jukeAdvance();
@@ -4262,9 +4338,7 @@ async function jukeAddPlaylist(url, det, titleHint) {
     items.push(t);
     juke.queue.push(t);
     jukeSortQueue();
-    if (net.enabled && net.sendJukeAdd) {
-      try { net.sendJukeAdd(t); } catch (e) { /* best effort */ }
-    }
+    jukeSendAdd(t); // build 44: broadcast + watch for the holder's ack
   }
   renderJuke();
   if (items.length) jukeHint(`queued ${items.length} track${items.length === 1 ? '' : 's'} — enjoy the set`);
@@ -4321,6 +4395,8 @@ function jukeRemoveTrack(id) {
     return false;
   }
   if (i !== -1) juke.queue.splice(i, 1);
+  try { jukeRemovedIds.set(id, Date.now()); } catch (e) {}
+  try { jukePendingAck.delete(id); } catch (e) {} // build 44: stop retrying a pulled track
   if (net.enabled && net.sendJukeRemove) {
     try { net.sendJukeRemove({ id, by: myName }); } catch (e) {}
   }
@@ -4331,6 +4407,8 @@ function jukeRemoveTrack(id) {
 function handleJukeRemove(d, peerId) {
   if (!jukeSrvOk(d)) return;
   if (!d || typeof d.id !== 'string') return;
+  try { jukeRemovedIds.set(d.id, Date.now()); } catch (e) {} // build 44: tombstone — a racing snapshot can't resurrect it
+  try { jukePendingAck.delete(d.id); } catch (e) {} // build 44: stop retrying a pulled track
   const i = juke.queue.findIndex((t) => t.id === d.id);
   if (i !== -1) juke.queue.splice(i, 1);
   if (juke.now && juke.now.id === d.id) {
@@ -4438,7 +4516,7 @@ async function jukeAddPhoneFile(file) {
   };
   juke.queue.push(item);
   jukeSortQueue();
-  if (net.enabled && net.sendJukeAdd) { try { net.sendJukeAdd(item); } catch (e) {} }
+  jukeSendAdd(item); // build 44: broadcast + watch for the holder's ack
   jukeHint(`\u{1F4F1} "${stem}" queued \u2014 the room pulls it from your phone when it plays`);
   renderJuke();
   if (!juke.now) jukeAdvance(); // empty room: starts now
