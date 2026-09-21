@@ -2,12 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='9' fill='%23a8c8ff'/%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23a8c8ff' stroke-opacity='0.4'/%3E%3C/svg%3E">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>LIMBO — a portal universe</title>
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=37">
+<link rel="stylesheet" href="css/style.css?v=38">
 <script type="importmap">
 {
   "imports": {
@@ -17,8 +18,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=37"></script>
-<script src="js/vendor/jsqr.js?v=37"></script>
+<script src="js/vendor/qrcode.js?v=38"></script>
+<script src="js/vendor/jsqr.js?v=38"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -305,6 +306,9 @@ if ('serviceWorker' in navigator) {
   <h1>LIMBO</h1>
   <p class="sub">a portal universe</p>
   <input id="name-input" maxlength="16" placeholder="what do other drifters call you?" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <!-- build 38: numbered servers with live headcounts, rendered once net boots -->
+  <p class="tiny server-label">pick a server</p>
+  <div id="server-list" role="listbox" aria-label="pick a server"></div>
   <button id="drift-btn" disabled>loading…</button>
   <!-- loading indicator while art textures download: in the overlay's column
        (under the button) so it can never overlap the title/subtitle -->
@@ -315,6 +319,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=37"></script>
+<script type="module" src="js/game.js?v=38"></script>
 </body>
 </html>
