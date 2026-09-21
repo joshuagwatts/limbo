@@ -102,140 +102,195 @@ export class OnsetDetector {
  * from several jammers just layer. `time` is an AudioContext timestamp.
  * All new opts are optional with musical defaults, so older {w,c,r} patches
  * from the room render exactly as before. */
-/* ---------------- polyphony guard (build 39) ----------------
- * The lead is a real instrument now: many fingers at once, chord pads,
- * stacked notes from the whole room. Cap simultaneous voices so a phone
- * never chokes — when the cap is hit, the oldest already-sounding voice
- * is gently released to make space. */
-const MAX_VOICES = 12;
-const liveVoices = []; // {oscs, g, t, life}
-let voiceCtx = null;
-function pruneVoices(ctx) {
-  const now = ctx.currentTime;
-  for (let i = liveVoices.length - 1; i >= 0; i--) {
-    if (now > liveVoices[i].life) liveVoices.splice(i, 1);
-  }
-}
-function stealVoice(ctx) {
-  const now = ctx.currentTime;
-  // Never steal a voice that hasn't started sounding yet (a remote note
-  // quantized into the future) — take the oldest live one instead.
-  const victim = liveVoices.find((v) => v.t <= now + 0.05);
-  if (!victim) return;
-  try {
-    victim.g.gain.cancelScheduledValues(now);
-    victim.g.gain.setTargetAtTime(0.0001, now, 0.03);
-    for (const o of victim.oscs) { try { o.stop(now + 0.25); } catch (e) {} }
-  } catch (e) {}
-  const i = liveVoices.indexOf(victim);
-  if (i >= 0) liveVoices.splice(i, 1);
-}
 /* Diagnostic: how many synth voices are alive right now. */
 export function synthVoiceCount() {
-  if (voiceCtx) { try { pruneVoices(voiceCtx); } catch (e) {} }
-  return liveVoices.length;
+  return SYNTH_VOICES.size;
 }
 
-export function playSynthNote(ctx, dest, opts) {
+/* ---------------- build 63: the real synth ----------------
+ * Vital-style voice: 2 oscillators + sub, resonant lowpass with its own
+ * ADSR, amp ADSR, LFO to pitch and filter, glide. synthNoteOn returns a
+ * voice id; synthNoteOff releases it. Hold a key = sustain; lift = release.
+ * playSynthNote stays as the one-shot wrapper (remote notes, sequencers). */
+const SYNTH_VOICES = new Map();
+let _synthVoiceId = 1;
+const SYNTH_MAX_VOICES = 12;
+function synthPrune() {
+  if (SYNTH_VOICES.size < SYNTH_MAX_VOICES) return;
+  let oldest = null, oldestT = Infinity;
+  for (const [id, v] of SYNTH_VOICES) {
+    if (v.t < oldestT) { oldestT = v.t; oldest = id; }
+  }
+  if (oldest != null) synthNoteOff(null, oldest, 0, true);
+}
+function synthEnv(param, t, peak, a, d, s) {
+  // Attack -> decay -> sustain (held). Returns time when sustain is reached.
+  const atk = Math.max(0.002, Math.min(2, a));
+  const dec = Math.max(0.02, Math.min(4, d));
+  const sus = Math.max(0, Math.min(1, s));
+  param.setValueAtTime(0.0001, t);
+  param.exponentialRampToValueAtTime(Math.max(0.0011, peak), t + atk);
+  param.exponentialRampToValueAtTime(Math.max(0.0011, peak * sus), t + atk + dec);
+  return t + atk + dec;
+}
+export function synthNoteOn(ctx, dest, opts) {
   const {
-    midi = 60,
-    vel = 0.9,
-    time = 0,
-    wave = 'sawtooth',
-    cutoff = 1800,
-    resonance = 5,
-    env = 0.35, // 0..1 — filter envelope amount (fraction of 6kHz added at peak)
-    decay = 0.4, // s — filter + amp decay
-    attack = 0.008, // s — amp attack
-    sub = 0, // 0..1 — sine sub-oscillator one octave down
-    spread = 12, // cents — detune spread of the osc pair
-    glide = 0, // s — portamento from fromFreq (local performance only)
-    fromFreq = 0, // Hz — glide start; ignored unless glide > 0
-    echo = 0, // 0..1 — per-voice delay/reverb send amount
-    sends = null, // [{node, gain}] — echo destinations (game's delay + conv)
+    midi = 60, vel = 0.9, time = 0,
+    osc1 = null, osc2 = null, // {wave, oct, detune, level}
+    sub = 0,
+    cutoff = 1800, reso = 5, keytrack = 0.5,
+    fAmt = 0.35, fA = 0.01, fD = 0.25, fS = 0.4, fR = 0.25,
+    aA = 0.008, aD = 0.3, aS = 0.7, aR = 0.3,
+    lfoRate = 5, lfoPitch = 0, lfoFilter = 0, // lfoPitch in cents, lfoFilter 0..1
+    glide = 0, fromFreq = 0,
+    echo = 0, sends = null,
   } = opts || {};
   try {
+    synthPrune();
     const t = Math.max(time || 0, ctx.currentTime);
-    const f = midiToFreq(midi);
-    const atk = Math.max(0.002, Math.min(0.6, Number(attack) || 0.008));
-    const dec = Math.max(0.08, Math.min(2.5, Number(decay) || 0.4));
-    const envAmt = Math.max(0, Math.min(1, Number(env) || 0)) * 6000;
-    const cut = Math.max(80, Math.min(12000, cutoff));
-    // Filter with its own envelope: opens by envAmt, settles back to cutoff.
+    const m = Math.max(0, Math.min(127, Math.round(midi)));
+    const f = midiToFreq(m);
+    const v = clampVel(vel);
+    const o1 = { wave: 'sawtooth', oct: 0, detune: 0, level: 0.85, ...(osc1 || {}) };
+    const o2 = { wave: 'sawtooth', oct: 0, detune: 8, level: 0.0, ...(osc2 || {}) };
+    // Filter: base cutoff with keytrack, plus its own ADSR opening by fAmt.
     const flt = ctx.createBiquadFilter();
     flt.type = 'lowpass';
-    flt.frequency.setValueAtTime(Math.min(14000, cut + envAmt), t);
-    flt.frequency.exponentialRampToValueAtTime(cut, t + Math.max(0.05, dec * 1.4));
-    flt.Q.value = Math.max(0, Math.min(15, resonance));
-    // Amp: quick attack, decay to a soft sustain, gentle release.
-    const g = ctx.createGain();
-    const peak = 0.32 * Math.max(0.05, Math.min(1.2, vel));
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(peak + 0.001, t + atk);
-    g.gain.exponentialRampToValueAtTime(peak * 0.55 + 0.001, t + atk + dec);
-    g.gain.setTargetAtTime(0.0001, t + atk + dec, Math.max(0.06, dec * 0.3));
-    const life = t + atk + dec * 3 + 0.6; // nodes live past the tail
-    const spr = Math.max(0, Math.min(50, Number(spread) || 0));
-    const oscs = []; // every live osc, for the polyphony guard
-    const mk = (type, detune, freqMul = 1, gainMul = 1, dur = life) => {
+    const kt = Math.pow(2, ((m - 60) / 12) * Math.max(0, Math.min(1, keytrack)));
+    const cut = Math.max(80, Math.min(12000, cutoff * kt));
+    const fPeak = Math.min(14000, cut + Math.max(0, Math.min(1, fAmt)) * 7000);
+    flt.Q.value = Math.max(0, Math.min(15, reso));
+    flt.frequency.setValueAtTime(cut, t);
+    // Filter envelope: opens to fPeak, settles to cut+fAmt*sustain portion.
+    const fSusF = cut + (fPeak - cut) * Math.max(0, Math.min(1, fS));
+    flt.frequency.exponentialRampToValueAtTime(Math.max(40, fPeak), t + Math.max(0.005, fA));
+    flt.frequency.exponentialRampToValueAtTime(Math.max(40, fSusF), t + Math.max(0.005, fA) + Math.max(0.03, fD));
+    // Amp ADSR.
+    const amp = ctx.createGain();
+    const peak = 0.3 * v;
+    synthEnv(amp.gain, t, peak, aA, aD, aS);
+    const mkOsc = (wave, freqMul, detune, level) => {
+      if (level <= 0.005) return null;
       const o = ctx.createOscillator();
-      o.type = type;
+      o.type = ['sawtooth', 'square', 'triangle', 'sine'].includes(wave) ? wave : 'sawtooth';
       const ff = f * freqMul;
-      if (glide > 0.005 && fromFreq > 20 && freqMul === 1) {
-        // portamento: slide from the last note into this one
-        o.frequency.setValueAtTime(Math.min(12000, fromFreq), t);
+      if (glide > 0.005 && fromFreq > 20) {
+        o.frequency.setValueAtTime(Math.min(12000, fromFreq * freqMul), t);
         o.frequency.exponentialRampToValueAtTime(Math.min(12000, ff), t + glide);
       } else {
         o.frequency.value = ff;
       }
       o.detune.value = detune;
-      if (gainMul !== 1) {
-        const og = ctx.createGain();
-        og.gain.value = gainMul;
-        o.connect(og);
-        og.connect(flt);
-      } else {
-        o.connect(flt);
-      }
+      const og = ctx.createGain();
+      og.gain.value = level;
+      o.connect(og); og.connect(flt);
       o.start(t);
-      o.stop(dur);
-      oscs.push(o);
       return o;
     };
-    if (wave === 'square') {
-      mk('square', -spr / 2);
-      mk('square', spr / 2);
-    } else if (wave === 'mix') {
-      mk('sawtooth', -spr / 2);
-      mk('square', spr / 2);
-    } else {
-      mk('sawtooth', -spr / 2);
-      mk('sawtooth', spr / 2);
+    const oscs = [];
+    const w1 = mkOsc(o1.wave, Math.pow(2, o1.oct || 0), o1.detune || 0, o1.level);
+    if (w1) oscs.push(w1);
+    const w2 = mkOsc(o2.wave, Math.pow(2, o2.oct || 0), o2.detune || 0, o2.level);
+    if (w2) oscs.push(w2);
+    const subAmt = Math.max(0, Math.min(1, sub));
+    if (subAmt > 0.01) {
+      const ws = mkOsc('sine', 0.5, 0, subAmt * 0.6);
+      if (ws) oscs.push(ws);
     }
-    const subAmt = Math.max(0, Math.min(1, Number(sub) || 0));
-    if (subAmt > 0.01) mk('sine', 0, 0.5, subAmt * 0.5); // weight underneath
-    flt.connect(g);
-    g.connect(dest);
-    // Per-voice echo: tap the voice into the game's delay + reverb sends.
-    const echoAmt = Math.max(0, Math.min(1, Number(echo) || 0));
+    // LFO: sine -> pitch (cents) and filter (Hz, bipolar around base).
+    let lfo = null;
+    const lp = Math.max(0, Math.min(1200, lfoPitch));
+    const lf = Math.max(0, Math.min(1, lfoFilter));
+    if ((lp > 1 || lf > 0.01) && lfoRate > 0.05) {
+      lfo = ctx.createOscillator();
+      lfo.type = 'sine';
+      lfo.frequency.value = Math.max(0.05, Math.min(30, lfoRate));
+      if (lp > 1) {
+        const lg = ctx.createGain(); lg.gain.value = lp;
+        lfo.connect(lg);
+        for (const o of oscs) { try { lg.connect(o.detune); } catch (e) {} }
+      }
+      if (lf > 0.01) {
+        const fg = ctx.createGain(); fg.gain.value = lf * 2500;
+        lfo.connect(fg);
+        try { fg.connect(flt.frequency); } catch (e) {}
+      }
+      lfo.start(t);
+    }
+    flt.connect(amp);
+    amp.connect(dest);
+    const echoAmt = Math.max(0, Math.min(1, echo || 0));
     if (echoAmt > 0.01 && Array.isArray(sends)) {
       for (const s of sends) {
         if (!s || !s.node) continue;
         const sg = ctx.createGain();
         sg.gain.value = echoAmt * Math.max(0, Math.min(1, Number(s.gain) || 0.5));
-        g.connect(sg);
+        amp.connect(sg);
         try { sg.connect(s.node); } catch (e) { try { sg.disconnect(); } catch (e2) {} }
       }
     }
-    // Polyphony guard: cap simultaneous voices, stealing the oldest live
-    // one when a new note needs the space. Keeps chords + fast fingers
-    // smooth on a phone.
-    pruneVoices(ctx);
-    if (liveVoices.length >= MAX_VOICES) stealVoice(ctx);
-    liveVoices.push({ oscs, g, t, life });
-    voiceCtx = ctx;
-  } catch (e) {
-    /* a missed note is better than a crashed frame */
+    const id = _synthVoiceId++;
+    SYNTH_VOICES.set(id, {
+      id, t, oscs, flt, amp, lfo,
+      aR: Math.max(0.02, Math.min(3, aR)),
+      fR: Math.max(0.02, Math.min(3, fR)),
+      fSusF, peak, aS: Math.max(0, Math.min(1, aS)),
+      released: false,
+    });
+    return id;
+  } catch (e) { return 0; }
+}
+export function synthNoteOff(ctx, id, when = 0, steal = false) {
+  const v = SYNTH_VOICES.get(id);
+  if (!v) return;
+  SYNTH_VOICES.delete(id);
+  try {
+    const t = Math.max(when || 0, ctx ? ctx.currentTime : 0);
+    const rel = steal ? 0.03 : v.aR;
+    const fRel = steal ? 0.03 : v.fR;
+    // Hold the live value, then glide to silence.
+    for (const p of [v.amp.gain, v.flt.frequency]) {
+      try {
+        if (p.cancelAndHoldAtTime) p.cancelAndHoldAtTime(t);
+        else p.cancelScheduledValues(t);
+      } catch (e) {}
+    }
+    v.amp.gain.setTargetAtTime(0.0001, t, Math.max(0.008, rel / 4));
+    v.flt.frequency.setTargetAtTime(Math.max(40, v.fSusF * 0.5), t, Math.max(0.008, fRel / 4));
+    const stopAt = t + rel + 0.15;
+    for (const o of v.oscs) { try { o.stop(stopAt); } catch (e) {} }
+    if (v.lfo) { try { v.lfo.stop(stopAt); } catch (e) {} }
+  } catch (e) { /* ignore */ }
+}
+export function synthAllOff(ctx) {
+  for (const id of [...SYNTH_VOICES.keys()]) synthNoteOff(ctx, id, 0);
+}
+
+/* One-shot wrapper: the pocket synth the room already knows. Implemented
+ * on the real voice — note on, then auto-release after the decay. Reads
+ * both the legacy flat patch and the build-63 full patch. */
+export function playSynthNote(ctx, dest, opts) {
+  const o = opts || {};
+  const spread = Number(o.spread) || 0;
+  const wave = o.wave || 'sawtooth';
+  const id = synthNoteOn(ctx, dest, {
+    ...o,
+    osc1: { wave, oct: 0, detune: -spread / 2, level: 0.85 },
+    osc2: {
+      wave: o.wave2 || (wave === 'mix' ? 'square' : wave),
+      oct: 0, detune: spread / 2,
+      level: o.osc2mix != null ? o.osc2mix : (wave === 'mix' ? 0.7 : 0.85),
+    },
+    aA: o.attack, aD: o.decay,
+    aS: o.sustain != null ? o.sustain : 0.55,
+    aR: o.release != null ? o.release : Math.max(0.15, (o.decay || 0.4) * 0.6),
+    fAmt: o.env, fA: 0.008, fD: (o.decay || 0.4) * 1.2, fS: 0.35, fR: 0.2,
+    lfoRate: o.lfoRate || 5, lfoPitch: o.lfoPitch || 0, lfoFilter: o.lfoFilter || 0,
+  });
+  if (id) {
+    const hold = Math.max(0.05, (o.attack || 0.008) + (o.decay || 0.4));
+    const ctxRef = ctx;
+    setTimeout(() => synthNoteOff(ctxRef, id, 0), hold * 1000);
   }
 }
 
@@ -309,13 +364,96 @@ export function playBassNote(ctx, dest, opts) {
 
 /* DRUMS: fully synthesized kit. kick = sine pitch drop, snare/clap =
  * filtered noise + body, hats/shaker = highpassed noise. */
+/* DRUM KITS (build 63): every pad carries a kit of variations — real
+ * synthesized "samples" with distinct character. renderDrumKits() bakes
+ * each variation to an AudioBuffer once (offline); pads then trigger
+ * buffer playback: instant, consistent, zero downloads. variant 0 of
+ * each kit is the legacy voice, so old code and old peers keep working. */
+export const DRUM_KITS = {
+  kick: [
+    { name: 'punch', hits: [
+      { k: 'tone', type: 'sine', f0: 155, f1: 44, dur: 0.26, peak: 0.95 },
+      { k: 'noise', fType: 'highpass', freq: 4000, q: 0.7, dur: 0.03, peak: 0.25 } ] },
+    { name: 'boom', hits: [
+      { k: 'tone', type: 'sine', f0: 120, f1: 36, dur: 0.55, peak: 1.0 } ] },
+    { name: 'hard', hits: [
+      { k: 'tone', type: 'sine', f0: 165, f1: 40, dur: 0.22, peak: 1.0, drive: 14 },
+      { k: 'noise', fType: 'highpass', freq: 5200, q: 0.7, dur: 0.02, peak: 0.3 } ] },
+    { name: 'soft', hits: [
+      { k: 'tone', type: 'sine', f0: 130, f1: 55, dur: 0.18, peak: 0.7 } ] },
+  ],
+  snare: [
+    { name: 'crack', hits: [
+      { k: 'noise', fType: 'bandpass', freq: 1900, q: 0.9, dur: 0.17, peak: 0.6 },
+      { k: 'tone', type: 'triangle', f0: 196, f1: 150, dur: 0.11, peak: 0.35 } ] },
+    { name: 'deep', hits: [
+      { k: 'noise', fType: 'bandpass', freq: 1200, q: 0.8, dur: 0.22, peak: 0.65 },
+      { k: 'tone', type: 'triangle', f0: 150, f1: 105, dur: 0.16, peak: 0.45 } ] },
+    { name: 'tight', hits: [
+      { k: 'noise', fType: 'bandpass', freq: 2600, q: 1.0, dur: 0.11, peak: 0.55 },
+      { k: 'tone', type: 'triangle', f0: 230, f1: 180, dur: 0.08, peak: 0.3 } ] },
+    { name: 'rim', hits: [
+      { k: 'noise', fType: 'highpass', freq: 4500, q: 0.8, dur: 0.04, peak: 0.5 },
+      { k: 'tone', type: 'square', f0: 800, f1: 700, dur: 0.03, peak: 0.22 } ] },
+  ],
+  clap: [
+    { name: 'clap', hits: [
+      { k: 'noise', fType: 'bandpass', freq: 1300, q: 1.4, dur: 0.09, peak: 0.5 },
+      { k: 'noise', fType: 'bandpass', freq: 1300, q: 1.4, dur: 0.09, peak: 0.5, at: 0.014 },
+      { k: 'noise', fType: 'bandpass', freq: 1300, q: 1.4, dur: 0.2, peak: 0.55, at: 0.028 } ] },
+    { name: 'snap', hits: [
+      { k: 'noise', fType: 'bandpass', freq: 2200, q: 1.6, dur: 0.06, peak: 0.5 },
+      { k: 'noise', fType: 'bandpass', freq: 2200, q: 1.6, dur: 0.12, peak: 0.55, at: 0.012 } ] },
+  ],
+  chat: [
+    { name: 'tight', hits: [
+      { k: 'noise', fType: 'highpass', freq: 8200, q: 0.7, dur: 0.05, peak: 0.32 } ] },
+    { name: 'crisp', hits: [
+      { k: 'noise', fType: 'highpass', freq: 9600, q: 0.7, dur: 0.04, peak: 0.3 } ] },
+    { name: 'dark', hits: [
+      { k: 'noise', fType: 'highpass', freq: 6800, q: 0.7, dur: 0.06, peak: 0.32 } ] },
+    { name: 'tick', hits: [
+      { k: 'noise', fType: 'highpass', freq: 9000, q: 0.9, dur: 0.025, peak: 0.28 } ] },
+  ],
+  ohat: [
+    { name: 'open', hits: [
+      { k: 'noise', fType: 'highpass', freq: 7600, q: 0.7, dur: 0.32, peak: 0.3 } ] },
+    { name: 'long', hits: [
+      { k: 'noise', fType: 'highpass', freq: 7200, q: 0.7, dur: 0.55, peak: 0.28 } ] },
+    { name: 'wash', hits: [
+      { k: 'noise', fType: 'highpass', freq: 6500, q: 0.6, dur: 0.4, peak: 0.25, attack: 0.02 } ] },
+  ],
+  shaker: [
+    { name: 'shake', hits: [
+      { k: 'noise', fType: 'highpass', freq: 6200, q: 0.8, dur: 0.11, peak: 0.22, attack: 0.012 } ] },
+    { name: 'soft', hits: [
+      { k: 'noise', fType: 'highpass', freq: 5500, q: 0.8, dur: 0.14, peak: 0.18, attack: 0.02 } ] },
+    { name: 'tamb', hits: [
+      { k: 'noise', fType: 'highpass', freq: 7500, q: 0.9, dur: 0.09, peak: 0.25, attack: 0.008 },
+      { k: 'noise', fType: 'bandpass', freq: 10000, q: 2.0, dur: 0.05, peak: 0.15 } ] },
+  ],
+};
 export const JAM_DRUMS = ['kick', 'snare', 'clap', 'chat', 'ohat', 'shaker'];
+function drumVariant(drum, vi) {
+  const kit = DRUM_KITS[drum];
+  if (!kit || !kit.length) return null;
+  return kit[Math.max(0, Math.min(kit.length - 1, vi | 0))];
+}
+export function drumVariantName(drum, vi) {
+  const v = drumVariant(drum, vi);
+  return v ? v.name : '';
+}
+export function drumVariantCount(drum) {
+  const kit = DRUM_KITS[drum];
+  return kit ? kit.length : 0;
+}
 export function playDrum(ctx, dest, opts) {
-  const { drum = 'kick', vel = 0.9, time = 0 } = opts || {};
-  if (!JAM_DRUMS.includes(drum)) return;
+  const { drum = 'kick', variant = 0, vel = 0.9, time = 0 } = opts || {};
+  const v = drumVariant(drum, variant);
+  if (!v) return;
   try {
     const t = Math.max(time || 0, ctx.currentTime);
-    const v = clampVel(vel);
+    const vv = clampVel(vel);
     const noise = getNoiseBuffer(ctx);
     const noiseHit = (t0, dur, fType, freq, q, peak, attack = 0.002) => {
       const src = ctx.createBufferSource();
@@ -327,50 +465,85 @@ export function playDrum(ctx, dest, opts) {
       flt.Q.value = q;
       const g = ctx.createGain();
       g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(Math.max(0.0011, peak * v), t0 + attack);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0011, peak * vv), t0 + attack);
       g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       src.connect(flt); flt.connect(g); g.connect(dest);
       src.start(t0);
       src.stop(t0 + dur + 0.05);
     };
-    const toneHit = (t0, dur, type, f0, f1, peak) => {
+    const toneHit = (t0, dur, type, f0, f1, peak, drive = 0) => {
       const o = ctx.createOscillator();
       o.type = type;
       o.frequency.setValueAtTime(Math.max(20, f0), t0);
       o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
       const g = ctx.createGain();
       g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(Math.max(0.0011, peak * v), t0 + 0.004);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0011, peak * vv), t0 + 0.004);
       g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-      o.connect(g); g.connect(dest);
+      if (drive > 0.5) {
+        const ws = ctx.createWaveShaper();
+        const curve = new Float32Array(256);
+        const amt = Math.max(1, Math.min(40, drive));
+        for (let i = 0; i < 256; i++) {
+          const x = i / 128 - 1;
+          curve[i] = Math.tanh(amt * x) / Math.tanh(amt * 0.5) * 0.5;
+        }
+        ws.curve = curve;
+        o.connect(ws); ws.connect(g);
+      } else {
+        o.connect(g);
+      }
+      g.connect(dest);
       o.start(t0);
       o.stop(t0 + dur + 0.05);
     };
-    switch (drum) {
-      case 'kick':
-        toneHit(t, 0.26, 'sine', 155, 44, 0.95);
-        noiseHit(t, 0.03, 'highpass', 4000, 0.7, 0.25);
-        break;
-      case 'snare':
-        noiseHit(t, 0.17, 'bandpass', 1900, 0.9, 0.6);
-        toneHit(t, 0.11, 'triangle', 196, 150, 0.35);
-        break;
-      case 'clap':
-        noiseHit(t, 0.09, 'bandpass', 1300, 1.4, 0.5);
-        noiseHit(t + 0.014, 0.09, 'bandpass', 1300, 1.4, 0.5);
-        noiseHit(t + 0.028, 0.2, 'bandpass', 1300, 1.4, 0.55);
-        break;
-      case 'chat': // closed hat
-        noiseHit(t, 0.05, 'highpass', 8200, 0.7, 0.32);
-        break;
-      case 'ohat': // open hat
-        noiseHit(t, 0.32, 'highpass', 7600, 0.7, 0.3);
-        break;
-      case 'shaker':
-        noiseHit(t, 0.11, 'highpass', 6200, 0.8, 0.22, 0.012);
-        break;
+    for (const h of v.hits) {
+      const at = t + (h.at || 0);
+      if (h.k === 'tone') toneHit(at, h.dur, h.type, h.f0, h.f1, h.peak, h.drive || 0);
+      else noiseHit(at, h.dur, h.fType, h.freq, h.q, h.peak, h.attack || 0.002);
     }
   } catch (e) { /* ignore */ }
+}
+
+/* Bake every kit variation to an AudioBuffer (offline, once). Pads then
+ * play buffers — sample-trigger feel, zero CPU per hit, zero downloads. */
+let _drumBufs = null;
+export async function renderDrumKits(ctx) {
+  if (_drumBufs) return _drumBufs;
+  const out = {};
+  for (const drum of JAM_DRUMS) {
+    out[drum] = [];
+    const n = drumVariantCount(drum);
+    for (let vi = 0; vi < n; vi++) {
+      try {
+        const len = Math.max(1, Math.ceil(ctx.sampleRate * 1.2));
+        const oc = new OfflineAudioContext(1, len, ctx.sampleRate);
+        const g = oc.createGain();
+        g.connect(oc.destination);
+        playDrum(oc, g, { drum, variant: vi, vel: 1, time: 0.01 });
+        out[drum].push(await oc.startRendering());
+      } catch (e) { out[drum].push(null); }
+    }
+  }
+  _drumBufs = out;
+  return out;
+}
+export function drumKitBuffers() { return _drumBufs; }
+/* Trigger a baked sample. Falls back to live synthesis if the kits
+ * haven't rendered yet (or the variant is missing). */
+export function playDrumSample(ctx, dest, opts) {
+  const { drum = 'kick', variant = 0, vel = 0.9, time = 0 } = opts || {};
+  const buf = _drumBufs && _drumBufs[drum] && _drumBufs[drum][variant | 0];
+  if (!buf) { playDrum(ctx, dest, opts); return; }
+  try {
+    const t = Math.max(time || 0, ctx.currentTime);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const g = ctx.createGain();
+    g.gain.value = clampVel(vel);
+    src.connect(g); g.connect(dest);
+    src.start(t);
+  } catch (e) { playDrum(ctx, dest, opts); }
 }
 
 /* PAD: i–VI–III–VII triads in A minor. Detuned saws, slow attack,
