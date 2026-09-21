@@ -266,6 +266,70 @@ export function synthAllOff(ctx) {
   for (const id of [...SYNTH_VOICES.keys()]) synthNoteOff(ctx, id, 0);
 }
 
+/* ---------------- synth FX insert (build 64) ----------------
+ * The synth's own pedalboard: clipper -> delay -> limiter.
+ * Voices land on `input`; connect `output` (the limiter) to the bus.
+ * Sensible and efficient: one waveshaper, one delay line, one
+ * fast compressor — all created once, then just knob-turns. */
+function makeClipCurve(drive) {
+  const n = 256;
+  const curve = new Float32Array(n);
+  const k = 1 + drive * 24; // 0 = clean, 1 = smashed
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 2 - 1;
+    curve[i] = Math.tanh(k * x) / Math.tanh(k * 0.7) * 0.7;
+  }
+  return curve;
+}
+export function createSynthFx(ctx) {
+  const input = ctx.createGain();
+  const clipper = ctx.createWaveShaper();
+  clipper.oversample = '2x';
+  const postClip = ctx.createGain();
+  const limiter = ctx.createDynamicsCompressor();
+  limiter.threshold.value = -6;
+  limiter.knee.value = 0;
+  limiter.ratio.value = 20;
+  limiter.attack.value = 0.001;
+  limiter.release.value = 0.08;
+  const delay = ctx.createDelay(2.0);
+  const fb = ctx.createGain();
+  const dlySend = ctx.createGain();
+  const dlyWet = ctx.createGain();
+  input.connect(clipper);
+  clipper.connect(postClip);
+  postClip.connect(limiter);
+  postClip.connect(dlySend); dlySend.connect(delay);
+  delay.connect(fb); fb.connect(delay);
+  delay.connect(dlyWet); dlyWet.connect(limiter);
+  const fx = {
+    input, output: limiter, nodes: { clipper, delay, fb, dlySend, dlyWet },
+    drive: 0, dlyMix: 0.25, dlyFb: 0.35, dlyDiv: 0.75, bpm: 120,
+    setDrive(v) {
+      this.drive = Math.max(0, Math.min(1, Number(v) || 0));
+      try { clipper.curve = makeClipCurve(this.drive); } catch (e) {}
+    },
+    setDelay(mix, fbAmt, div) {
+      if (mix != null) this.dlyMix = Math.max(0, Math.min(1, Number(mix)));
+      if (fbAmt != null) this.dlyFb = Math.max(0, Math.min(0.92, Number(fbAmt)));
+      if (div != null) this.dlyDiv = Number(div) || 0.75;
+      const t = ctx.currentTime;
+      try {
+        dlyWet.gain.setTargetAtTime(this.dlyMix * 0.9, t, 0.03);
+        fb.gain.setTargetAtTime(this.dlyFb, t, 0.03);
+        delay.delayTime.setTargetAtTime((60 / this.bpm) * this.dlyDiv, t, 0.05);
+      } catch (e) {}
+    },
+    updateTempo(bpm) {
+      this.bpm = Math.max(40, Math.min(220, Number(bpm) || 120));
+      this.setDelay(null, null, null);
+    },
+  };
+  fx.setDrive(0);
+  fx.setDelay(0.25, 0.35, 0.75);
+  return fx;
+}
+
 /* One-shot wrapper: the pocket synth the room already knows. Implemented
  * on the real voice — note on, then auto-release after the decay. Reads
  * both the legacy flat patch and the build-63 full patch. */
