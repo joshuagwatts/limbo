@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=51';
-import { CouchNet } from './couch.js?v=51';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=52';
+import { CouchNet } from './couch.js?v=52';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
 
@@ -7714,38 +7714,86 @@ const _rayUp = new THREE.Vector3(0, 1, 0);
 
 function buildJourneyRays(scene) {
   const rnd = mulberry32(4901);
-  const bodyGeo = new THREE.SphereGeometry(1, 10, 8);
-  bodyGeo.scale(1.5, 0.38, 2.6);
-  const tailGeo = new THREE.ConeGeometry(0.14, 7, 6);
-  tailGeo.rotateX(-Math.PI / 2); // point -Z: trails behind the +Z nose
-  tailGeo.translate(0, 0, -5.2);
-  // wing: swept triangle; inner edge at the body, tip swept back.
-  // shape +Y maps to world -Z after rotateX(-90°), so the nose-ward edge
-  // sits at -Y to land at +Z (the nose).
-  const wingShape = new THREE.Shape();
-  wingShape.moveTo(0.4, -1.4);
-  wingShape.lineTo(7.2, 0.6);
-  wingShape.lineTo(5.0, 2.4);
-  wingShape.lineTo(0.4, 1.8);
-  wingShape.closePath();
-  const wingGeo = new THREE.ShapeGeometry(wingShape);
-  wingGeo.rotateX(-Math.PI / 2);
   const mat = new THREE.MeshStandardMaterial({
     color: 0x9db8dd, roughness: 0.55, metalness: 0.15,
     emissive: 0x14263f, emissiveIntensity: 0.5,
     flatShading: true, side: THREE.DoubleSide,
   });
+
+  /* Lofted manta wing — real planform (broad root, swept pointed tip),
+     cambered airfoil section: round nose, knife trailing edge. */
+  function wingGeometry() {
+    const SPAN = 9, CHORD = 10;
+    const pos = [], idx = [];
+    for (let i = 0; i < SPAN; i++) {
+      const s = i / (SPAN - 1);                 // 0 root → 1 tip
+      const x = 0.5 + s * 8.0;
+      const chord = 3.6 * (1 - s * 0.8) + 0.25; // pointed tip
+      const zLE = 1.8 - Math.pow(s, 1.6) * 5.2; // leading edge sweeps back
+      const dihedral = s * s * 1.4;             // tips lift a touch
+      for (let j = 0; j < CHORD; j++) {
+        const c = j / (CHORD - 1);              // 0 leading edge → 1 trailing
+        const z = zLE - c * chord;
+        // NACA-style half-thickness: round nose, thin tail
+        const th = 0.11 * chord * (1.4845 * Math.sqrt(c) - 0.63 * c
+          - 1.758 * c * c + 1.4215 * c * c * c - 0.5075 * c * c * c * c);
+        const camber = 0.05 * chord * Math.sin(Math.PI * c);
+        pos.push(x, camber + th + dihedral, z,
+                 x, camber - th + dihedral, z);
+      }
+    }
+    for (let i = 0; i < SPAN - 1; i++) {
+      for (let j = 0; j < CHORD - 1; j++) {
+        const a = (i * CHORD + j) * 2, b = ((i + 1) * CHORD + j) * 2;
+        idx.push(a, a + 2, b, b, a + 2, b + 2);         // upper
+        idx.push(a + 1, b + 1, a + 3, b + 1, b + 3, a + 3); // lower
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+    return geo;
+  }
+  const wingGeo = wingGeometry();
+
+  // body: long diamond hull
+  const bodyGeo = new THREE.SphereGeometry(1, 24, 18);
+  bodyGeo.scale(1.5, 0.34, 3.0);
+  // whip tail: thin tube with a gentle upward S-curve
+  const tailCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 0.05, -2.8),
+    new THREE.Vector3(0, 0.15, -6.0),
+    new THREE.Vector3(0, 0.45, -9.5),
+    new THREE.Vector3(0, 0.90, -12.5),
+  ]);
+  const tailGeo = new THREE.TubeGeometry(tailCurve, 12, 0.07, 6, false);
+  // dorsal fin: small swept blade
+  const dorsalGeo = new THREE.ConeGeometry(0.32, 1.2, 6);
+  dorsalGeo.scale(1, 1, 0.35);
+  dorsalGeo.rotateX(-0.35);
+  dorsalGeo.translate(0, 0.55, -0.8);
+  // cephalic fins: the manta's signature curled "horns" at the head
+  const cephGeo = new THREE.ConeGeometry(0.30, 1.9, 8);
+
   const rays = [];
   for (let i = 0; i < J_RAYS_N; i++) {
     const g = new THREE.Group();
     const wingR = new THREE.Mesh(wingGeo, mat);
     const wingL = new THREE.Mesh(wingGeo, mat);
-    wingL.scale.x = -1;
+    wingL.scale.x = -1; // mirrored — same flap sign lifts both tips
+    const cephL = new THREE.Mesh(cephGeo, mat);
+    cephL.rotation.set(Math.PI / 2 + 0.38, 0, 0.55);
+    cephL.position.set(0.95, -0.18, 2.9);
+    const cephR = new THREE.Mesh(cephGeo, mat);
+    cephR.rotation.set(Math.PI / 2 + 0.38, 0, -0.55);
+    cephR.position.set(-0.95, -0.18, 2.9);
     const hit = new THREE.Mesh(
-      new THREE.SphereGeometry(7, 8, 6),
+      new THREE.SphereGeometry(9, 8, 6),
       new THREE.MeshBasicMaterial({ visible: false }));
     g.add(new THREE.Mesh(bodyGeo, mat), wingR, wingL,
-      new THREE.Mesh(tailGeo, mat), hit);
+      new THREE.Mesh(tailGeo, mat), new THREE.Mesh(dorsalGeo, mat),
+      cephL, cephR, hit);
     g.scale.setScalar(1.1 + rnd() * 0.7);
     const ray = {
       group: g, wingR, wingL, hit,
@@ -7845,7 +7893,7 @@ function updateJourneyRays(dt, t) {
     const wantFlapSpd = ray.following ? 3.4 : climbing ? 6.5 : 1.4;
     ray.flapSpd += (wantFlapSpd - ray.flapSpd) * k(2.5);
     ray.flap += ray.flapSpd * dt;
-    const amp = ray.following ? 0.45 : climbing ? 0.6 : 0.1;
+    const amp = ray.following ? 0.4 : climbing ? 0.5 : 0.1;
     const flap = Math.sin(ray.flap) * amp;
     // wingL is mirrored (scale.x = -1), so the same sign lifts both tips
     ray.wingR.rotation.z = flap;
