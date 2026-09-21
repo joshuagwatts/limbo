@@ -169,24 +169,49 @@ if ('serviceWorker' in navigator) {
   </div>
   <div id="jam-inst-lead" class="jam-inst-panel">
     <div class="jam-synth-row">
-      <button class="jam-wave" data-wave="sawtooth">saw</button>
-      <button class="jam-wave" data-wave="square">square</button>
-      <button class="jam-wave" data-wave="mix">mix</button>
+      <span class="jam-preset-label">osc 1</span>
+      <button class="jam-wave sel" data-osc="1" data-wave="sawtooth">saw</button>
+      <button class="jam-wave" data-osc="1" data-wave="square">square</button>
+      <button class="jam-wave" data-osc="1" data-wave="triangle">tri</button>
+    </div>
+    <div class="jam-synth-row">
+      <span class="jam-preset-label">osc 2</span>
+      <button class="jam-wave sel" data-osc="2" data-wave="sawtooth">saw</button>
+      <button class="jam-wave" data-osc="2" data-wave="square">square</button>
+      <button class="jam-wave" data-osc="2" data-wave="triangle">tri</button>
     </div>
     <div class="jam-synth-row jam-presets">
       <span class="jam-preset-label">patch</span>
       <button class="jam-preset" data-preset="spark">spark</button>
       <button class="jam-preset" data-preset="acid">acid</button>
       <button class="jam-preset" data-preset="drift">drift</button>
+      <button class="jam-preset" data-preset="pluck">pluck</button>
+      <button class="jam-preset" data-preset="pad">pad</button>
     </div>
+    <div class="jam-sub jam-knob-sub">FILTER</div>
     <div class="jam-knobs cols3">
       <label>cutoff <input id="jam-cutoff" type="range" min="300" max="8000" value="1800"></label>
       <label>reso <input id="jam-reso" type="range" min="0" max="12" step="0.5" value="5"></label>
       <label>env <input id="jam-env" type="range" min="0" max="100" value="35"></label>
+    </div>
+    <div class="jam-sub jam-knob-sub">ENVELOPE</div>
+    <div class="jam-knobs cols3">
+      <label>attack <input id="jam-attack" type="range" min="2" max="1000" value="8"></label>
       <label>decay <input id="jam-decay" type="range" min="8" max="250" value="40"></label>
-      <label>attack <input id="jam-attack" type="range" min="2" max="500" value="8"></label>
+      <label>sustain <input id="jam-sustain" type="range" min="0" max="100" value="70"></label>
+      <label>release <input id="jam-release" type="range" min="5" max="200" value="30"></label>
+    </div>
+    <div class="jam-sub jam-knob-sub">LFO</div>
+    <div class="jam-knobs cols3">
+      <label>rate <input id="jam-lforate" type="range" min="1" max="200" value="50"></label>
+      <label>pitch <input id="jam-lfopitch" type="range" min="0" max="100" value="0"></label>
+      <label>filter <input id="jam-lfofilter" type="range" min="0" max="100" value="0"></label>
+    </div>
+    <div class="jam-sub jam-knob-sub">OSC / FX</div>
+    <div class="jam-knobs cols3">
+      <label>osc 2 mix <input id="jam-osc2mix" type="range" min="0" max="100" value="45"></label>
+      <label>detune <input id="jam-spread" type="range" min="0" max="50" value="12"></label>
       <label>sub <input id="jam-sub" type="range" min="0" max="100" value="0"></label>
-      <label>spread <input id="jam-spread" type="range" min="0" max="50" value="12"></label>
       <label>echo <input id="jam-echo" type="range" min="0" max="100" value="30"></label>
       <label>glide <input id="jam-glide" type="range" min="0" max="30" value="2"></label>
     </div>
@@ -207,6 +232,15 @@ if ('serviceWorker' in navigator) {
   </div>
   <div id="jam-inst-drums" class="jam-inst-panel" hidden>
     <div id="jam-drums"></div>
+  </div>
+  <!-- build 63: press-and-hold a drum pad to swap its sample -->
+  <div id="drum-picker" class="drum-picker" hidden>
+    <div class="drum-picker-backdrop"></div>
+    <div class="drum-picker-sheet">
+      <div id="drum-picker-title" class="drum-picker-title"></div>
+      <div id="drum-picker-list" class="drum-picker-list"></div>
+      <div class="drum-picker-hint">tap to hear + load &nbsp;·&nbsp; hold the pad for the list</div>
+    </div>
   </div>
   <div id="jam-inst-pad" class="jam-inst-panel" hidden>
     <div id="jam-chords"></div>
@@ -241,6 +275,7 @@ if ('serviceWorker' in navigator) {
     </div>
     <div class="jam-loop-side">
       <button id="jam-loop-stop" aria-label="rest the loop">&#9632;</button>
+      <button id="jam-loop-undo" class="off" aria-label="peel off the last layer">&#8617;</button>
       <button id="jam-loop-clear" aria-label="clear the loop">&#10005;</button>
     </div>
   </div>
@@ -414,6 +449,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=62"></script>
+<script type="module" src="js/game.js?v=63"></script>
 </body>
 </html>
