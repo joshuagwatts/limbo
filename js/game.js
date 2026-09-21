@@ -4216,7 +4216,7 @@ async function jukeFetchTitle(url, provider) {
 async function jukeResolveShortLink(url) {
   try {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 8000);
+    const t = setTimeout(() => ctl.abort(), 15000); // build 54: was 8s — slow mobile networks need more
     const r = await fetch('https://soundcloud.com/oembed?url=' + encodeURIComponent(url) + '&format=json',
       { signal: ctl.signal });
     clearTimeout(t);
@@ -4394,8 +4394,9 @@ async function jukeAddTrack(rawUrl, titleHint) {
   let resolvedTitle = titleHint || null;
   // Mobile "Share → Copy Link" (on.soundcloud.com/xxx): resolve to the
   // canonical track/set URL via oEmbed (also yields the real title). If it
-  // won't resolve, hand the short URL to the widget anyway — SoundCloud
-  // usually resolves it server-side.
+  // won't resolve here, the track keeps the short URL and gets one more
+  // resolve at play time (build 54) — the widget itself 404s on short
+  // links, so it is never handed one.
   if (det.provider === 'soundcloud-short') {
     jukeHint('resolving that soundcloud link…');
     const r = await jukeResolveShortLink(url);
@@ -5210,11 +5211,11 @@ function jukePlayYTFresh(d, offset) {
    tell the room plainly instead of sitting in silence, and let the queuer
    move the room on to the next track. */
 let jukeErrAdvancedFor = null;
-function jukeOnTrackError() {
+function jukeOnTrackError(msg) {
   if (!juke.now) return;
   if (jukeErrAdvancedFor === juke.now.id) return; // already handling it
   jukeErrAdvancedFor = juke.now.id;
-  jukeHint('couldn\u2019t load that link — is it public?');
+  jukeHint(msg || 'couldn\u2019t load that link — is it public?');
   if (juke.now.addedBy === myName) {
     setTimeout(() => {
       if (juke.now && jukeErrAdvancedFor === juke.now.id) jukeAdvance();
@@ -5286,12 +5287,31 @@ function jukeEnsureWarmSC(cb) {
   });
 }
 
-function jukePlaySC(d, offset) {
+/* Build 54: the widget 404s on on.soundcloud.com short links (verified),
+   so a track whose URL never resolved at queue time gets one more resolve
+   here, before any widget sees it. If it still won't resolve, say so
+   plainly and skip — never feed a known-bad URL to the widget. */
+async function jukePlaySC(d, offset) {
   if (juke.playerFactory && juke.playerFactory.soundcloud) {
     const hooks = { onEnded: () => jukeOnPlayerEnded() };
     juke.player = juke.playerFactory.soundcloud(d, offset, hooks);
     try { juke.player.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
     return;
+  }
+  if (/^https?:\/\/(www\.)?on\.soundcloud\.com\//i.test(d.url || '')) {
+    jukeHint('resolving that soundcloud link…');
+    let r = null;
+    try { r = await jukeResolveShortLink(d.url); } catch (e) { r = null; }
+    if (!juke.now || juke.now.id !== d.id) return; // skipped while resolving
+    if (r && r.url) {
+      d.url = r.url;
+      juke.now.url = r.url;
+      if (r.title) { d.title = r.title; juke.now.title = r.title; }
+      renderJuke();
+    } else {
+      jukeOnTrackError('that soundcloud link won\u2019t open — paste the full soundcloud.com link');
+      return;
+    }
   }
   jukeEnsureWarmSC((w) => {
     if (!juke.now || juke.now.id !== d.id) return; // stale track
@@ -5325,15 +5345,14 @@ function jukeUseWarmSC(w, d, offset) {
   try { wg.setVolume(Math.round(juke.volume * 100)); } catch (e) {}
   const arm = { d, offset: jukeOffsetFor(d) };
   jukeArmPlayWatchdog('soundcloud', d, () => {
-    // one recovery: reload the track; the READY handler re-arms it
+    // Build 54: the warm load never produced audio. Don't blindly re-arm —
+    // w.lastUrl is set optimistically before load() completes, so arming
+    // here could play whatever the widget still holds (wrong track).
+    // Fall back to a fresh widget, which navigates straight to the URL.
     if (!juke.now || juke.now.id !== d.id) return;
-    const a2 = { d, offset: jukeOffsetFor(juke.now) };
-    if (w.lastUrl === d.url) jukeArmWarmSC(w, wg, a2);
-    else {
-      w.armed = a2;
-      w.lastUrl = d.url;
-      try { wg.load(d.url, { auto_play: false, visual: false, hide_related: true, show_comments: false, show_user: false }); } catch (e) {}
-    }
+    try { wg.pause(); } catch (e) {}
+    w.armed = null; w.playingId = null;
+    jukePlaySCFresh(d, jukeOffsetFor(juke.now));
   });
   try {
     if (w.lastUrl === d.url) {
