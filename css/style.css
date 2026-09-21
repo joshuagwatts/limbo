@@ -1240,6 +1240,16 @@ html, body {
   font-size: 15px; cursor: pointer; padding: 8px 10px;
   touch-action: manipulation; min-height: 44px; min-width: 44px;
 }
+/* Build 43: clear-the-line control + holder indicator. */
+#juke-clear {
+  background: none; border: none; color: #bfe9b0;
+  font-size: 11px; letter-spacing: 0.25em; cursor: pointer; padding: 8px 10px;
+  touch-action: manipulation; min-height: 44px; min-width: 44px;
+}
+.juke-holder {
+  font-size: 10px; letter-spacing: 0.12em; color: rgba(210, 255, 196, 0.55);
+  margin-right: 4px;
+}
 .juke-now { margin-bottom: 6px; }
 .juke-now-title {
   font-size: 15px; color: #f0ffe9; letter-spacing: 0.04em;
