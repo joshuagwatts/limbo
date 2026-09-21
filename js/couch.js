@@ -32,10 +32,15 @@
  * and incoming room-scoped actions are dropped when `d.r` isn't our
  * current room. Peer join/leave are transport-level and always delivered.
  *
- * Bump on every deploy — shown in the debug HUD next to the online build.
+ * Build 48: reads the module's own ?v= cache-bust — always the running build.
  */
 
-const BUILD = '34';
+const BUILD = (() => {
+  try {
+    const m = String(import.meta.url || '').match(/[?&]v=(\d+)/);
+    return m ? m[1] : '?';
+  } catch (e) { return '?'; }
+})();
 const MAX_NAME = 16;
 const QR_PREFIX = 'LIMBO1:';
 const DC_LABEL = 'limbo-couch';

@@ -98,9 +98,14 @@ const PRESENCE_EXPIRE_MS = 45000;   // silent this long -> considered gone
 const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 /* Sound room (build 12): room key for the DJ/social space. */
 const SOUND_ROOM_KEY = 'limbo-realm-5';
-/* Bump on every deploy — shown in the debug HUD (press D) so we can tell
-   whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '43';
+/* Build 48: the stamp reads the module's own ?v= cache-bust, so it always
+   shows the build that's actually running — never a stale hardcoded number. */
+const BUILD = (() => {
+  try {
+    const m = String(import.meta.url || '').match(/[?&]v=(\d+)/);
+    return m ? m[1] : '?';
+  } catch (e) { return '?'; }
+})();
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
