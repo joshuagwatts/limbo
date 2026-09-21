@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=38">
+<link rel="stylesheet" href="css/style.css?v=39">
 <script type="importmap">
 {
   "imports": {
@@ -18,8 +18,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=38"></script>
-<script src="js/vendor/jsqr.js?v=38"></script>
+<script src="js/vendor/qrcode.js?v=39"></script>
+<script src="js/vendor/jsqr.js?v=39"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -162,11 +162,34 @@ if ('serviceWorker' in navigator) {
       <button class="jam-wave" data-wave="square">square</button>
       <button class="jam-wave" data-wave="mix">mix</button>
     </div>
-    <div class="jam-knobs">
+    <div class="jam-synth-row jam-presets">
+      <span class="jam-preset-label">patch</span>
+      <button class="jam-preset" data-preset="spark">spark</button>
+      <button class="jam-preset" data-preset="acid">acid</button>
+      <button class="jam-preset" data-preset="drift">drift</button>
+    </div>
+    <div class="jam-knobs cols3">
       <label>cutoff <input id="jam-cutoff" type="range" min="300" max="8000" value="1800"></label>
       <label>reso <input id="jam-reso" type="range" min="0" max="12" step="0.5" value="5"></label>
+      <label>env <input id="jam-env" type="range" min="0" max="100" value="35"></label>
+      <label>decay <input id="jam-decay" type="range" min="8" max="250" value="40"></label>
+      <label>attack <input id="jam-attack" type="range" min="2" max="500" value="8"></label>
+      <label>sub <input id="jam-sub" type="range" min="0" max="100" value="0"></label>
+      <label>spread <input id="jam-spread" type="range" min="0" max="50" value="12"></label>
+      <label>echo <input id="jam-echo" type="range" min="0" max="100" value="30"></label>
+      <label>glide <input id="jam-glide" type="range" min="0" max="30" value="2"></label>
+    </div>
+    <div class="jam-synth-row jam-scales">
+      <span class="jam-preset-label">keys</span>
+      <button class="jam-scale sel" data-scale="chromatic">chromatic</button>
+      <button class="jam-scale" data-scale="minpent">min pent</button>
+      <button class="jam-scale" data-scale="majpent">maj pent</button>
     </div>
     <div id="jam-keys"></div>
+    <!-- build 39: one-touch triads stacked from the scale lock, voiced
+         through your patch. Labels are root note names. -->
+    <div class="jam-sub jam-chords-sub">CHORDS</div>
+    <div id="jam-lead-chords" class="jam-lead-chords"></div>
   </div>
   <div id="jam-inst-bass" class="jam-inst-panel" hidden>
     <div id="jam-bass-keys"></div>
@@ -182,6 +205,52 @@ if ('serviceWorker' in navigator) {
     <button id="jam-grab">grab loop</button>
     <button id="jam-grab-room" title="record the room mix (jukebox + jam + mic)">&#127908; sample the room</button>
     <div id="jam-pads"></div>
+  </div>
+  <!-- build 39: overdub looper. ● records the room mix into a loop of N bars
+       (starts on the next bar line); ● again layers another take over it
+       (sound-on-sound); ■ rests the loop; ▶ drifts it again; ✕ clears. -->
+  <div class="jam-sub">LOOP</div>
+  <div class="jam-loop-row">
+    <div class="jam-loop-len" id="jam-loop-len" role="group" aria-label="loop length in bars">
+      <button data-bars="1">1</button><button data-bars="2" class="sel">2</button><button data-bars="4">4</button><button data-bars="8">8</button>
+    </div>
+    <span class="jam-loop-len-label">bars</span>
+  </div>
+  <div class="jam-loop-main">
+    <button id="jam-loop-btn" class="jam-loop-btn" aria-label="loop record / overdub">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <circle class="loop-ring-bg" cx="32" cy="32" r="27"></circle>
+        <circle class="loop-ring" id="jam-loop-ring" cx="32" cy="32" r="27"></circle>
+      </svg>
+      <span class="loop-glyph" id="jam-loop-glyph">&#9679;</span>
+    </button>
+    <div class="jam-loop-info">
+      <div id="jam-loop-state" class="jam-loop-state">the loop is empty — play, then tap &#9679;</div>
+      <div id="jam-loop-meta" class="jam-loop-meta"></div>
+    </div>
+    <div class="jam-loop-side">
+      <button id="jam-loop-stop" aria-label="rest the loop">&#9632;</button>
+      <button id="jam-loop-clear" aria-label="clear the loop">&#10005;</button>
+    </div>
+  </div>
+  <!-- build 39: optional rhythm sequencer. OFF by default — the room's
+       generative drift is untouched until you tap "beats". 16 steps x
+       4 synthesized voices (no samples); runs on the jam tempo; the
+       overdub looper catches it like anything else you play. -->
+  <div class="jam-sub">RHYTHM</div>
+  <div class="jam-seq-head">
+    <button id="jam-seq-toggle">beats</button>
+    <span id="jam-seq-state" class="jam-seq-state">the flock drifts free</span>
+  </div>
+  <div id="jam-seq-body" hidden>
+    <div id="jam-seq-grid"></div>
+    <div class="jam-seq-presets">
+      <button class="jam-seq-preset" data-seqpreset="pulse">pulse</button>
+      <button class="jam-seq-preset" data-seqpreset="sway">sway</button>
+      <button class="jam-seq-preset" data-seqpreset="embers">embers</button>
+      <button id="jam-seq-clear">clear</button>
+      <label class="jam-seq-swing">sway <input id="jam-seq-swing" type="range" min="0" max="60" value="0"></label>
+    </div>
   </div>
   <!-- build 27: mic in. Your voice joins the jam bus like any instrument —
        through the reverb, delay and limiter, out to the room when live.
@@ -319,6 +388,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=38"></script>
+<script type="module" src="js/game.js?v=39"></script>
 </body>
 </html>
