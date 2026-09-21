@@ -1,4 +1,4 @@
-/* LIMBO service worker (build 40) — offline-first PWA.
+/* LIMBO service worker (build 67) — offline-first PWA.
  *
  * After ONE online visit, the whole game (all realms, journey room, sound
  * room, vendor QR libs, three.js from the CDN) is cached, so the game
@@ -14,24 +14,24 @@
  * successful (ok) responses).
  */
 
-const BUILD = '53';
+const BUILD = '67';
 const CACHE = `limbo-v${BUILD}`;
 
-/* Same version stamps the page uses (?v=40). query strings are part of
+/* Same version stamps the page uses (?v=67). query strings are part of
    the cache key — that is exactly what we want. */
 const CORE_ASSETS = [
   './',
   './index.html',
   './manifest.webmanifest',
-  './css/style.css?v=44',
-  './js/game.js?v=44',
-  './js/net.js?v=44',
-  './js/couch.js?v=39',
-  './js/jam.js?v=39',
-  './js/audio.js?v=39',
-  './js/flock.js?v=39',
-  './js/vendor/qrcode.js?v=39',
-  './js/vendor/jsqr.js?v=39',
+  './css/style.css?v=67',
+  './js/game.js?v=67',
+  './js/net.js?v=67',
+  './js/couch.js?v=67',
+  './js/jam.js?v=67',
+  './js/audio.js?v=67',
+  './js/flock.js?v=67',
+  './js/vendor/qrcode.js?v=67',
+  './js/vendor/jsqr.js?v=67',
   './assets/realm1.jpg',
   './assets/realm2.jpg',
   './assets/realm3.jpg',
