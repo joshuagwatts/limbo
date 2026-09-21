@@ -5006,7 +5006,14 @@ function jukeJoinTap() {
   if (!juke.player) return;
   try {
     const off = juke.now ? jukeOffsetFor(juke.now) : 0;
-    if (off > 1) juke.player.seekTo(off);
+    if (juke.player.kind === 'soundcloud') {
+      // Build 56: the SC widget can wedge playing-silently if the autoplay
+      // block hit it mid-buffer. A seek inside this real gesture forces the
+      // audio element to re-engage; play() then starts it with sound.
+      try { juke.player.seekTo(Math.max(0, off)); } catch (e) {}
+    } else if (off > 1) {
+      try { juke.player.seekTo(off); } catch (e) {}
+    }
     juke.player.play();
   } catch (e) {}
   juke.joinWaiting = false;
@@ -5276,7 +5283,12 @@ function jukePlaySCFresh(d, offset) {
     try {
       const w = window.SC.Widget(iframe);
       let playingFlag = false;
-      w.bind(window.SC.Widget.Events.PLAY, () => { playingFlag = true; });
+      w.bind(window.SC.Widget.Events.PLAY, () => {
+        playingFlag = true;
+        // Build 56: the track beat the watchdog on its own (slow network) —
+        // clear the stale "tap to join" pill instead of leaving it up.
+        if (juke.joinWaiting) { juke.joinWaiting = false; renderJuke(); }
+      });
       w.bind(window.SC.Widget.Events.PAUSE, () => { playingFlag = false; });
       w.bind(window.SC.Widget.Events.FINISH, () => { playingFlag = false; jukeOnPlayerEnded(); });
       w.bind(window.SC.Widget.Events.ERROR, () => { playingFlag = false; juke.playerErrored = true; jukeOnTrackError(); });
