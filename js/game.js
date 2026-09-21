@@ -13,7 +13,7 @@ import { AudioEngine } from './audio.js?v=41';
 import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=53';
 import { CouchNet } from './couch.js?v=53';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=42';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -1490,6 +1490,7 @@ function audioEnsureRunning() {
     if (!audio.ctx) audio.init(110);
     if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
   } catch (e) {}
+  if (audio.ctx && audio.master) jamEnsureDrumKits(); // bake the drum kits once
   return !!(audio.ctx && audio.master);
 }
 
@@ -1592,16 +1593,29 @@ const jam = {
   // build 39: the pocket synth is a real patch now — every field rides the
   // jamNote so the room hears YOUR voice, not a default.
   synth: {
-    wave: 'sawtooth',
+    wave: 'sawtooth', // osc 1 wave
+    wave2: 'sawtooth', // osc 2 wave
+    osc2mix: 0.45, // osc 2 level 0..1
     cutoff: 1800, reso: 5,
     env: 0.35, // filter envelope amount 0..1
-    decay: 0.4, attack: 0.008, // seconds
+    attack: 0.008, decay: 0.4, sustain: 0.7, release: 0.3, // amp ADSR (seconds, s is 0..1)
     sub: 0, // 0..1 sub-osc level
-    spread: 12, // cents of detune spread
+    spread: 12, // cents of detune (osc 2)
     echo: 0.3, // 0..1 per-voice delay/reverb send
     glide: 0.02, // seconds of portamento (local performance only)
+    lfoRate: 5, // Hz
+    lfoPitch: 0, // cents of vibrato
+    lfoFilter: 0, // 0..1 filter wobble
   },
   scale: 'chromatic', // chromatic | minpent | majpent — the lead keys remap
+  drumVariant: (() => { // build 63: per-pad sample pick (persists)
+    const d = { kick: 0, snare: 0, clap: 0, chat: 0, ohat: 0, shaker: 0 };
+    try {
+      const raw = JSON.parse(localStorage.getItem('limbo-drumkit') || '{}');
+      for (const k of Object.keys(d)) if (Number.isInteger(raw[k]) && raw[k] >= 0) d[k] = raw[k];
+    } catch (e) {}
+    return d;
+  })(),
   glideFrom: 0, // last lead freq, for portamento (local only, never broadcast)
   pads: [null, null, null, null], // AudioBuffers, local to this client
   padRound: 0, // next pad to fill on grab (round-robin)
@@ -1636,6 +1650,7 @@ const dub = {
   state: 'empty', // empty|arming|recording|playing|dubbing|stopped
   bars: 2,
   buf: null, // AudioBuffer (stereo) — the loop itself
+  history: [], // build 63: previous bounces for undo (peel layers off)
   src: null, // looping BufferSource
   srcGain: null,
   t0: 0, // ctx.currentTime of the current cycle start
@@ -2341,17 +2356,64 @@ function jamRenderNote(midi, vel, audioTime, patch) {
     vel,
     time: audioTime,
     wave: P.w || s.wave,
+    wave2: P.w2 || s.wave2,
+    osc2mix: P.o2 != null ? P.o2 : s.osc2mix,
     cutoff: P.c || s.cutoff,
     resonance: P.r != null ? P.r : s.reso,
     env: P.e != null ? P.e : s.env,
     decay: P.d || s.decay,
     attack: P.a || s.attack,
+    sustain: P.su != null ? P.su : s.sustain,
+    release: P.rl != null ? P.rl : s.release,
     sub: P.s != null ? P.s : s.sub,
     spread: P.sp != null ? P.sp : s.spread,
     echo: P.x != null ? P.x : s.echo,
+    lfoRate: P.lr || s.lfoRate,
+    lfoPitch: P.lp != null ? P.lp : s.lfoPitch,
+    lfoFilter: P.lf != null ? P.lf : s.lfoFilter,
     // glide is a local performance feel — remote notes render straight.
     sends: jamSynthSends(P.x != null ? P.x : s.echo),
   });
+}
+/* Build 63: local held notes — sustain while the finger is down, release
+ * on lift. This is the real-synth feel; the room hears note on/off too. */
+const jamHeldVoices = new Map(); // pointerId -> {voiceId, midi}
+function jamNoteOnLocal(midi, vel = 0.9) {
+  audioEnsureRunning(); // key taps are gestures — iOS resumes here
+  const ctx = audio.ctx;
+  if (!ctx || !audio.master) return 0;
+  const s = jam.synth;
+  const f = 440 * Math.pow(2, (midi - 69) / 12);
+  const glideFrom = s.glide > 0.005 ? jam.glideFrom : 0;
+  jam.glideFrom = f;
+  const id = synthNoteOn(ctx, jamDestFor('lead'), {
+    midi, vel, time: ctx.currentTime + 0.01,
+    osc1: { wave: s.wave, oct: 0, detune: -s.spread / 2, level: 0.85 },
+    osc2: { wave: s.wave2, oct: 0, detune: s.spread / 2, level: s.osc2mix },
+    sub: s.sub, cutoff: s.cutoff, reso: s.reso,
+    fAmt: s.env, fA: 0.01, fD: 0.25, fS: 0.4, fR: 0.25,
+    aA: s.attack, aD: s.decay, aS: s.sustain, aR: s.release,
+    lfoRate: s.lfoRate, lfoPitch: s.lfoPitch, lfoFilter: s.lfoFilter,
+    glide: s.glide, fromFreq: glideFrom,
+    echo: s.echo, sends: jamSynthSends(s.echo),
+  });
+  if (!id) return 0;
+  jamVoicesSpawned++;
+  jam.lastVoice = { inst: 'lead', wave: s.wave };
+  const beatNow = jamBeatNow();
+  const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
+  jamBroadcastNote({ midi, vel, beat, inst: 'lead', patch: jamLeadPatch(), on: 1 });
+  jamMarkJammer(myName, 'lead');
+  renderJamJammers();
+  return id;
+}
+function jamNoteOffLocal(pointerId) {
+  const rec = jamHeldVoices.get(pointerId);
+  if (!rec) return;
+  jamHeldVoices.delete(pointerId);
+  const ctx = audio.ctx;
+  if (ctx && rec.voiceId) synthNoteOff(ctx, rec.voiceId, 0);
+  jamBroadcastNote({ midi: rec.midi, inst: 'lead', off: 1 });
 }
 
 /* Per-voice echo destinations: the game's own delay + reverb. Called with
@@ -2376,12 +2438,17 @@ function jamRenderBass(midi, vel, audioTime) {
   playBassNote(ctx, jamDestFor('bass'), { midi, vel, time: audioTime });
 }
 
-function jamRenderDrum(drum, vel, audioTime) {
+function jamDrumVariant(drum) {
+  const vi = jam.drumVariant && jam.drumVariant[drum];
+  return Math.max(0, Math.min(drumVariantCount(drum) - 1, vi | 0));
+}
+function jamRenderDrum(drum, vel, audioTime, variant) {
   const ctx = audio.ctx;
   if (!ctx || !audio.master) return;
   jamVoicesSpawned++;
   jam.lastVoice = { inst: 'drums', drum };
-  playDrum(ctx, jamDestFor('drums'), { drum, vel, time: audioTime });
+  const vi = variant != null ? variant : jamDrumVariant(drum);
+  playDrumSample(ctx, jamDestFor('drums'), { drum, variant: vi, vel, time: audioTime });
 }
 
 function jamRenderChord(chord, vel, audioTime) {
@@ -2394,11 +2461,46 @@ function jamRenderChord(chord, vel, audioTime) {
 
 /* Route an inbound event to the SENDER's instrument voice — never the
    receiver's. d = {inst, midi, vel, drum, chord, patch}. */
-function jamRenderRemote(d, audioTime) {
+/* Build 63: sustained remote lead voices, keyed by peer+midi. A lost
+ * note-off can't drone forever — every held note auto-releases at 8s. */
+const jamRemoteVoices = new Map(); // `${peerId}:${midi}` -> {id, timer}
+function jamRemoteVoiceKey(peerId, midi) { return String(peerId || '?') + ':' + midi; }
+function jamRemoteNoteOn(peerId, midi, vel, audioTime, patch) {
+  const ctx = audio.ctx;
+  if (!ctx || !audio.master) return;
+  jamRemoteNoteOff(peerId, midi);
+  const s = jam.synth;
+  const id = synthNoteOn(ctx, jamDestFor('lead'), {
+    midi, vel, time: audioTime,
+    osc1: { wave: patch.w, oct: 0, detune: -patch.sp / 2, level: 0.85 },
+    osc2: { wave: patch.w2, oct: 0, detune: patch.sp / 2, level: patch.o2 },
+    sub: patch.s, cutoff: patch.c, reso: patch.r,
+    fAmt: patch.e, fA: 0.01, fD: 0.25, fS: 0.4, fR: 0.25,
+    aA: patch.a, aD: patch.d, aS: patch.su, aR: patch.rl,
+    lfoRate: patch.lr, lfoPitch: patch.lp, lfoFilter: patch.lf,
+    echo: patch.x, sends: jamSynthSends(patch.x),
+  });
+  if (!id) return;
+  jamVoicesSpawned++;
+  jam.lastVoice = { inst: 'lead', wave: patch.w };
+  const key = jamRemoteVoiceKey(peerId, midi);
+  const timer = setTimeout(() => jamRemoteNoteOff(peerId, midi), 8000);
+  jamRemoteVoices.set(key, { id, timer });
+}
+function jamRemoteNoteOff(peerId, midi) {
+  const key = jamRemoteVoiceKey(peerId, midi);
+  const rec = jamRemoteVoices.get(key);
+  if (!rec) return;
+  jamRemoteVoices.delete(key);
+  clearTimeout(rec.timer);
+  const ctx = audio.ctx;
+  if (ctx) synthNoteOff(ctx, rec.id, 0);
+}
+function jamRenderRemote(d, audioTime, peerId) {
   const inst = JAM_INSTRUMENTS[d.inst] ? d.inst : 'lead';
   const vel = d.vel;
   if (inst === 'drums') {
-    if (JAM_DRUMS.includes(d.drum)) jamRenderDrum(d.drum, vel, audioTime);
+    if (JAM_DRUMS.includes(d.drum)) jamRenderDrum(d.drum, vel, audioTime, Number.isInteger(d.dv) ? d.dv : 0);
   } else if (inst === 'pad') {
     const c = Number(d.chord);
     if (Number.isInteger(c) && c >= 0 && c < JAM_CHORDS.length) jamRenderChord(c, vel, audioTime);
@@ -2406,8 +2508,10 @@ function jamRenderRemote(d, audioTime) {
     jamRenderNoteBassSafe(d.midi, vel, audioTime);
   } else {
     // build 39: notes carry a patch object; pre-39 clients sent flat w/c/r.
+    // build 63: `on` marks a held note — sustain it until the note-off lands.
     const patch = d.patch || ((d.w || d.c || d.r != null) ? { w: d.w, c: d.c, r: d.r } : null);
-    jamRenderNote(d.midi, vel, audioTime, patch);
+    if (d.on && peerId) jamRemoteNoteOn(peerId, d.midi, vel, audioTime, jamPatchFromBroadcast(patch || {}, d));
+    else jamRenderNote(d.midi, vel, audioTime, patch);
   }
 }
 
@@ -2434,8 +2538,26 @@ function jamBroadcastNote(payload) {
 function jamLeadPatch() {
   const s = jam.synth;
   return {
-    w: s.wave, c: Math.round(s.cutoff), r: s.reso,
-    e: s.env, d: s.decay, a: s.attack, s: s.sub, sp: s.spread, x: s.echo,
+    w: s.wave, w2: s.wave2, o2: s.osc2mix,
+    c: Math.round(s.cutoff), r: s.reso,
+    e: s.env, d: s.decay, a: s.attack, su: s.sustain, rl: s.release,
+    s: s.sub, sp: s.spread, x: s.echo,
+    lr: s.lfoRate, lp: s.lfoPitch, lf: s.lfoFilter,
+  };
+}
+/* Build 63: the full patch a remote note carries (flat, broadcast-safe). */
+function jamPatchFromBroadcast(p, d) {
+  const pick = (v, fb) => (Number.isFinite(Number(v)) ? Number(v) : fb);
+  return {
+    w: ['sawtooth', 'square', 'triangle', 'mix'].includes(p.w || d.w) ? (p.w || d.w) : 'sawtooth',
+    w2: ['sawtooth', 'square', 'triangle'].includes(p.w2) ? p.w2 : 'sawtooth',
+    o2: pick(p.o2, 0.45),
+    c: pick(p.c != null ? p.c : d.c, 1800),
+    r: pick(p.r != null ? p.r : d.r, 5),
+    e: pick(p.e, 0.35), d: pick(p.d, 0.4), a: pick(p.a, 0.008),
+    su: pick(p.su, 0.7), rl: pick(p.rl, 0.3),
+    s: pick(p.s, 0), sp: pick(p.sp, 12), x: pick(p.x, 0.3),
+    lr: pick(p.lr, 5), lp: pick(p.lp, 0), lf: pick(p.lf, 0),
   };
 }
 function jamBroadcastLeadNote(midi, vel, patch) {
@@ -2498,10 +2620,11 @@ function jamHitDrumLocal(drum, vel = 0.95) {
   audioEnsureRunning(); // pad taps are gestures — iOS resumes the context here
   if (!JAM_DRUMS.includes(drum)) return;
   const ctx = audio.ctx;
-  jamRenderDrum(drum, vel, ctx ? ctx.currentTime + 0.01 : 0);
+  const vi = jamDrumVariant(drum);
+  jamRenderDrum(drum, vel, ctx ? ctx.currentTime + 0.01 : 0, vi);
   const beatNow = jamBeatNow();
   const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
-  jamBroadcastNote({ midi: JAM_DRUMS.indexOf(drum), vel, beat, inst: 'drums', drum });
+  jamBroadcastNote({ midi: JAM_DRUMS.indexOf(drum), vel, beat, inst: 'drums', drum, dv: vi });
   jamMarkJammer(myName, 'drums');
   renderJamJammers();
 }
@@ -2549,13 +2672,9 @@ function handleJamNote(peerId, d) {
   // build 39: notes carry a nested patch object; pre-39 clients sent flat w/c/r.
   const p = (d.patch && typeof d.patch === 'object') ? d.patch : {};
   const pick = (v, fb) => (Number.isFinite(Number(v)) ? Number(v) : fb);
-  const patch = {
-    w: ['sawtooth', 'square', 'mix'].includes(p.w || d.w) ? (p.w || d.w) : 'sawtooth',
-    c: pick(p.c != null ? p.c : d.c, 1800),
-    r: pick(p.r != null ? p.r : d.r, 5),
-    e: pick(p.e, 0.35), d: pick(p.d, 0.4), a: pick(p.a, 0.008),
-    s: pick(p.s, 0), sp: pick(p.sp, 12), x: pick(p.x, 0.3),
-  };
+  const patch = jamPatchFromBroadcast(p, d);
+  // build 63: note-off — release the sustained remote voice, if any.
+  if (d.off && inst === 'lead') { jamRemoteNoteOff(peerId, midi); return; }
   const drum = JAM_DRUMS.includes(d.drum) ? d.drum : null;
   const chord = Number.isInteger(Number(d.chord)) ? Number(d.chord) : null;
   // build 47: a jammer's chord stab lights the readout with their name
@@ -2569,11 +2688,11 @@ function handleJamNote(peerId, d) {
       try { pv.glow.material.color.setHex(JAM_INSTRUMENTS[inst].glow); } catch (e) {}
     }
   }
-  const remote = { inst, midi, vel, drum, chord, patch };
+  const remote = { inst, midi, vel, drum, chord, patch, on: d.on ? 1 : 0 };
   if (beat != null && Number.isFinite(beat) && jamBeatNow() != null) {
-    jamEnqueue({ beat, play: (at) => jamRenderRemote(remote, at) });
+    jamEnqueue({ beat, play: (at) => jamRenderRemote(remote, at, peerId) });
   } else {
-    jamRenderRemote(remote, audio.ctx ? audio.ctx.currentTime + 0.01 : 0);
+    jamRenderRemote(remote, audio.ctx ? audio.ctx.currentTime + 0.01 : 0, peerId);
   }
 }
 
@@ -3214,13 +3333,105 @@ function loopStopPlayback() {
 /* The ● button. Empty → record; playing → overdub a layer; stopped →
    drift the loop again. Recording/dubbing taps are ignored (the cycle
    closes itself on the bar line — predictable, no partial loops). */
+/* Build 63: the looper-pedal flow. One big button, no thinking:
+ * empty -> tap ● = record (starts next bar)
+ * recording -> tap ● = close the loop early (rounds to whole bars)
+ * playing -> tap ● = layer more (starts next round)
+ * dubbing -> tap ● = stop layering, keep playing
+ * playing -> double-tap ● = stop (rest)
+ * stopped -> tap ▶ = play again
+ * hold ● = clear it all
+ * Layers stack; undo peels the last one off. */
+let loopTapTimer = 0, loopTapCount = 0;
+let loopHoldTimer = 0, loopHoldFired = false;
 function loopMainButton() {
   audioEnsureRunning();
   if (!audio.ctx || !jamEnsureChain()) return false;
   if (dub.state === 'empty') return loopArmRecord();
+  if (dub.state === 'recording') return loopFinishRecord();
+  if (dub.state === 'dubbing') return loopStopDub();
   if (dub.state === 'stopped' && dub.buf) return loopArmPlay();
-  if (dub.state === 'playing' && dub.buf) return loopArmDub();
+  if (dub.state === 'arming') return loopCancelArm();
+  if (dub.state === 'playing' && dub.buf) {
+    // Single tap = layer, double tap = rest. Decided in 300ms — the layer
+    // arms on the next cycle boundary anyway, so no audible delay.
+    loopTapCount++;
+    clearTimeout(loopTapTimer);
+    loopTapTimer = setTimeout(() => {
+      const n = loopTapCount;
+      loopTapCount = 0;
+      if (n >= 2) loopStop();
+      else loopArmDub();
+    }, 300);
+    return true;
+  }
   return false;
+}
+/* Tap ● while recording: close the loop at the next bar line instead of
+ * waiting out the full bar count. Rounds to whole bars at record tempo. */
+function loopFinishRecord() {
+  if (dub.state !== 'recording' || !dub.take || !audio.ctx) return false;
+  const ctx = audio.ctx;
+  const take = dub.take;
+  loopStopCapture();
+  const idx = take.idx;
+  if (idx < ctx.sampleRate * 0.25) return false; // too short — keep going
+  try {
+    const barSec = (60 / dub.bpm) * 4;
+    const bars = Math.max(1, Math.round((idx / ctx.sampleRate) / barSec));
+    const len = Math.max(1, Math.round(bars * barSec * ctx.sampleRate));
+    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    const n = Math.min(idx, len);
+    buf.getChannelData(0).set(take.L.subarray(0, n));
+    buf.getChannelData(1).set(take.R.subarray(0, n));
+    const at = loopNextBarAt();
+    if (!loopStartPlayback(buf, at)) return false;
+    dub.buf = buf;
+    dub.history = [];
+    dub.dur = len / ctx.sampleRate;
+    dub.bars = bars;
+    dub.t0 = at;
+    dub.pendingBuf = null;
+    dub.state = 'playing';
+    loopRenderUI();
+    return true;
+  } catch (e) { return false; }
+}
+/* Tap ● while layering: drop the in-flight take, keep playing. */
+function loopStopDub() {
+  if (dub.state !== 'dubbing') return false;
+  loopStopCapture();
+  dub.pendingDub = false;
+  dub.dubAt = 0;
+  dub.state = 'playing';
+  loopRenderUI();
+  return true;
+}
+/* Tap while arming: stand down. */
+function loopCancelArm() {
+  if (dub.state !== 'arming') return false;
+  loopStopCapture();
+  dub.armMode = null;
+  dub.pendingDub = false;
+  dub.state = dub.buf ? 'stopped' : 'empty';
+  loopRenderUI();
+  return true;
+}
+/* Undo: peel the last layered take off, swap the previous bounce in on
+ * the next cycle boundary. */
+function loopUndo() {
+  if (!dub.history || !dub.history.length || !audio.ctx) return false;
+  const prev = dub.history.pop();
+  if (!prev) return false;
+  if (dub.state === 'dubbing') loopStopDub();
+  const ctx = audio.ctx;
+  const at = (dub.t0 + dub.dur > ctx.currentTime + 0.05) ? dub.t0 + dub.dur : ctx.currentTime + 0.05;
+  if (!loopStartPlayback(prev, at)) return false;
+  dub.buf = prev;
+  dub.t0 = at;
+  if (dub.state !== 'playing') dub.state = 'playing';
+  loopRenderUI();
+  return true;
 }
 
 function loopArmRecord() {
@@ -3272,6 +3483,7 @@ function loopArmTick() {
         buf.getChannelData(1).set(R);
       } catch (e) { /* a partial take still loops */ }
       dub.pendingBuf = null;
+      dub.history = []; // a fresh record starts a fresh layer stack
       if (dub.state === 'recording') { dub.state = 'playing'; loopRenderUI(); }
     });
     if (!ok) { dub.pendingBuf = null; dub.state = 'empty'; loopRenderUI(); return; }
@@ -3357,6 +3569,7 @@ function loopFoldDub(L, R) {
     }
     const at = dub.t0 + dub.dur;
     if (loopStartPlayback(buf, at)) {
+      if (dub.buf) dub.history.push(dub.buf); // keep the pre-layer bounce for undo
       dub.buf = buf;
       dub.t0 = at;
     }
@@ -3394,6 +3607,7 @@ function loopClear() {
   loopStopCapture();
   loopStopPlayback();
   dub.buf = null;
+  dub.history = [];
   dub.pendingBuf = null;
   dub.dubAt = 0;
   dub.armFrom = 0;
@@ -3427,13 +3641,16 @@ function loopRenderUI() {
     loopBtnEl.classList.toggle('dub', dub.state === 'dubbing' || (dub.state === 'arming' && dub.armMode === 'dub'));
   }
   if (loopStateEl) {
+    const layers = dub.history ? dub.history.length : 0;
     const m = {
       empty: 'the loop is empty — play, then tap &#9679;',
       arming: dub.armMode === 'dub' ? 'layering on the next round…'
-        : dub.armMode === 'play' ? 'joining the bar…' : 'catching the next bar…',
-      recording: 'recording — play into the loop…',
-      playing: 'loop drifting — tap &#9679; to layer more',
-      dubbing: 'layering — play into the loop…',
+        : dub.armMode === 'play' ? 'joining the bar…' : 'catching the next bar — tap &#9679; to cancel',
+      recording: 'recording — tap &#9679; to close the loop',
+      playing: layers
+        ? `loop drifting (${layers + 1} layers) — tap &#9679; to layer, double-tap to rest`
+        : 'loop drifting — tap &#9679; to layer more, double-tap to rest',
+      dubbing: 'layering — tap &#9679; to stop layering',
       stopped: 'loop resting — tap &#9654; to drift again',
     };
     loopStateEl.innerHTML = m[dub.state] || '';
@@ -3443,6 +3660,8 @@ function loopRenderUI() {
       ? `${dub.bars} bars · ${Math.round(dub.bpm)} bpm · ${dub.dur.toFixed(1)}s`
       : `${dub.bars} bars · ${Math.round(jam.bpm)} bpm`;
   }
+  const undoEl = document.getElementById('jam-loop-undo');
+  if (undoEl) undoEl.classList.toggle('off', !(dub.history && dub.history.length));
 }
 
 /* Progress ring + countdowns, while the jam panel is open. */
@@ -3476,9 +3695,25 @@ function loopUiEnsure() {
   dub.uiRaf = requestAnimationFrame(tick);
 }
 
-if (loopBtnEl) loopBtnEl.addEventListener('click', () => { loopMainButton(); loopBtnEl.blur(); });
+if (loopBtnEl) {
+  // Hold the big button to clear the loop; a plain tap runs the pedal flow.
+  loopBtnEl.addEventListener('pointerdown', () => {
+    loopHoldFired = false;
+    clearTimeout(loopHoldTimer);
+    loopHoldTimer = setTimeout(() => { loopHoldFired = true; loopClear(); }, 800);
+  });
+  loopBtnEl.addEventListener('pointerup', () => clearTimeout(loopHoldTimer));
+  loopBtnEl.addEventListener('pointercancel', () => clearTimeout(loopHoldTimer));
+  loopBtnEl.addEventListener('pointerleave', () => clearTimeout(loopHoldTimer));
+  loopBtnEl.addEventListener('click', () => {
+    if (loopHoldFired) { loopHoldFired = false; loopBtnEl.blur(); return; }
+    loopMainButton(); loopBtnEl.blur();
+  });
+}
 if (loopStopEl) loopStopEl.addEventListener('click', () => { loopStop(); loopStopEl.blur(); });
 if (loopClearEl) loopClearEl.addEventListener('click', () => { loopClear(); loopClearEl.blur(); });
+const loopUndoEl = document.getElementById('jam-loop-undo');
+if (loopUndoEl) loopUndoEl.addEventListener('click', () => { loopUndo(); loopUndoEl.blur(); });
 if (loopLenEl) {
   loopLenEl.querySelectorAll('button').forEach((b) => {
     b.addEventListener('click', () => { loopSetBars(Number(b.dataset.bars)); b.blur(); });
@@ -6623,7 +6858,19 @@ function buildJamKeys() {
     b.textContent = black ? '' : JAM_SCALE_NAMES[midi % 12];
     b.setAttribute('aria-label', JAM_SCALE_NAMES[midi % 12] + Math.floor(midi / 12 - 1));
     // pointerdown (not click): notes fire the instant the finger lands.
-    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamPlayLocal(midi, 0.9); });
+    // build 63: hold = sustain, lift = release — a real synth feel.
+    b.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const id = jamNoteOnLocal(midi, 0.9);
+      if (id) jamHeldVoices.set(e.pointerId, { voiceId: id, midi });
+      b.classList.add('held');
+    });
+    const keyRelease = (e) => {
+      jamNoteOffLocal(e.pointerId);
+      b.classList.remove('held');
+    };
+    b.addEventListener('pointerup', keyRelease);
+    b.addEventListener('pointercancel', keyRelease);
     jamKeysEl.appendChild(b);
   });
 }
@@ -6708,6 +6955,18 @@ function buildJamBassKeys() {
   }
 }
 
+function jamSaveDrumKit() {
+  try { localStorage.setItem('limbo-drumkit', JSON.stringify(jam.drumVariant)); } catch (e) {}
+}
+/* Bake the drum kits to samples (once, after the context exists). */
+let _drumKitsRendering = false;
+function jamEnsureDrumKits() {
+  if (!audio.ctx || _drumKitsRendering) return;
+  _drumKitsRendering = true;
+  try {
+    renderDrumKits(audio.ctx).catch(() => {}).finally(() => { _drumKitsRendering = false; });
+  } catch (e) { _drumKitsRendering = false; }
+}
 function buildJamDrums() {
   if (!jamDrumsEl) return;
   jamDrumsEl.innerHTML = '';
@@ -6719,11 +6978,77 @@ function buildJamDrums() {
     const s = document.createElement('span');
     s.className = 'jam-drum-name';
     s.textContent = labels[d] || d;
+    const v = document.createElement('span');
+    v.className = 'jam-drum-var';
+    v.textContent = drumVariantName(d, jamDrumVariant(d));
     b.appendChild(s);
-    b.setAttribute('aria-label', 'drum ' + (labels[d] || d));
-    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamHitDrumLocal(d, 0.95); });
+    b.appendChild(v);
+    b.setAttribute('aria-label', 'drum ' + (labels[d] || d) + ' — hold to pick a sample');
+    let holdT = null;
+    b.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      jamHitDrumLocal(d, 0.95);
+      clearTimeout(holdT);
+      holdT = setTimeout(() => { holdT = null; openDrumPicker(d); }, 600);
+    });
+    const cancelHold = () => { clearTimeout(holdT); holdT = null; };
+    b.addEventListener('pointerup', cancelHold);
+    b.addEventListener('pointercancel', cancelHold);
+    b.addEventListener('pointerleave', cancelHold);
     jamDrumsEl.appendChild(b);
   }
+}
+/* Press-and-hold a pad -> pick which sample it fires. Tap a row to hear
+ * it AND load it; the pad's sub-label follows. */
+let drumPickerDrum = null;
+function openDrumPicker(drum) {
+  drumPickerDrum = drum;
+  const sheet = document.getElementById('drum-picker');
+  const title = document.getElementById('drum-picker-title');
+  const list = document.getElementById('drum-picker-list');
+  if (!sheet || !list) return;
+  audioEnsureRunning();
+  jamEnsureDrumKits();
+  if (title) title.textContent = (drum || '').toUpperCase() + ' · pick a sample';
+  list.innerHTML = '';
+  const n = drumVariantCount(drum);
+  const cur = jamDrumVariant(drum);
+  for (let vi = 0; vi < n; vi++) {
+    const row = document.createElement('button');
+    row.className = 'drum-picker-row' + (vi === cur ? ' sel' : '');
+    const nm = document.createElement('span');
+    nm.className = 'drum-picker-name';
+    nm.textContent = drumVariantName(drum, vi);
+    const st = document.createElement('span');
+    st.className = 'drum-picker-state';
+    st.textContent = vi === cur ? 'loaded' : '';
+    row.appendChild(nm);
+    row.appendChild(st);
+    row.addEventListener('click', () => {
+      // Hear it, load it — one tap.
+      const ctx = audio.ctx;
+      if (ctx && audio.master) playDrumSample(ctx, jamDestFor('drums'), { drum, variant: vi, vel: 1, time: ctx.currentTime + 0.01 });
+      jam.drumVariant[drum] = vi;
+      jamSaveDrumKit();
+      list.querySelectorAll('.drum-picker-row').forEach((r, i) => {
+        r.classList.toggle('sel', i === vi);
+        r.querySelector('.drum-picker-state').textContent = i === vi ? 'loaded' : '';
+      });
+      const pad = jamDrumsEl && jamDrumsEl.querySelector(`[data-drum="${drum}"] .jam-drum-var`);
+      if (pad) pad.textContent = drumVariantName(drum, vi);
+    });
+    list.appendChild(row);
+  }
+  sheet.hidden = false;
+}
+function closeDrumPicker() {
+  const sheet = document.getElementById('drum-picker');
+  if (sheet) sheet.hidden = true;
+  drumPickerDrum = null;
+}
+{ // build 63: tapping the backdrop dismisses the picker
+  const bd = document.querySelector('#drum-picker .drum-picker-backdrop');
+  if (bd) bd.addEventListener('click', closeDrumPicker);
 }
 
 function buildJamChords() {
@@ -6780,17 +7105,25 @@ if (jamMetroVolEl) jamMetroVolEl.addEventListener('input', () => {
  * room hears YOUR voice. Presets snap the whole patch at once. The key
  * scale remaps the one-octave keys (pentatonics span two octaves). */
 const JAM_PRESETS = {
-  spark: { wave: 'sawtooth', cutoff: 3200, reso: 4, env: 0.5, decay: 0.35, attack: 0.005, sub: 0, spread: 14, echo: 0.4, glide: 0 },
-  acid: { wave: 'sawtooth', cutoff: 700, reso: 10, env: 0.85, decay: 0.3, attack: 0.004, sub: 0.15, spread: 8, echo: 0.25, glide: 0.06 },
-  drift: { wave: 'sawtooth', cutoff: 1400, reso: 2, env: 0.2, decay: 1.4, attack: 0.25, sub: 0.3, spread: 20, echo: 0.6, glide: 0.02 },
+  spark: { wave: 'sawtooth', wave2: 'sawtooth', osc2mix: 0.45, cutoff: 3200, reso: 4, env: 0.5, attack: 0.005, decay: 0.35, sustain: 0.6, release: 0.3, sub: 0, spread: 14, echo: 0.4, glide: 0, lfoRate: 5, lfoPitch: 0, lfoFilter: 0 },
+  acid: { wave: 'sawtooth', wave2: 'square', osc2mix: 0.3, cutoff: 700, reso: 10, env: 0.85, attack: 0.004, decay: 0.3, sustain: 0.4, release: 0.2, sub: 0.15, spread: 8, echo: 0.25, glide: 0.06, lfoRate: 5, lfoPitch: 0, lfoFilter: 0 },
+  drift: { wave: 'sawtooth', wave2: 'triangle', osc2mix: 0.5, cutoff: 1400, reso: 2, env: 0.2, attack: 0.25, decay: 1.4, sustain: 0.8, release: 0.8, sub: 0.3, spread: 20, echo: 0.6, glide: 0.02, lfoRate: 0.4, lfoPitch: 0, lfoFilter: 0.35 },
+  pluck: { wave: 'square', wave2: 'sawtooth', osc2mix: 0.35, cutoff: 2400, reso: 6, env: 0.7, attack: 0.003, decay: 0.22, sustain: 0.25, release: 0.25, sub: 0, spread: 10, echo: 0.35, glide: 0, lfoRate: 5, lfoPitch: 0, lfoFilter: 0 },
+  pad: { wave: 'sawtooth', wave2: 'sawtooth', osc2mix: 0.6, cutoff: 1100, reso: 1.5, env: 0.15, attack: 0.6, decay: 1.2, sustain: 0.9, release: 1.2, sub: 0.25, spread: 24, echo: 0.7, glide: 0, lfoRate: 0.3, lfoPitch: 6, lfoFilter: 0.25 },
 };
 const JAM_SYNTH_SLIDERS = [
   // [element id, patch key, fromSlider, toSlider]
   ['jam-cutoff', 'cutoff', (v) => v, (v) => v],
   ['jam-reso', 'reso', (v) => v, (v) => v],
   ['jam-env', 'env', (v) => v / 100, (v) => v * 100],
-  ['jam-decay', 'decay', (v) => v / 100, (v) => v * 100],
   ['jam-attack', 'attack', (v) => v / 1000, (v) => v * 1000],
+  ['jam-decay', 'decay', (v) => v / 100, (v) => v * 100],
+  ['jam-sustain', 'sustain', (v) => v / 100, (v) => v * 100],
+  ['jam-release', 'release', (v) => v / 100, (v) => v * 100],
+  ['jam-lforate', 'lfoRate', (v) => v / 10, (v) => v * 10],
+  ['jam-lfopitch', 'lfoPitch', (v) => v, (v) => v],
+  ['jam-lfofilter', 'lfoFilter', (v) => v / 100, (v) => v * 100],
+  ['jam-osc2mix', 'osc2mix', (v) => v / 100, (v) => v * 100],
   ['jam-sub', 'sub', (v) => v / 100, (v) => v * 100],
   ['jam-spread', 'spread', (v) => v, (v) => v],
   ['jam-echo', 'echo', (v) => v / 100, (v) => v * 100],
@@ -6802,8 +7135,10 @@ function jamSyncSynthUI() {
     const el = document.getElementById(id);
     if (el) el.value = Math.round(toSlider(s[key]) * 100) / 100;
   }
-  document.querySelectorAll('.jam-wave').forEach((x) =>
-    x.classList.toggle('sel', x.dataset.wave === s.wave));
+  document.querySelectorAll('.jam-wave').forEach((x) => {
+    const osc = x.dataset.osc || '1';
+    x.classList.toggle('sel', (osc === '2' ? s.wave2 : s.wave) === x.dataset.wave);
+  });
 }
 function jamApplyPreset(name) {
   const p = JAM_PRESETS[name];
@@ -6815,8 +7150,11 @@ function jamApplyPreset(name) {
 }
 document.querySelectorAll('.jam-wave').forEach((b) => {
   b.addEventListener('click', () => {
-    jam.synth.wave = b.dataset.wave || 'sawtooth';
-    document.querySelectorAll('.jam-wave').forEach((x) =>
+    const osc = b.dataset.osc || '1';
+    const w = b.dataset.wave || 'sawtooth';
+    if (osc === '2') jam.synth.wave2 = w;
+    else jam.synth.wave = w;
+    document.querySelectorAll(`.jam-wave[data-osc="${osc}"]`).forEach((x) =>
       x.classList.toggle('sel', x === b));
     document.querySelectorAll('.jam-preset').forEach((x) => x.classList.remove('sel'));
     b.blur();
