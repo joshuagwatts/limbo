@@ -272,6 +272,7 @@ function syncJukeServer() {
     jukeServerN = selectedServer;
     jukeLeaveServer(); // fresh party per server — no stale queue
     jukeResetElection(); // new server, new holder election
+    jukeRestore(); // build 60: my last line on this server seeds the handoff
     jukeScheduleSync(); // ask the holder for the line; retries while empty
   }
 }
@@ -489,6 +490,42 @@ function jukeBroadcastClaim() {
 }
 /* The canonical line, from the holder. Periodic + on every mutation, so
    any drift between phones heals within seconds. */
+/* Build 60: the line survives a leave-and-return. Persisted per-server to
+   localStorage on every canonical change; on (re)join the persisted line
+   seeds jukeLastKnown so the holder handoff inherits it. Fresher peer
+   data always wins over the persisted snapshot. */
+function jukePersistKey() {
+  try { return 'limbo-juke-' + nexusServerKey(selectedServer); } catch (e) { return null; }
+}
+function jukePersist() {
+  try {
+    const key = jukePersistKey();
+    if (!key) return;
+    localStorage.setItem(key, JSON.stringify({
+      queue: (juke.queue || []).slice(0, JUKE_MAX_QUEUE),
+      now: juke.now || null,
+      at: Date.now(),
+    }));
+  } catch (e) {}
+}
+function jukeRestore() {
+  try {
+    const key = jukePersistKey();
+    if (!key) return;
+    const raw = localStorage.getItem(key);
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    if (!d) return;
+    /* phone-file tracks can't survive a reload (bytes are in-memory only),
+       so they're dropped on restore rather than resurrected as dead entries. */
+    const q = (Array.isArray(d.queue) ? d.queue : [])
+      .filter((t) => t && t.provider !== 'phone-file')
+      .filter(jukeValidAdd).slice(0, JUKE_MAX_QUEUE);
+    const n = (d.now && d.now.provider !== 'phone-file' && jukeValidPlay(d.now) && !d.now.stopped) ? d.now : null;
+    if (!q.length && !n) return; // nothing worth remembering
+    jukeLastKnown = { queue: q, now: n, at: d.at || Date.now(), rev: -1 };
+  } catch (e) {}
+}
 function jukeBroadcastSync() {
   try {
     if (!net || !net.sendJukeSync) return;
@@ -502,6 +539,7 @@ function jukeBroadcastSync() {
       now: juke.now,
     });
   } catch (e) {}
+  jukePersist(); // build 60: holder's canonical line survives a leave-and-return
 }
 function jukeNotePeer(cid, d) {
   const id = String(cid || '');
@@ -611,6 +649,7 @@ function handleJukeSync(d, peerId) {
      clears arrive as their own broadcasts (jukePlay stopped / jukeClear),
      so a snapshot racing a just-advanced track can't mute it. */
   renderJuke();
+  jukePersist(); // build 60: converged line survives a leave-and-return
 }
 /* Build 43: anyone in the server can clear the line. The clear lands
    locally at once, and the holder rebroadcasts the empty canonical
@@ -624,6 +663,7 @@ function jukeClearQueue() {
   try { jukePendingAck.clear(); } catch (e) {} // build 44: the line is gone — stop retrying
   renderJuke();
   jukeHint('the line is clear — drift on');
+  jukePersist(); // build 60: the cleared line stays cleared on return
   try {
     if (net && net.enabled && net.sendJukeClear) {
       net.sendJukeClear({ by: (typeof myName === 'string' && myName) || 'drifter' });
@@ -641,6 +681,7 @@ function handleJukeClear(d, peerId) {
   try { jukePendingAck.clear(); } catch (e) {} // build 44: the line is gone — stop retrying
   renderJuke();
   jukeHint('the line was cleared by ' + ((d && d.by) || 'a drifter'));
+  jukePersist(); // build 60: the cleared line stays cleared on return
   if (jukeIAmHolder) jukeBroadcastSync();
 }
 function pickServer(n) {
@@ -4008,6 +4049,7 @@ try {
    so every peer's remembered line is fresh for the next election. */
 window.addEventListener('pagehide', () => {
   try { if (jukeIAmHolder && !jukeHolderCatchingUp) jukeBroadcastSync(); } catch (e) {}
+  try { jukePersist(); } catch (e) {} // build 60: freshest line saved on the way out
 });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') wallSaveSnapshot();
