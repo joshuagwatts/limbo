@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=52';
-import { CouchNet } from './couch.js?v=52';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=53';
+import { CouchNet } from './couch.js?v=53';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
 
@@ -309,6 +309,17 @@ const JUKE_ACK_MS = 20000; // wait this long for the holder's sync to confirm
 const JUKE_ACK_RETRIES = 8;
 let jukeAckTimer = null;
 const jukeRemovedIds = new Map(); // id -> Date.now() — stops a sync from resurrecting a pulled track
+/* Build 53: holder handoff. Every peer remembers the last canonical line it
+   accepted from the holder. When a new holder is elected, it asks the room
+   for the line and inherits the freshest copy instead of broadcasting an
+   empty one — an empty first sync used to wipe the queue off every phone
+   while the song kept playing underneath. */
+let jukeLastKnown = null; // {queue, now, at, rev} — last good canonical snapshot
+let jukeHolderCatchingUp = false; // newly elected holder, still inheriting the line
+let jukeHandoffTimer = null;
+let jukeHandoffReqId = null;
+let jukeHandoffAnswers = []; // {queue, now, at} collected during catch-up
+const JUKE_HANDOFF_MS = 2500;
 function jukeTrackPending(t) {
   try {
     if (!t || !t.id || jukeIAmHolder) return; // holder merges locally — already canonical
@@ -413,20 +424,55 @@ function jukeBecomeHolder() {
   jukeHolderName = (typeof myName === 'string' && myName) || 'drifter';
   jukeSyncRev = 0;
   jukeBroadcastClaim();
-  jukeBroadcastSync();
   if (jukeClaimTimer) clearInterval(jukeClaimTimer);
-  if (jukeSyncTimer) clearInterval(jukeSyncTimer);
   jukeClaimTimer = setInterval(() => { try { jukeBroadcastClaim(); } catch (e) {} }, JUKE_CLAIM_MS);
+  /* Build 53: don't claim the line empty — ask the room for it first. The
+     sync timer starts once the handoff finishes. */
+  jukeHolderCatchingUp = true;
+  jukeHandoffAnswers = [];
+  jukeHandoffReqId = 'handoff-' + Date.now().toString(36);
+  try { if (net && net.sendJukeStateReq) net.sendJukeStateReq({ reqId: jukeHandoffReqId }); } catch (e) {}
+  if (jukeHandoffTimer) clearTimeout(jukeHandoffTimer);
+  jukeHandoffTimer = setTimeout(() => { try { jukeFinishHandoff(); } catch (e) {} }, JUKE_HANDOFF_MS);
+  if (jukeSyncTimer) clearInterval(jukeSyncTimer);
+}
+function jukeFinishHandoff() {
+  if (jukeHandoffTimer) { clearTimeout(jukeHandoffTimer); jukeHandoffTimer = null; }
+  if (!jukeIAmHolder) { jukeHolderCatchingUp = false; return; }
+  jukeHolderCatchingUp = false;
+  // freshest wins: answers, my remembered line, then my local state
+  let best = null;
+  const consider = (q, n, at) => {
+    const has = (Array.isArray(q) && q.length) || (n && !n.stopped);
+    if (!has) return;
+    if (!best || (at || 0) > (best.at || 0)) best = { queue: q, now: n, at: at || 0 };
+  };
+  for (const a of jukeHandoffAnswers) consider(a.queue, a.now, a.at);
+  if (jukeLastKnown) consider(jukeLastKnown.queue, jukeLastKnown.now, jukeLastKnown.at);
+  consider(juke.queue, juke.now, Date.now());
+  if (best) {
+    juke.queue = (Array.isArray(best.queue) ? best.queue : []).filter(jukeValidAdd).slice(0, JUKE_MAX_QUEUE);
+    jukeSortQueue();
+    const bn = best.now;
+    if (bn && jukeValidPlay(bn) && !bn.stopped && (!juke.now || juke.now.id !== bn.id)) {
+      jukeAdoptPlay(bn); // offset math puts us in sync mid-track
+    }
+    renderJuke();
+  }
+  jukeBroadcastSync(); // the inherited line is canonical now
   jukeSyncTimer = setInterval(() => { try { jukeBroadcastSync(); } catch (e) {} }, JUKE_SYNC_MS);
 }
 function jukeStepDown() {
   jukeIAmHolder = false;
+  jukeHolderCatchingUp = false; // build 53: a stepped-down catch-up never finishes
+  if (jukeHandoffTimer) { clearTimeout(jukeHandoffTimer); jukeHandoffTimer = null; }
   if (jukeClaimTimer) { clearInterval(jukeClaimTimer); jukeClaimTimer = null; }
   if (jukeSyncTimer) { clearInterval(jukeSyncTimer); jukeSyncTimer = null; }
 }
 function jukeResetElection() {
   jukeStepDown();
   jukeRoster.clear();
+  jukeLastKnown = null; // build 53: fresh server, fresh line
   jukeHolderCid = null;
   jukeHolderKey = null;
   jukeHolderName = '';
@@ -548,6 +594,16 @@ function handleJukeSync(d, peerId) {
   juke.queue = incoming.concat(mine).concat(unconfirmed).slice(0, JUKE_MAX_QUEUE);
   jukeSortQueue();
   const dn = d.now;
+  /* Build 53: remember the canonical line — if this holder leaves, the next
+     one inherits it instead of starting empty. Only a line with something
+     in it overwrites the memory; an empty snapshot never erases a good one. */
+  if (incoming.length || (dn && jukeValidPlay(dn) && !dn.stopped)) {
+    jukeLastKnown = {
+      queue: incoming.slice(0, JUKE_MAX_QUEUE),
+      now: (dn && jukeValidPlay(dn) && !dn.stopped) ? dn : null,
+      at: d.at || Date.now(), rev: d.rev,
+    };
+  }
   if (dn && jukeValidPlay(dn) && !dn.stopped) {
     if (!juke.now || juke.now.id !== dn.id) jukeAdoptPlay(dn); // holder's line rules
   }
@@ -563,6 +619,7 @@ function jukeClearQueue() {
   jukeStopPlayback();
   juke.now = null;
   juke.queue = [];
+  jukeLastKnown = null; // build 53: an explicit clear really is empty
   jukeLastClearAt = Date.now();
   try { jukePendingAck.clear(); } catch (e) {} // build 44: the line is gone — stop retrying
   renderJuke();
@@ -579,6 +636,7 @@ function handleJukeClear(d, peerId) {
   jukeStopPlayback();
   juke.now = null;
   juke.queue = [];
+  jukeLastKnown = null; // build 53: an explicit clear really is empty
   jukeLastClearAt = Date.now();
   try { jukePendingAck.clear(); } catch (e) {} // build 44: the line is gone — stop retrying
   renderJuke();
@@ -3946,6 +4004,11 @@ function handleWallHello(peerId, d) {
 wallRestoreSnapshot();
 try {
   window.addEventListener('pagehide', wallSaveSnapshot);
+/* Build 53: a leaving holder hands the line off — one last canonical sync
+   so every peer's remembered line is fresh for the next election. */
+window.addEventListener('pagehide', () => {
+  try { if (jukeIAmHolder && !jukeHolderCatchingUp) jukeBroadcastSync(); } catch (e) {}
+});
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') wallSaveSnapshot();
   });
@@ -5786,11 +5849,22 @@ function jukeStopPlayback() {
 function handleJukeStateReq(d, peerId) {
   if (!jukeSrvOk(d)) return;
   /* Build 43: one canonical answer — the holder's. (Pre-relay, before any
-     election can run, fall back to anyone-answers like before.) */
-  if (!jukeIAmHolder && net.relayMode) return;
+     election can run, fall back to anyone-answers like before.)
+     Build 53: a handoff request (freshly elected holder inheriting the
+     line) is answered by ANY peer holding the line — that's the point. */
+  const isHandoff = !!(d && typeof d.reqId === 'string' && d.reqId.indexOf('handoff-') === 0);
+  if (!jukeIAmHolder && net.relayMode && !isHandoff) return;
   if (!d || typeof d.reqId !== 'string' || !d.reqId) return;
   if (juke.answeredReq.has(d.reqId)) return;
-  if (!juke.now && juke.queue.length === 0) return; // nothing to share
+  /* Build 53: answer from the remembered canonical line when it's fresher
+     than local drift — a peer that never got the last sync still shares
+     what the holder last told it. */
+  const src = (jukeLastKnown && (jukeLastKnown.queue.length || jukeLastKnown.now))
+    ? jukeLastKnown : null;
+  const shareQueue = src ? src.queue : juke.queue;
+  const shareNow = src ? src.now : juke.now;
+  const shareAt = src ? src.at : Date.now();
+  if (!shareNow && shareQueue.length === 0) return; // nothing to share
   juke.answeredReq.add(d.reqId);
   if (juke.answeredReq.size > 40) {
     const oldest = juke.answeredReq.values().next().value;
@@ -5798,13 +5872,20 @@ function handleJukeStateReq(d, peerId) {
   }
   if (!net.enabled || !net.sendJukeState) return;
   try {
-    net.sendJukeState({ reqId: d.reqId, at: Date.now(), now: juke.now, queue: juke.queue.slice(0, JUKE_MAX_QUEUE) });
+    net.sendJukeState({ reqId: d.reqId, at: shareAt, now: shareNow, queue: shareQueue.slice(0, JUKE_MAX_QUEUE) });
   } catch (e) { /* best effort */ }
 }
 
 function handleJukeState(d, peerId) {
   if (!jukeSrvOk(d)) return;
   if (!d || typeof d.reqId !== 'string') return;
+  /* Build 53: collecting handoff answers — the freshest one wins when the
+     timer fires; don't adopt the first answer blind. */
+  if (jukeHolderCatchingUp && d.reqId === jukeHandoffReqId) {
+    const q = Array.isArray(d.queue) ? d.queue.filter(jukeValidAdd) : [];
+    jukeHandoffAnswers.push({ queue: q, now: d.now || null, at: d.at || 0 });
+    return;
+  }
   if (juke.now || juke.queue.length) return; // we already have state; first answer wins
   if (d.at && jukeLastClearAt && d.at < jukeLastClearAt - 5000) return; // built before our clear
   const q = Array.isArray(d.queue) ? d.queue.filter(jukeValidAdd) : [];
