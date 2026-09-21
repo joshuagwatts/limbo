@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=38';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=38';
-import { CouchNet } from './couch.js?v=38';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=38';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=38';
+import { AudioEngine } from './audio.js?v=39';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=39';
+import { CouchNet } from './couch.js?v=39';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=39';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=39';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -935,7 +935,7 @@ let roomAnalyser = null; // {comp, analyser, data} — FFT tap on the jam bus (b
 
 /* Room analyser (build 28): a tiny FFT hanging off the jam master bus.
    Feeds the bass-reactive lights and the auto-BPM detector. With
-   create=false it never builds the audio chain — safe for the render loop. */
+   create=false it never builds the audio chain — safe for the render dub. */
 function roomAnalyserGet(create) {
   const ch = create ? jamEnsureChain() : ((audio.ctx && jam.chain) || null);
   if (!ch || !ch.comp || !audio.ctx) return null;
@@ -1036,6 +1036,13 @@ const jamMetroVolEl = document.getElementById('jam-metro-vol');
 const jamBassKeysEl = document.getElementById('jam-bass-keys');
 const jamDrumsEl = document.getElementById('jam-drums');
 const jamChordsEl = document.getElementById('jam-chords');
+const jamLeadChordsEl = document.getElementById('jam-lead-chords');
+const jamSeqToggleEl = document.getElementById('jam-seq-toggle');
+const jamSeqStateEl = document.getElementById('jam-seq-state');
+const jamSeqBodyEl = document.getElementById('jam-seq-body');
+const jamSeqGridEl = document.getElementById('jam-seq-grid');
+const jamSeqSwingEl = document.getElementById('jam-seq-swing');
+const jamSeqClearEl = document.getElementById('jam-seq-clear');
 const jamMicBtnEl = document.getElementById('jam-mic-btn');
 const jamMicMuteEl = document.getElementById('jam-mic-mute');
 const jamMicMeterEl = document.getElementById('jam-mic-meter');
@@ -1063,9 +1070,20 @@ const jam = {
   clockLastRemote: 0, // when we last heard someone else's clock
   manual: false, // manual tempo override (auto-detect paused)
   instrument: 'lead', // build 20: this player's instrument
-  wave: 'sawtooth',
-  cutoff: 1800,
-  reso: 5,
+  // build 39: the pocket synth is a real patch now — every field rides the
+  // jamNote so the room hears YOUR voice, not a default.
+  synth: {
+    wave: 'sawtooth',
+    cutoff: 1800, reso: 5,
+    env: 0.35, // filter envelope amount 0..1
+    decay: 0.4, attack: 0.008, // seconds
+    sub: 0, // 0..1 sub-osc level
+    spread: 12, // cents of detune spread
+    echo: 0.3, // 0..1 per-voice delay/reverb send
+    glide: 0.02, // seconds of portamento (local performance only)
+  },
+  scale: 'chromatic', // chromatic | minpent | majpent — the lead keys remap
+  glideFrom: 0, // last lead freq, for portamento (local only, never broadcast)
   pads: [null, null, null, null], // AudioBuffers, local to this client
   padRound: 0, // next pad to fill on grab (round-robin)
   rec: null, // ring-buffer recorder on the jam bus
@@ -1081,6 +1099,36 @@ const jam = {
 const jamQueue = []; // pending {beat, play(audioTime)} — the lookahead scheduler's list
 let jamVoicesSpawned = 0; // diagnostic counter for the test hook
 let jamTaps = []; // tap-tempo timestamps
+
+/* ---------------- overdub looper (build 39) ----------------
+ * A sound-on-sound loop of the room mix. Tap ● : the next bar boundary
+ * starts a stereo capture of exactly `bars` bars off the post-limiter bus
+ * (what the room hears); at the cycle end the take starts looping through
+ * the jam bus, gapless. Tap ● again while it plays: the next whole cycle
+ * is captured and folded into the loop (sound-on-sound — the take holds
+ * the loop's own playback plus your new playing, so layers accumulate and
+ * gently settle instead of doubling). Tap ■ to rest the loop, ▶ to drift
+ * it again, ✕ to clear. The loop keeps its own tempo snapshot — if the
+ * room's bpm moves, the loop holds its line (note the drift, re-grab).
+ * Free-time works too: with no clock the loop is bars × the bpm readout. */
+const dub = {
+  state: 'empty', // empty|arming|recording|playing|dubbing|stopped
+  bars: 2,
+  buf: null, // AudioBuffer (stereo) — the loop itself
+  src: null, // looping BufferSource
+  srcGain: null,
+  t0: 0, // ctx.currentTime of the current cycle start
+  dur: 0, // loop duration in seconds
+  bpm: 120, // tempo snapshot taken at record time
+  take: null, // {proc,tap,sink,bufL,bufR,idx,len} while capturing
+  armAt: 0, // ctx.currentTime when an armed record/dub begins
+  armFrom: 0, // ctx.currentTime when arming started (ring progress)
+  armMode: null, // 'record' | 'play' | 'dub' while arming
+  pendingBuf: null, // AudioBuffer being filled by a record capture
+  dubAt: 0, // cycle start of an in-flight dub capture (watchdog)
+  pendingDub: false, // armed overdub waiting on the cycle boundary
+  uiRaf: 0,
+};
 
 /* Current beat on the shared clock, or null when the clock is stopped. */
 function jamBeatNow() {
@@ -1399,15 +1447,39 @@ function jamRenderNote(midi, vel, audioTime, patch) {
   const ctx = audio.ctx;
   if (!ctx || !audio.master) return;
   jamVoicesSpawned++;
-  jam.lastVoice = { inst: 'lead', wave: (patch && patch.w) || jam.wave };
+  const s = jam.synth;
+  const P = patch || {};
+  jam.lastVoice = { inst: 'lead', wave: P.w || s.wave };
   playSynthNote(ctx, jamDestFor('lead'), {
     midi,
     vel,
     time: audioTime,
-    wave: (patch && patch.w) || jam.wave,
-    cutoff: (patch && patch.c) || jam.cutoff,
-    resonance: (patch && patch.r) || jam.reso,
+    wave: P.w || s.wave,
+    cutoff: P.c || s.cutoff,
+    resonance: P.r != null ? P.r : s.reso,
+    env: P.e != null ? P.e : s.env,
+    decay: P.d || s.decay,
+    attack: P.a || s.attack,
+    sub: P.s != null ? P.s : s.sub,
+    spread: P.sp != null ? P.sp : s.spread,
+    echo: P.x != null ? P.x : s.echo,
+    // glide is a local performance feel — remote notes render straight.
+    sends: jamSynthSends(P.x != null ? P.x : s.echo),
   });
+}
+
+/* Per-voice echo destinations: the game's own delay + reverb. Called with
+   the note's echo amount; empty when the chain isn't built yet (the voice
+   still gets the bus's global sends through jamDestFor). */
+function jamSynthSends(echoAmt) {
+  const ch = jam.chain;
+  if (!ch || !ch.delay || !ch.conv) return [];
+  const e = Math.max(0, Math.min(1, Number(echoAmt) || 0));
+  if (e <= 0.01) return [];
+  return [
+    { node: ch.delay, gain: 0.55 },
+    { node: ch.conv, gain: 0.45 },
+  ];
 }
 
 function jamRenderBass(midi, vel, audioTime) {
@@ -1447,7 +1519,9 @@ function jamRenderRemote(d, audioTime) {
   } else if (inst === 'bass') {
     jamRenderNoteBassSafe(d.midi, vel, audioTime);
   } else {
-    jamRenderNote(d.midi, vel, audioTime, d.patch);
+    // build 39: notes carry a patch object; pre-39 clients sent flat w/c/r.
+    const patch = d.patch || ((d.w || d.c || d.r != null) ? { w: d.w, c: d.c, r: d.r } : null);
+    jamRenderNote(d.midi, vel, audioTime, patch);
   }
 }
 
@@ -1469,16 +1543,56 @@ function jamBroadcastNote(payload) {
   }
 }
 
+/* The player's current patch, packed for the wire — the room hears YOUR
+   voice. (glide/fromFreq stay local; old clients ignore new fields.) */
+function jamLeadPatch() {
+  const s = jam.synth;
+  return {
+    w: s.wave, c: Math.round(s.cutoff), r: s.reso,
+    e: s.env, d: s.decay, a: s.attack, s: s.sub, sp: s.spread, x: s.echo,
+  };
+}
+function jamBroadcastLeadNote(midi, vel, patch) {
+  const beatNow = jamBeatNow();
+  const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
+  jamBroadcastNote({ midi, vel, beat, inst: 'lead', patch });
+  jamMarkJammer(myName, 'lead');
+  renderJamJammers();
+}
 function jamPlayLocal(midi, vel = 0.9) {
   audioEnsureRunning(); // pad taps are gestures — iOS resumes the context here
   const ctx = audio.ctx;
-  jamRenderNote(midi, vel, ctx ? ctx.currentTime + 0.01 : 0, null);
+  // Portamento: glide from the last lead note's pitch (local feel only —
+  // the room hears each note straight, no slide).
+  const s = jam.synth;
+  const f = 440 * Math.pow(2, (midi - 69) / 12);
+  const glideFrom = s.glide > 0.005 ? jam.glideFrom : 0;
+  jam.glideFrom = f;
+  const patch = jamLeadPatch();
+  jamRenderNote(midi, vel, ctx ? ctx.currentTime + 0.01 : 0,
+    { ...patch, glide: s.glide, fromFreq: glideFrom });
+  jamBroadcastLeadNote(midi, vel, patch);
+}
+
+/* One-touch chords on the lead (build 39): every note of the triad rides
+   the player's patch, so chords sound like YOUR voice, not a preset.
+   A breath of stagger — strummed, not stepped — and the room hears all
+   three notes on the same beat. */
+function jamPlayChordLocal(midis, vel = 0.85) {
+  if (!Array.isArray(midis) || !midis.length) return;
+  audioEnsureRunning();
+  const ctx = audio.ctx;
+  const t = ctx ? ctx.currentTime + 0.01 : 0;
+  const patch = jamLeadPatch();
   const beatNow = jamBeatNow();
   const beat = beatNow != null ? quantizeUp(beatNow, 0.25) : null;
-  jamBroadcastNote({
-    midi, vel, beat, inst: 'lead',
-    w: jam.wave, c: Math.round(jam.cutoff), r: jam.reso,
+  midis.forEach((m, i) => {
+    const v = i === 0 ? vel : vel * 0.92;
+    jamRenderNote(m, v, t + i * 0.012, patch);
+    jamBroadcastNote({ midi: m, vel: v, beat, inst: 'lead', patch });
   });
+  const top = Math.max(...midis);
+  jam.glideFrom = 440 * Math.pow(2, (top - 69) / 12);
   jamMarkJammer(myName, 'lead');
   renderJamJammers();
 }
@@ -1530,10 +1644,15 @@ function handleJamNote(peerId, d) {
   const name = String(d.n || 'drifter').slice(0, 16);
   const beat = d.beat == null ? null : Number(d.beat);
   const inst = JAM_INSTRUMENTS[d.inst] ? d.inst : 'lead';
+  // build 39: notes carry a nested patch object; pre-39 clients sent flat w/c/r.
+  const p = (d.patch && typeof d.patch === 'object') ? d.patch : {};
+  const pick = (v, fb) => (Number.isFinite(Number(v)) ? Number(v) : fb);
   const patch = {
-    w: ['sawtooth', 'square', 'mix'].includes(d.w) ? d.w : 'sawtooth',
-    c: Number.isFinite(Number(d.c)) ? Number(d.c) : 1800,
-    r: Number.isFinite(Number(d.r)) ? Number(d.r) : 5,
+    w: ['sawtooth', 'square', 'mix'].includes(p.w || d.w) ? (p.w || d.w) : 'sawtooth',
+    c: pick(p.c != null ? p.c : d.c, 1800),
+    r: pick(p.r != null ? p.r : d.r, 5),
+    e: pick(p.e, 0.35), d: pick(p.d, 0.4), a: pick(p.a, 0.008),
+    s: pick(p.s, 0), sp: pick(p.sp, 12), x: pick(p.x, 0.3),
   };
   const drum = JAM_DRUMS.includes(d.drum) ? d.drum : null;
   const chord = Number.isInteger(Number(d.chord)) ? Number(d.chord) : null;
@@ -1554,7 +1673,7 @@ function handleJamNote(peerId, d) {
   }
 }
 
-/* Pad trigger from a peer: play OUR local copy of that loop. Clients
+/* Pad trigger from a peer: play OUR local copy of that dub. Clients
    that never grabbed the loop have nothing in the slot — skipped
    silently. */
 function handleJamPad(peerId, d) {
@@ -2048,6 +2167,562 @@ function jamTriggerPad(i) {
   renderJamJammers();
   return true;
 }
+
+/* ---------------- overdub looper (build 39) ---------------- */
+
+const loopBtnEl = document.getElementById('jam-loop-btn');
+const loopGlyphEl = document.getElementById('jam-loop-glyph');
+const loopRingEl = document.getElementById('jam-loop-ring');
+const loopStateEl = document.getElementById('jam-loop-state');
+const loopMetaEl = document.getElementById('jam-loop-meta');
+const loopStopEl = document.getElementById('jam-loop-stop');
+const loopClearEl = document.getElementById('jam-loop-clear');
+const loopLenEl = document.getElementById('jam-loop-len');
+const LOOP_RING_C = 2 * Math.PI * 27;
+
+function loopDurSec() {
+  const bpm = Math.max(40, Math.min(220, Number(jam.bpm) || 120));
+  return (dub.bars * 4 * 60) / bpm;
+}
+
+/* Next bar line as an AudioContext timestamp. With the clock off, the
+   loop runs free-time off the bpm readout. */
+function loopNextBarAt() {
+  const ctx = audio.ctx;
+  if (!ctx) return 0;
+  const bn = jamBeatNow();
+  if (bn != null) {
+    const at = jamAudioTimeForBeat(Math.floor(bn / 4) * 4 + 4);
+    if (at != null && at > ctx.currentTime + 0.03) return at;
+  }
+  return ctx.currentTime + 0.08;
+}
+
+function loopStopCapture() {
+  const tk = dub.take;
+  dub.take = null;
+  if (!tk) return;
+  try { tk.proc.onaudioprocess = null; } catch (e) {}
+  try { tk.tap.disconnect(); } catch (e) {}
+  try { tk.proc.disconnect(); } catch (e) {}
+  try { tk.sink.disconnect(); } catch (e) {}
+}
+
+/* Stereo capture of exactly `len` samples off the post-limiter bus,
+   starting sample-accurately at `startAt` (blocks straddling the start
+   are trimmed). Calls `done(L, R)` when the take is full. */
+function loopStartCapture(startAt, len, done) {
+  const ch = jamEnsureChain();
+  const ctx = audio.ctx;
+  if (!ch || !ctx || typeof ctx.createScriptProcessor !== 'function') return false;
+  loopStopCapture();
+  try {
+    const tap = ctx.createGain();
+    tap.gain.value = 1;
+    ch.comp.connect(tap);
+    const proc = ctx.createScriptProcessor(4096, 2, 2);
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    const take = {
+      proc, tap, sink, len,
+      L: new Float32Array(len), R: new Float32Array(len), idx: 0,
+    };
+    dub.take = take;
+    proc.onaudioprocess = (e) => {
+      if (dub.take !== take) return;
+      const bt = e.playbackTime;
+      const ib = e.inputBuffer;
+      const c0 = ib.getChannelData(0);
+      const c1 = ib.numberOfChannels > 1 ? ib.getChannelData(1) : c0;
+      const sr = ctx.sampleRate;
+      let skip = 0;
+      // Without a usable playbackTime we can't trim to the bar line —
+      // record from the first block instead of dropping everything.
+      if (Number.isFinite(bt) && bt < startAt) {
+        skip = Math.min(c0.length, Math.round((startAt - bt) * sr));
+        if (skip >= c0.length) return; // whole block is before the start
+      }
+      const n = Math.min(c0.length - skip, take.len - take.idx);
+      for (let i = 0; i < n; i++) {
+        take.L[take.idx] = c0[skip + i];
+        take.R[take.idx] = c1[skip + i];
+        take.idx++;
+      }
+      // Keep the processor's output silent (the sink is zeroed anyway).
+      const ob = e.outputBuffer;
+      for (let chI = 0; chI < ob.numberOfChannels; chI++) {
+        ob.getChannelData(chI).fill(0);
+      }
+      if (take.idx >= take.len) {
+        loopStopCapture();
+        try { done(take.L, take.R); } catch (err) { /* ignore */ }
+      }
+    };
+    tap.connect(proc);
+    proc.connect(sink);
+    sink.connect(ctx.destination);
+    return true;
+  } catch (e) {
+    loopStopCapture();
+    return false;
+  }
+}
+
+function loopStartPlayback(buf, atTime) {
+  const ch = jamEnsureChain();
+  const ctx = audio.ctx;
+  if (!ch || !ctx || !buf) return false;
+  loopStopPlayback();
+  try {
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const g = ctx.createGain();
+    g.gain.value = 0.9;
+    src.connect(g);
+    g.connect(ch.bus); // the loop drifts with the room: space + limiter
+    src.start(Math.max(atTime, ctx.currentTime + 0.01));
+    dub.src = src;
+    dub.srcGain = g;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function loopStopPlayback() {
+  const src = dub.src;
+  dub.src = null;
+  dub.srcGain = null;
+  if (!src) return;
+  try { src.stop(); } catch (e) {}
+  try { src.disconnect(); } catch (e) {}
+}
+
+/* The ● button. Empty → record; playing → overdub a layer; stopped →
+   drift the loop again. Recording/dubbing taps are ignored (the cycle
+   closes itself on the bar line — predictable, no partial loops). */
+function loopMainButton() {
+  audioEnsureRunning();
+  if (!audio.ctx || !jamEnsureChain()) return false;
+  if (dub.state === 'empty') return loopArmRecord();
+  if (dub.state === 'stopped' && dub.buf) return loopArmPlay();
+  if (dub.state === 'playing' && dub.buf) return loopArmDub();
+  return false;
+}
+
+function loopArmRecord() {
+  if (dub.state !== 'empty') return false;
+  const ctx = audio.ctx;
+  dub.bpm = Math.max(40, Math.min(220, Number(jam.bpm) || 120));
+  dub.dur = loopDurSec();
+  dub.armAt = loopNextBarAt();
+  dub.armMode = 'record';
+  dub.state = 'arming';
+  loopRenderUI();
+  return true;
+}
+
+function loopArmPlay() {
+  if (!dub.buf || (dub.state !== 'stopped' && dub.state !== 'empty')) return false;
+  dub.armAt = loopNextBarAt();
+  dub.armMode = 'play';
+  dub.state = 'arming';
+  loopRenderUI();
+  return true;
+}
+
+function loopArmDub() {
+  if (dub.state !== 'playing' || !dub.buf) return false;
+  dub.armAt = dub.t0 + dub.dur; // the next cycle boundary
+  if (dub.armAt < audio.ctx.currentTime + 0.05) dub.armAt = loopNextBarAt();
+  dub.armMode = 'dub';
+  dub.pendingDub = true;
+  dub.state = 'arming';
+  loopRenderUI();
+  return true;
+}
+
+/* Fires armed record/play/dub transitions. Polled on a 25ms tick — the
+   capture itself is sample-aligned inside the ScriptProcessor. */
+function loopArmTick() {
+  if (dub.state !== 'arming' || !audio.ctx) return;
+  if (audio.ctx.currentTime < dub.armAt - 0.02) return;
+  const ctx = audio.ctx;
+  if (dub.armMode === 'record') {
+    const len = Math.max(1, Math.round(dub.dur * ctx.sampleRate));
+    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    dub.pendingBuf = buf; // filled by the capture; watchdog finalizes if it stalls
+    const ok = loopStartCapture(dub.armAt, len, (L, R) => {
+      // Take complete: the buffer was filled live during the cycle.
+      try {
+        buf.getChannelData(0).set(L);
+        buf.getChannelData(1).set(R);
+      } catch (e) { /* a partial take still loops */ }
+      dub.pendingBuf = null;
+      if (dub.state === 'recording') { dub.state = 'playing'; loopRenderUI(); }
+    });
+    if (!ok) { dub.pendingBuf = null; dub.state = 'empty'; loopRenderUI(); return; }
+    // Gapless handoff: the source is scheduled NOW for the cycle end; the
+    // capture fills the buffer it will read.
+    if (!loopStartPlayback(buf, dub.armAt + dub.dur)) {
+      loopStopCapture(); dub.state = 'empty'; loopRenderUI(); return;
+    }
+    dub.buf = buf;
+    dub.t0 = dub.armAt + dub.dur;
+    dub.state = 'recording';
+  } else if (dub.armMode === 'play') {
+    if (!loopStartPlayback(dub.buf, dub.armAt)) { dub.state = 'stopped'; }
+    else { dub.t0 = dub.armAt; dub.state = 'playing'; }
+  } else if (dub.armMode === 'dub') {
+    const len = Math.max(1, Math.round(dub.dur * ctx.sampleRate));
+    dub.dubAt = dub.armAt;
+    const ok = loopStartCapture(dub.armAt, len, (L, R) => {
+      dub.dubAt = 0;
+      loopFoldDub(L, R);
+    });
+    if (!ok) { dub.dubAt = 0; dub.pendingDub = false; dub.state = 'playing'; }
+    else dub.state = 'dubbing';
+  }
+  dub.armMode = null;
+  loopRenderUI();
+}
+setInterval(() => { if (jam.open) loopArmTick(); }, 25);
+
+/* Watchdog: if a capture stalls (throttled tab, starved audio thread), the
+   loop must not hang in recording/dubbing forever. Finalize from whatever
+   was captured — a partial take still loops. */
+function loopWatchdog() {
+  if (!audio.ctx) return;
+  const now = audio.ctx.currentTime;
+  if (dub.state === 'recording' && dub.pendingBuf && now > dub.t0 + 0.75) {
+    const tk = dub.take;
+    try {
+      if (tk && tk.idx > 0) {
+        dub.pendingBuf.getChannelData(0).set(tk.L.subarray(0, tk.idx));
+        dub.pendingBuf.getChannelData(1).set(tk.R.subarray(0, tk.idx));
+      }
+    } catch (e) { /* silence tail is fine */ }
+    loopStopCapture();
+    dub.pendingBuf = null;
+    dub.state = 'playing';
+    loopRenderUI();
+  } else if (dub.state === 'dubbing' && dub.dubAt && now > dub.dubAt + dub.dur + 0.75) {
+    const tk = dub.take;
+    loopStopCapture();
+    dub.dubAt = 0;
+    dub.pendingDub = false;
+    if (tk && tk.idx > tk.len * 0.5) {
+      // Enough of a take to fold: pad the tail and mix it in.
+      const L = new Float32Array(tk.len), R = new Float32Array(tk.len);
+      L.set(tk.L.subarray(0, tk.idx)); R.set(tk.R.subarray(0, tk.idx));
+      loopFoldDub(L, R);
+    } else {
+      dub.state = 'playing'; // too little — keep the old loop drifting
+      loopRenderUI();
+    }
+  }
+}
+setInterval(() => { if (jam.open) loopWatchdog(); }, 500);
+
+/* Sound-on-sound fold: the take holds the loop's own playback plus the new
+   playing, so the new loop IS the take (scaled for headroom, soft-clipped).
+   Layers settle instead of doubling — like a real looper pedal. The buffer
+   swap happens exactly on the cycle boundary: old source stops, new source
+   starts, no seam. */
+function loopFoldDub(L, R) {
+  const ctx = audio.ctx;
+  const len = L.length;
+  try {
+    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let chI = 0; chI < 2; chI++) {
+      const src = chI === 0 ? L : R;
+      const out = buf.getChannelData(chI);
+      for (let i = 0; i < len; i++) {
+        const v = src[i] * 0.85;
+        out[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+      }
+    }
+    const at = dub.t0 + dub.dur;
+    if (loopStartPlayback(buf, at)) {
+      dub.buf = buf;
+      dub.t0 = at;
+    }
+  } catch (e) { /* keep the old loop drifting */ }
+  dub.pendingDub = false;
+  dub.dubAt = 0;
+  if (dub.state === 'dubbing') dub.state = 'playing';
+  loopRenderUI();
+}
+
+/* ■ — rest the loop (kept, tap ▶/● to drift again). */
+function loopStop() {
+  if (dub.state === 'arming') {
+    dub.state = dub.buf ? 'stopped' : 'empty';
+    dub.armMode = null;
+    dub.pendingDub = false;
+    loopRenderUI();
+    return true;
+  }
+  loopStopCapture();
+  loopStopPlayback();
+  dub.pendingDub = false;
+  dub.pendingBuf = null;
+  dub.dubAt = 0;
+  dub.armFrom = 0;
+  if (dub.buf && (dub.state === 'playing' || dub.state === 'dubbing' || dub.state === 'recording')) {
+    dub.state = 'stopped';
+  }
+  loopRenderUI();
+  return true;
+}
+
+/* ✕ — clear the loop entirely. */
+function loopClear() {
+  loopStopCapture();
+  loopStopPlayback();
+  dub.buf = null;
+  dub.pendingBuf = null;
+  dub.dubAt = 0;
+  dub.armFrom = 0;
+  dub.pendingDub = false;
+  dub.armMode = null;
+  dub.state = 'empty';
+  loopRenderUI();
+  return true;
+}
+
+function loopSetBars(n) {
+  n = Math.max(1, Math.min(8, Number(n) || 2));
+  if (n === dub.bars) return true;
+  dub.bars = n;
+  // A loop's length is baked into its buffer — a new length starts fresh.
+  if (dub.buf) loopClear();
+  else loopRenderUI();
+  if (loopLenEl) {
+    loopLenEl.querySelectorAll('button').forEach((b) =>
+      b.classList.toggle('sel', Number(b.dataset.bars) === n));
+  }
+  return true;
+}
+
+function loopRenderUI() {
+  if (loopGlyphEl) {
+    loopGlyphEl.innerHTML = dub.state === 'stopped' ? '&#9654;' : '&#9679;';
+  }
+  if (loopBtnEl) {
+    loopBtnEl.classList.toggle('rec', dub.state === 'recording' || (dub.state === 'arming' && dub.armMode === 'record'));
+    loopBtnEl.classList.toggle('dub', dub.state === 'dubbing' || (dub.state === 'arming' && dub.armMode === 'dub'));
+  }
+  if (loopStateEl) {
+    const m = {
+      empty: 'the loop is empty — play, then tap &#9679;',
+      arming: dub.armMode === 'dub' ? 'layering on the next round…'
+        : dub.armMode === 'play' ? 'joining the bar…' : 'catching the next bar…',
+      recording: 'recording — play into the loop…',
+      playing: 'loop drifting — tap &#9679; to layer more',
+      dubbing: 'layering — play into the loop…',
+      stopped: 'loop resting — tap &#9654; to drift again',
+    };
+    loopStateEl.innerHTML = m[dub.state] || '';
+  }
+  if (loopMetaEl) {
+    loopMetaEl.textContent = dub.buf
+      ? `${dub.bars} bars · ${Math.round(dub.bpm)} bpm · ${dub.dur.toFixed(1)}s`
+      : `${dub.bars} bars · ${Math.round(jam.bpm)} bpm`;
+  }
+}
+
+/* Progress ring + countdowns, while the jam panel is open. */
+function loopUiTick() {
+  if (!jam.open) return;
+  if (!loopRingEl || !audio.ctx) return;
+  let pos = 0;
+  const now = audio.ctx.currentTime;
+  if (dub.state === 'recording' && dub.take) {
+    pos = Math.min(1, dub.take.idx / Math.max(1, dub.take.len));
+  } else if ((dub.state === 'playing' || dub.state === 'dubbing') && dub.dur > 0) {
+    pos = ((now - dub.t0) / dub.dur) % 1;
+    if (pos < 0) pos += 1;
+  } else if (dub.state === 'arming') {
+    const span = Math.max(0.001, dub.armAt - (dub.armFrom || (dub.armFrom = now)));
+    pos = Math.min(1, Math.max(0, 1 - (dub.armAt - now) / span));
+  } else {
+    dub.armFrom = 0;
+  }
+  if (dub.state !== 'arming') dub.armFrom = 0;
+  loopRingEl.style.strokeDashoffset = String(LOOP_RING_C * (1 - pos));
+}
+function loopUiEnsure() {
+  if (dub.uiRaf) return;
+  const tick = () => {
+    dub.uiRaf = 0;
+    if (!jam.open) return;
+    loopUiTick();
+    dub.uiRaf = requestAnimationFrame(tick);
+  };
+  dub.uiRaf = requestAnimationFrame(tick);
+}
+
+if (loopBtnEl) loopBtnEl.addEventListener('click', () => { loopMainButton(); loopBtnEl.blur(); });
+if (loopStopEl) loopStopEl.addEventListener('click', () => { loopStop(); loopStopEl.blur(); });
+if (loopClearEl) loopClearEl.addEventListener('click', () => { loopClear(); loopClearEl.blur(); });
+if (loopLenEl) {
+  loopLenEl.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => { loopSetBars(Number(b.dataset.bars)); b.blur(); });
+  });
+}
+
+/* ---------------- rhythm sequencer (build 39: optional beats) ----------------
+ * A 16-step, 4-voice pattern player for the synthesized kit — OFF by
+ * default, so the room's generative drift is untouched until YOU tap
+ * "beats". Runs on jam.bpm and follows tap-tempo live; steps render
+ * through the jam bus, so the overdub looper catches them like anything
+ * else you play. Local only — never broadcast (your pattern, your room).
+ * All drums are synthesized DSP: no samples, no downloads, works offline. */
+const SEQ_VOICES = [
+  { drum: 'kick', label: 'kick' },
+  { drum: 'snare', label: 'snare' },
+  { drum: 'chat', label: 'hat' },
+  { drum: 'shaker', label: 'perc' },
+];
+const SEQ_PRESETS = {
+  pulse: [
+    [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
+    [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
+    [0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0],
+    [0,0,0,0, 0,0,1,0, 0,0,0,0, 0,1,0,0],
+  ],
+  sway: [
+    [1,0,0,1, 0,0,1,0, 0,0,1,0, 0,1,0,0],
+    [0,0,0,0, 1,0,0,0, 0,0,0,1, 0,0,0,0],
+    [0,0,1,0, 0,1,0,0, 1,0,0,1, 0,0,1,0],
+    [0,0,0,0, 0,0,0,1, 0,0,0,0, 0,0,1,0],
+  ],
+  embers: [
+    [1,0,0,0, 0,0,0,0, 0,0,1,0, 0,0,0,0],
+    [0,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0],
+    [1,0,0,1, 0,0,1,0, 0,1,0,0, 1,0,0,0],
+    [0,0,0,0, 0,1,0,0, 0,0,0,0, 0,0,0,1],
+  ],
+};
+const seq = {
+  on: false, // the flock drifts free until you say otherwise
+  steps: SEQ_PRESETS.pulse.map((row) => row.slice()), // a groove waiting
+  swing: 0, // 0..0.6 — sway on the off-16ths
+  step: 0, nextT: 0, hits: 0,
+  lastShownStep: -1,
+};
+function seqStepDur() {
+  return 60 / Math.max(40, Math.min(220, Number(jam.bpm) || 120)) / 4;
+}
+/* Lookahead scheduler: hits are placed ahead of time so they land on the
+ * grid even if the tab hiccups. Reads jam.bpm live — tap-tempo bends the
+ * groove without restarting it. */
+function seqTick() {
+  if (!seq.on || !audio.ctx || !audio.master) return;
+  const ctx = audio.ctx;
+  const stepDur = seqStepDur();
+  // If the tab slept (screen lock), drop the missed steps and resume from
+  // now — never machine-gun a catch-up burst.
+  if (seq.nextT < ctx.currentTime - 0.5) {
+    seq.step += Math.ceil((ctx.currentTime - seq.nextT) / stepDur);
+    seq.nextT = ctx.currentTime + 0.05;
+  }
+  while (seq.nextT < ctx.currentTime + 0.15) {
+    const s = seq.step % 16;
+    const at = seq.nextT + (s % 2 === 1 ? seq.swing * stepDur : 0);
+    for (let vi = 0; vi < SEQ_VOICES.length; vi++) {
+      if (seq.steps[vi][s]) jamRenderDrum(SEQ_VOICES[vi].drum, vi === 0 ? 1 : 0.85, at);
+    }
+    seq.hits++;
+    seq.step++;
+    seq.nextT += stepDur;
+  }
+  if (jam.open) seqRenderStep();
+}
+setInterval(() => seqTick(), 25);
+function seqSetOn(on) {
+  seq.on = !!on;
+  if (seq.on) {
+    audioEnsureRunning(); // the toggle is a gesture — iOS resumes here
+    jamEnsureChain();
+    seq.step = 0;
+    seq.lastShownStep = -1;
+    seq.nextT = audio.ctx ? audio.ctx.currentTime + 0.08 : 0;
+  }
+  seqRenderUI();
+}
+function seqBuildGrid() {
+  if (!jamSeqGridEl) return;
+  jamSeqGridEl.innerHTML = '';
+  SEQ_VOICES.forEach((v, vi) => {
+    const row = document.createElement('div');
+    row.className = 'jam-seq-row';
+    const lab = document.createElement('span');
+    lab.className = 'jam-seq-label';
+    lab.textContent = v.label;
+    row.appendChild(lab);
+    for (let s = 0; s < 16; s++) {
+      const b = document.createElement('button');
+      b.className = 'jam-seq-step' + (s % 4 === 0 ? ' bar' : '');
+      b.dataset.voice = vi;
+      b.dataset.step = s;
+      b.setAttribute('aria-label', v.label + ' step ' + (s + 1));
+      b.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        audioEnsureRunning();
+        seq.steps[vi][s] = !seq.steps[vi][s];
+        seqRenderSteps();
+      });
+      row.appendChild(b);
+    }
+    jamSeqGridEl.appendChild(row);
+  });
+  seqRenderSteps();
+}
+function seqRenderSteps() {
+  if (!jamSeqGridEl) return;
+  jamSeqGridEl.querySelectorAll('.jam-seq-step').forEach((b) => {
+    const vi = Number(b.dataset.voice), s = Number(b.dataset.step);
+    b.classList.toggle('on', !!seq.steps[vi][s]);
+  });
+}
+/* Playhead highlight — the DOM is only touched when the step changes. */
+function seqRenderStep() {
+  if (!jamSeqGridEl) return;
+  const s = (((seq.step - 1) % 16) + 16) % 16; // the step now sounding
+  if (s === seq.lastShownStep) return;
+  seq.lastShownStep = s;
+  jamSeqGridEl.querySelectorAll('.jam-seq-step').forEach((b) => {
+    b.classList.toggle('now', Number(b.dataset.step) === s);
+  });
+}
+function seqRenderUI() {
+  if (jamSeqToggleEl) {
+    jamSeqToggleEl.classList.toggle('sel', seq.on);
+    jamSeqToggleEl.innerHTML = seq.on ? 'beats &#9679;' : 'beats';
+  }
+  if (jamSeqBodyEl) jamSeqBodyEl.hidden = !seq.on;
+  if (jamSeqStateEl) jamSeqStateEl.textContent = seq.on ? 'the flock keeps time' : 'the flock drifts free';
+}
+function seqApplyPreset(name) {
+  const p = SEQ_PRESETS[name];
+  if (!p) return;
+  seq.steps = p.map((row) => row.slice());
+  seqRenderSteps();
+}
+function seqClear() {
+  seq.steps = SEQ_VOICES.map(() => new Array(16).fill(false));
+  seqRenderSteps();
+}
+
+if (jamSeqToggleEl) jamSeqToggleEl.addEventListener('click', () => { seqSetOn(!seq.on); jamSeqToggleEl.blur(); });
+if (jamSeqSwingEl) jamSeqSwingEl.addEventListener('input', () => { seq.swing = Number(jamSeqSwingEl.value) / 100; });
+document.querySelectorAll('.jam-seq-preset').forEach((b) => {
+  b.addEventListener('click', () => { seqApplyPreset(b.dataset.seqpreset); b.blur(); });
+});
+if (jamSeqClearEl) jamSeqClearEl.addEventListener('click', () => { seqClear(); jamSeqClearEl.blur(); });
 
 /* ---------------- community wall (build 18; persistence: build 26) ----------------
    A shared 1024x512 paint canvas. One per client (not per room) so the
@@ -4760,6 +5435,8 @@ function setJamPanel(open) {
     renderJamSamplerHint();
     renderJamJammers();
     jamRenderRoomNote();
+    loopRenderUI(); // looper state text + ring
+    loopUiEnsure(); // progress ring rAF while the panel is open
   } else {
     try { applySkin(equipped.skin); } catch (e) {} // wisp glow back to the skin
   }
@@ -4828,20 +5505,91 @@ function renderJamSamplerHint() {
       : '';
 }
 
+/* Lead keys with a scale lock (build 39). Chromatic = one octave C4–C5 as
+ * before; the pentatonics span two octaves so melodies stay in the flock. */
+const JAM_SCALES = {
+  chromatic: { base: 60, steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] },
+  minpent: { base: 57, steps: [0, 3, 5, 7, 10, 12, 15, 17, 19, 22, 24] }, // A minor pent, 2 octaves
+  majpent: { base: 60, steps: [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24] }, // C major pent, 2 octaves
+};
+const JAM_SCALE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 function buildJamKeys() {
   if (!jamKeysEl) return;
   jamKeysEl.innerHTML = '';
-  const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-  for (let i = 0; i <= 12; i++) {
-    const midi = 60 + i; // one chromatic octave, C4–C5
-    const black = [1, 3, 6, 8, 10].includes(i % 12);
+  const sc = JAM_SCALES[jam.scale] || JAM_SCALES.chromatic;
+  const chromatic = jam.scale === 'chromatic';
+  sc.steps.forEach((st, i) => {
+    const midi = sc.base + st;
+    const black = chromatic && [1, 3, 6, 8, 10].includes(st % 12);
     const b = document.createElement('button');
     b.className = 'jam-key' + (black ? ' black' : '');
-    b.textContent = black ? '' : names[i % 12];
-    b.setAttribute('aria-label', names[i % 12] + (4 + Math.floor(i / 12)));
+    b.textContent = black ? '' : JAM_SCALE_NAMES[midi % 12];
+    b.setAttribute('aria-label', JAM_SCALE_NAMES[midi % 12] + Math.floor(midi / 12 - 1));
     // pointerdown (not click): notes fire the instant the finger lands.
     b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamPlayLocal(midi, 0.9); });
     jamKeysEl.appendChild(b);
+  });
+}
+
+/* One-touch chord pads for the lead (build 39): in chromatic, proper
+ * tertian triads on the major-scale degrees (I ii iii IV V vi vii°);
+ * in the pentatonics, triads stacked from the scale degrees so every
+ * pad always sits inside the key you're in. Voiced through the player's
+ * patch. Labels are root note names — always true, whatever the scale.
+ * Rebuilt with the keys whenever the scale changes. */
+const JAM_CHORD_QUALITIES = ['maj', 'min', 'min', 'maj', 'maj', 'min', 'dim'];
+const JAM_CHORD_ROOTS = [0, 2, 4, 5, 7, 9, 11]; // major-scale degrees
+function jamScalePitchClasses() {
+  const sc = JAM_SCALES[jam.scale] || JAM_SCALES.chromatic;
+  const pcs = [];
+  for (const st of sc.steps) {
+    const pc = ((st % 12) + 12) % 12;
+    if (!pcs.includes(pc)) pcs.push(pc);
+  }
+  return { base: sc.base, pcs };
+}
+function jamLeadChordMidis(degree) {
+  const { base, pcs } = jamScalePitchClasses();
+  if (jam.scale === 'chromatic') {
+    const d = ((degree % 7) + 7) % 7;
+    const q = JAM_CHORD_QUALITIES[d];
+    const third = q === 'maj' ? 4 : 3;
+    const fifth = q === 'dim' ? 6 : 7;
+    return [base + JAM_CHORD_ROOTS[d], base + JAM_CHORD_ROOTS[d] + third, base + JAM_CHORD_ROOTS[d] + fifth];
+  }
+  const len = pcs.length;
+  const n = Math.min(7, len);
+  const d = ((degree % n) + n) % n;
+  const at = (i) => pcs[(d + i) % len] + (d + i >= len ? 12 : 0);
+  return [base + at(0), base + at(2), base + at(4)];
+}
+function jamLeadChordRootName(degree) {
+  const { base, pcs } = jamScalePitchClasses();
+  if (jam.scale === 'chromatic') {
+    const d = ((degree % 7) + 7) % 7;
+    return JAM_SCALE_NAMES[(base + JAM_CHORD_ROOTS[d]) % 12];
+  }
+  const n = Math.min(7, pcs.length);
+  const d = ((degree % n) + n) % n;
+  return JAM_SCALE_NAMES[(base + pcs[d]) % 12];
+}
+function jamLeadChordPadCount() {
+  if (jam.scale === 'chromatic') return 7;
+  return Math.min(7, jamScalePitchClasses().pcs.length);
+}
+function buildJamLeadChords() {
+  if (!jamLeadChordsEl) return;
+  jamLeadChordsEl.innerHTML = '';
+  const n = jamLeadChordPadCount();
+  for (let d = 0; d < n; d++) {
+    const midis = jamLeadChordMidis(d);
+    const name = jamLeadChordRootName(d);
+    const b = document.createElement('button');
+    b.className = 'jam-lead-chord';
+    b.textContent = name;
+    b.setAttribute('aria-label', 'chord on ' + name);
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); jamPlayChordLocal(midis, 0.85); });
+    jamLeadChordsEl.appendChild(b);
   }
 }
 
@@ -4925,22 +5673,73 @@ if (jamMetroToggleEl) jamMetroToggleEl.addEventListener('click', () => {
 if (jamMetroVolEl) jamMetroVolEl.addEventListener('input', () => {
   jamSetMetro(jam.metro.on, Number(jamMetroVolEl.value) / 100);
 });
+/* ---------------- lead synth panel (build 39: a real patch) ----------------
+ * Every knob writes jam.synth and rides the next jamNote's patch, so the
+ * room hears YOUR voice. Presets snap the whole patch at once. The key
+ * scale remaps the one-octave keys (pentatonics span two octaves). */
+const JAM_PRESETS = {
+  spark: { wave: 'sawtooth', cutoff: 3200, reso: 4, env: 0.5, decay: 0.35, attack: 0.005, sub: 0, spread: 14, echo: 0.4, glide: 0 },
+  acid: { wave: 'sawtooth', cutoff: 700, reso: 10, env: 0.85, decay: 0.3, attack: 0.004, sub: 0.15, spread: 8, echo: 0.25, glide: 0.06 },
+  drift: { wave: 'sawtooth', cutoff: 1400, reso: 2, env: 0.2, decay: 1.4, attack: 0.25, sub: 0.3, spread: 20, echo: 0.6, glide: 0.02 },
+};
+const JAM_SYNTH_SLIDERS = [
+  // [element id, patch key, fromSlider, toSlider]
+  ['jam-cutoff', 'cutoff', (v) => v, (v) => v],
+  ['jam-reso', 'reso', (v) => v, (v) => v],
+  ['jam-env', 'env', (v) => v / 100, (v) => v * 100],
+  ['jam-decay', 'decay', (v) => v / 100, (v) => v * 100],
+  ['jam-attack', 'attack', (v) => v / 1000, (v) => v * 1000],
+  ['jam-sub', 'sub', (v) => v / 100, (v) => v * 100],
+  ['jam-spread', 'spread', (v) => v, (v) => v],
+  ['jam-echo', 'echo', (v) => v / 100, (v) => v * 100],
+  ['jam-glide', 'glide', (v) => v / 100, (v) => v * 100],
+];
+function jamSyncSynthUI() {
+  const s = jam.synth;
+  for (const [id, key, , toSlider] of JAM_SYNTH_SLIDERS) {
+    const el = document.getElementById(id);
+    if (el) el.value = Math.round(toSlider(s[key]) * 100) / 100;
+  }
+  document.querySelectorAll('.jam-wave').forEach((x) =>
+    x.classList.toggle('sel', x.dataset.wave === s.wave));
+}
+function jamApplyPreset(name) {
+  const p = JAM_PRESETS[name];
+  if (!p) return;
+  Object.assign(jam.synth, p);
+  jamSyncSynthUI();
+  document.querySelectorAll('.jam-preset').forEach((x) =>
+    x.classList.toggle('sel', x.dataset.preset === name));
+}
 document.querySelectorAll('.jam-wave').forEach((b) => {
   b.addEventListener('click', () => {
-    jam.wave = b.dataset.wave || 'sawtooth';
+    jam.synth.wave = b.dataset.wave || 'sawtooth';
     document.querySelectorAll('.jam-wave').forEach((x) =>
       x.classList.toggle('sel', x === b));
+    document.querySelectorAll('.jam-preset').forEach((x) => x.classList.remove('sel'));
     b.blur();
   });
 });
-{
-  const first = document.querySelector('.jam-wave');
-  if (first) first.classList.add('sel');
+document.querySelectorAll('.jam-preset').forEach((b) => {
+  b.addEventListener('click', () => { jamApplyPreset(b.dataset.preset); b.blur(); });
+});
+for (const [id, key, fromSlider] of JAM_SYNTH_SLIDERS) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('input', () => {
+    jam.synth[key] = fromSlider(Number(el.value));
+    document.querySelectorAll('.jam-preset').forEach((x) => x.classList.remove('sel'));
+  });
 }
-const jamCutoffEl = document.getElementById('jam-cutoff');
-const jamResoEl = document.getElementById('jam-reso');
-if (jamCutoffEl) jamCutoffEl.addEventListener('input', () => { jam.cutoff = Number(jamCutoffEl.value) || 1800; });
-if (jamResoEl) jamResoEl.addEventListener('input', () => { jam.reso = Number(jamResoEl.value) || 0; });
+document.querySelectorAll('.jam-scale').forEach((b) => {
+  b.addEventListener('click', () => {
+    jam.scale = b.dataset.scale || 'chromatic';
+    document.querySelectorAll('.jam-scale').forEach((x) =>
+      x.classList.toggle('sel', x === b));
+    buildJamKeys(); // remap the keys to the new scale
+    buildJamLeadChords(); // ...and the chord pads
+    b.blur();
+  });
+});
 
 
 // Boot: dress the wisp in the saved look; net reads the equipped look
@@ -4955,6 +5754,10 @@ buildJamKeys(); // one-octave synth keyboard for the jam panel
 buildJamBassKeys(); // bass keys (the voice drops an octave)
 buildJamDrums(); // 6 synthesized drum pads
 buildJamChords(); // 4 chord pads (i–VI–III–VII)
+buildJamLeadChords(); // build 39: one-touch triads on the lead, in your scale
+seqBuildGrid(); // build 39: the 16-step rhythm grid (beats off by default)
+seqRenderUI();
+jamSyncSynthUI(); // build 39: wave sel + knob positions match the patch
 net.cosmetics = () => {
   const tc = TRAIL_COLORS[equipped.trailColor] || TRAIL_COLORS.white;
   return {
@@ -7476,9 +8279,8 @@ window.__limbo = {
     by: jam.clockBy,
     manual: jam.manual,
     instrument: jam.instrument,
-    wave: jam.wave,
-    cutoff: jam.cutoff,
-    reso: jam.reso,
+    synth: { ...jam.synth }, // build 39: the full patch
+    scale: jam.scale,
     padsLoaded: jam.pads.map((b) => !!b),
     voices: jamVoicesSpawned,
     queue: jamQueue.length,
@@ -7537,6 +8339,66 @@ window.__limbo = {
   jamSetMetro: (on, vol) => jamSetMetro(on, vol),
   jamMetro: () => ({ ...jam.metro }),
   jamPeerInst: (pid) => jamPeerInst.get(pid) || null,
+  // build 39: deeper synth + overdub looper
+  jamSynth: () => ({ ...jam.synth }),
+  jamSetSynth: (k, v) => { if (k in jam.synth) { jam.synth[k] = v; jamSyncSynthUI(); return true; } return false; },
+  jamPreset: (name) => jamApplyPreset(name),
+  jamPresets: () => Object.keys(JAM_PRESETS),
+  jamScale: () => jam.scale,
+  jamSetScale: (s) => {
+    if (!JAM_SCALES[s]) return false;
+    jam.scale = s;
+    document.querySelectorAll('.jam-scale').forEach((x) => x.classList.toggle('sel', x.dataset.scale === s));
+    buildJamKeys();
+    buildJamLeadChords();
+    return true;
+  },
+  jamKeyCount: () => (jamKeysEl ? jamKeysEl.children.length : 0),
+  loopState: () => ({
+    state: dub.state, bars: dub.bars, bpm: Math.round(dub.bpm),
+    dur: dub.dur, hasBuf: !!dub.buf,
+    bufLen: dub.buf ? dub.buf.length : 0, sampleRate: audio.ctx ? audio.ctx.sampleRate : 0,
+    takeIdx: dub.take ? dub.take.idx : 0,
+  }),
+  loopMain: () => loopMainButton(),
+  loopStop: () => loopStop(),
+  loopClear: () => loopClear(),
+  loopSetBars: (n) => loopSetBars(n),
+  loopRenderUI: () => loopRenderUI(),
+  // build 39: rhythm sequencer hooks
+  seqOn: (on) => seqSetOn(on),
+  seqToggle: () => seqSetOn(!seq.on),
+  seqState: () => ({ on: seq.on, hits: seq.hits, step: seq.step % 16 }),
+  seqHits: () => seq.hits,
+  seqStep: (vi, s) => {
+    vi = Math.max(0, Math.min(SEQ_VOICES.length - 1, vi | 0));
+    s = Math.max(0, Math.min(15, s | 0));
+    seq.steps[vi][s] = !seq.steps[vi][s];
+    seqRenderSteps();
+    return seq.steps[vi][s];
+  },
+  seqSteps: () => seq.steps.map((r) => r.slice()),
+  seqPreset: (name) => seqApplyPreset(name),
+  seqSwing: (v) => { seq.swing = Math.max(0, Math.min(0.6, Number(v) || 0)); },
+  // build 39: lead chord pads + polyphony diagnostics
+  playChord: (degree) => jamPlayChordLocal(jamLeadChordMidis(degree | 0), 0.85),
+  leadChordCount: () => (jamLeadChordsEl ? jamLeadChordsEl.children.length : 0),
+  leadChordMidis: (degree) => jamLeadChordMidis(degree | 0),
+  synthVoices: () => synthVoiceCount(),
+  // build 39 diagnostic: peak |sample| of the loop buffer (0 when empty/silent)
+  loopBufPeak: () => {
+    if (!dub.buf) return 0;
+    let peak = 0;
+    for (let chI = 0; chI < dub.buf.numberOfChannels; chI++) {
+      const d = dub.buf.getChannelData(chI);
+      const step = Math.max(1, Math.floor(d.length / 4000));
+      for (let i = 0; i < d.length; i += step) {
+        const a = Math.abs(d[i]);
+        if (a > peak) peak = a;
+      }
+    }
+    return Math.round(peak * 1000) / 1000;
+  },
   // test helper (build 28): simulate holding the clock without playing a note
   jamSimulateDj: (on) => { if (on) jamEnsureClock(); else jamStopClock(); renderJamTransport(); },
   // test helpers (build 17): drive the sampler's ring buffer deterministically

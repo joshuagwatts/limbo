@@ -92,10 +92,50 @@ export class OnsetDetector {
   }
 }
 
-/* The pocket synth voice. Two detuned oscillators (waveform selectable)
- * through a lowpass filter with a short plucky envelope. Every note
- * spawns fresh nodes — no voice stealing, so overlapping notes from
- * several jammers just layer. `time` is an AudioContext timestamp. */
+/* The pocket synth voice (build 39: deeper).
+ * Two detuned oscillators (waveform selectable) + an optional sine sub an
+ * octave down, through a lowpass filter with its own envelope (cutoff +
+ * env amount + decay), a shaping amp envelope (attack/decay), optional
+ * portamento glide for mono-style leads, and per-voice echo sends that tap
+ * the game's delay + reverb directly (the dotted-eighth psy-lead sound).
+ * Every note spawns fresh nodes — no voice stealing, so overlapping notes
+ * from several jammers just layer. `time` is an AudioContext timestamp.
+ * All new opts are optional with musical defaults, so older {w,c,r} patches
+ * from the room render exactly as before. */
+/* ---------------- polyphony guard (build 39) ----------------
+ * The lead is a real instrument now: many fingers at once, chord pads,
+ * stacked notes from the whole room. Cap simultaneous voices so a phone
+ * never chokes — when the cap is hit, the oldest already-sounding voice
+ * is gently released to make space. */
+const MAX_VOICES = 12;
+const liveVoices = []; // {oscs, g, t, life}
+let voiceCtx = null;
+function pruneVoices(ctx) {
+  const now = ctx.currentTime;
+  for (let i = liveVoices.length - 1; i >= 0; i--) {
+    if (now > liveVoices[i].life) liveVoices.splice(i, 1);
+  }
+}
+function stealVoice(ctx) {
+  const now = ctx.currentTime;
+  // Never steal a voice that hasn't started sounding yet (a remote note
+  // quantized into the future) — take the oldest live one instead.
+  const victim = liveVoices.find((v) => v.t <= now + 0.05);
+  if (!victim) return;
+  try {
+    victim.g.gain.cancelScheduledValues(now);
+    victim.g.gain.setTargetAtTime(0.0001, now, 0.03);
+    for (const o of victim.oscs) { try { o.stop(now + 0.25); } catch (e) {} }
+  } catch (e) {}
+  const i = liveVoices.indexOf(victim);
+  if (i >= 0) liveVoices.splice(i, 1);
+}
+/* Diagnostic: how many synth voices are alive right now. */
+export function synthVoiceCount() {
+  if (voiceCtx) { try { pruneVoices(voiceCtx); } catch (e) {} }
+  return liveVoices.length;
+}
+
 export function playSynthNote(ctx, dest, opts) {
   const {
     midi = 60,
@@ -104,41 +144,96 @@ export function playSynthNote(ctx, dest, opts) {
     wave = 'sawtooth',
     cutoff = 1800,
     resonance = 5,
+    env = 0.35, // 0..1 — filter envelope amount (fraction of 6kHz added at peak)
+    decay = 0.4, // s — filter + amp decay
+    attack = 0.008, // s — amp attack
+    sub = 0, // 0..1 — sine sub-oscillator one octave down
+    spread = 12, // cents — detune spread of the osc pair
+    glide = 0, // s — portamento from fromFreq (local performance only)
+    fromFreq = 0, // Hz — glide start; ignored unless glide > 0
+    echo = 0, // 0..1 — per-voice delay/reverb send amount
+    sends = null, // [{node, gain}] — echo destinations (game's delay + conv)
   } = opts || {};
   try {
     const t = Math.max(time || 0, ctx.currentTime);
     const f = midiToFreq(midi);
+    const atk = Math.max(0.002, Math.min(0.6, Number(attack) || 0.008));
+    const dec = Math.max(0.08, Math.min(2.5, Number(decay) || 0.4));
+    const envAmt = Math.max(0, Math.min(1, Number(env) || 0)) * 6000;
+    const cut = Math.max(80, Math.min(12000, cutoff));
+    // Filter with its own envelope: opens by envAmt, settles back to cutoff.
     const flt = ctx.createBiquadFilter();
     flt.type = 'lowpass';
-    flt.frequency.value = Math.max(80, Math.min(12000, cutoff));
+    flt.frequency.setValueAtTime(Math.min(14000, cut + envAmt), t);
+    flt.frequency.exponentialRampToValueAtTime(cut, t + Math.max(0.05, dec * 1.4));
     flt.Q.value = Math.max(0, Math.min(15, resonance));
+    // Amp: quick attack, decay to a soft sustain, gentle release.
     const g = ctx.createGain();
     const peak = 0.32 * Math.max(0.05, Math.min(1.2, vel));
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(peak + 0.001, t + 0.008);
-    g.gain.exponentialRampToValueAtTime(peak * 0.55 + 0.001, t + 0.18);
-    g.gain.setTargetAtTime(0.0001, t + 0.35, 0.12);
-    const mk = (type, detune) => {
+    g.gain.exponentialRampToValueAtTime(peak + 0.001, t + atk);
+    g.gain.exponentialRampToValueAtTime(peak * 0.55 + 0.001, t + atk + dec);
+    g.gain.setTargetAtTime(0.0001, t + atk + dec, Math.max(0.06, dec * 0.3));
+    const life = t + atk + dec * 3 + 0.6; // nodes live past the tail
+    const spr = Math.max(0, Math.min(50, Number(spread) || 0));
+    const oscs = []; // every live osc, for the polyphony guard
+    const mk = (type, detune, freqMul = 1, gainMul = 1, dur = life) => {
       const o = ctx.createOscillator();
       o.type = type;
-      o.frequency.value = f;
+      const ff = f * freqMul;
+      if (glide > 0.005 && fromFreq > 20 && freqMul === 1) {
+        // portamento: slide from the last note into this one
+        o.frequency.setValueAtTime(Math.min(12000, fromFreq), t);
+        o.frequency.exponentialRampToValueAtTime(Math.min(12000, ff), t + glide);
+      } else {
+        o.frequency.value = ff;
+      }
       o.detune.value = detune;
-      o.connect(flt);
+      if (gainMul !== 1) {
+        const og = ctx.createGain();
+        og.gain.value = gainMul;
+        o.connect(og);
+        og.connect(flt);
+      } else {
+        o.connect(flt);
+      }
       o.start(t);
-      o.stop(t + 1.0);
+      o.stop(dur);
+      oscs.push(o);
+      return o;
     };
     if (wave === 'square') {
-      mk('square', -4);
-      mk('square', 4);
+      mk('square', -spr / 2);
+      mk('square', spr / 2);
     } else if (wave === 'mix') {
-      mk('sawtooth', -5);
-      mk('square', 5);
+      mk('sawtooth', -spr / 2);
+      mk('square', spr / 2);
     } else {
-      mk('sawtooth', -5);
-      mk('sawtooth', 6);
+      mk('sawtooth', -spr / 2);
+      mk('sawtooth', spr / 2);
     }
+    const subAmt = Math.max(0, Math.min(1, Number(sub) || 0));
+    if (subAmt > 0.01) mk('sine', 0, 0.5, subAmt * 0.5); // weight underneath
     flt.connect(g);
     g.connect(dest);
+    // Per-voice echo: tap the voice into the game's delay + reverb sends.
+    const echoAmt = Math.max(0, Math.min(1, Number(echo) || 0));
+    if (echoAmt > 0.01 && Array.isArray(sends)) {
+      for (const s of sends) {
+        if (!s || !s.node) continue;
+        const sg = ctx.createGain();
+        sg.gain.value = echoAmt * Math.max(0, Math.min(1, Number(s.gain) || 0.5));
+        g.connect(sg);
+        try { sg.connect(s.node); } catch (e) { try { sg.disconnect(); } catch (e2) {} }
+      }
+    }
+    // Polyphony guard: cap simultaneous voices, stealing the oldest live
+    // one when a new note needs the space. Keeps chords + fast fingers
+    // smooth on a phone.
+    pruneVoices(ctx);
+    if (liveVoices.length >= MAX_VOICES) stealVoice(ctx);
+    liveVoices.push({ oscs, g, t, life });
+    voiceCtx = ctx;
   } catch (e) {
     /* a missed note is better than a crashed frame */
   }
