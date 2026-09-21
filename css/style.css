@@ -1774,9 +1774,13 @@ html { -webkit-text-size-adjust: 100%; }
 }
 #journey-chrome button:active { transform: scale(0.94); }
 #journey-jammute.off { opacity: 0.85; }
+/* build 65: minimap moved bottom-left + shrunk (floats above the chat row) */
 #journey-minimap {
   pointer-events: none;
-  width: 132px; height: 132px; border-radius: 50%;
+  position: fixed;
+  left: calc(14px + env(safe-area-inset-left));
+  bottom: calc(92px + env(safe-area-inset-bottom));
+  width: 88px; height: 88px; border-radius: 50%;
   border: 1px solid rgba(122, 224, 255, 0.35);
   background: rgba(6, 8, 18, 0.66);
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
