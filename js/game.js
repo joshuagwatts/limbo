@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=53';
-import { CouchNet } from './couch.js?v=53';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=66';
+import { CouchNet } from './couch.js?v=66';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=42';
 
