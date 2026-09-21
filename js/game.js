@@ -4235,12 +4235,17 @@ function jukeMakeId() {
    URL first; set/playlist URLs expand into one item per track.
    titleHint skips the network fetch (tests). */
 async function jukeAddTrack(rawUrl, titleHint) {
-  let det = jukeDetectProvider(rawUrl);
+  // Build 45: share text carries promo words around the link
+  // ("Listen to X by Y on #SoundCloud https://on.soundcloud.com/abc") —
+  // fish out the first https URL and queue that.
+  const _m45 = String(rawUrl || '').match(/https?:\/\/[^\s<>"'`]+/i);
+  const cleanUrl = _m45 ? _m45[0].replace(/[.,;:!?)\]}>]+$/, '') : '';
+  let det = jukeDetectProvider(cleanUrl);
   if (det.provider === 'invalid') {
     jukeHint('that link doesn\u2019t look right — paste a full https url');
     return null;
   }
-  let url = String(rawUrl).trim();
+  let url = cleanUrl; // build 45: extracted from pasted share text
   let resolvedTitle = titleHint || null;
   // Mobile "Share → Copy Link" (on.soundcloud.com/xxx): resolve to the
   // canonical track/set URL via oEmbed (also yields the real title). If it
