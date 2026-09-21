@@ -7381,6 +7381,20 @@ chatInput.addEventListener('focus', () => {
   for (const k in keys) keys[k] = false; // never fly while typing
 });
 chatInput.addEventListener('blur', () => { chatFocused = false; });
+
+/* build 40: iOS keyboard covers fixed bottom chrome. The page itself can't
+   scroll (overflow hidden), so lift the chat bar by the keyboard height
+   while one of its inputs has focus; it settles back on its own. */
+(function () {
+  const vv = window.visualViewport;
+  const chatEl = document.getElementById('chat');
+  if (!vv || !chatEl) return;
+  vv.addEventListener('resize', () => {
+    const inside = chatEl.contains(document.activeElement);
+    const kb = window.innerHeight - vv.height - vv.offsetTop;
+    chatEl.style.transform = (inside && kb > 80) ? 'translateY(' + (-kb) + 'px)' : '';
+  });
+})();
 chatInput.addEventListener('keydown', (e) => {
   e.stopPropagation(); // keep game keys out of the window handler
   if (e.key === 'Enter') sendChatLine();
