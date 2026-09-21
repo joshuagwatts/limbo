@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=46">
+<link rel="stylesheet" href="css/style.css?v=47">
 <script type="importmap">
 {
   "imports": {
@@ -146,6 +146,7 @@ if ('serviceWorker' in navigator) {
   <div class="jam-head"><span>&#127925; JAM ROOM</span><button id="jam-close" aria-label="close">&#10005;</button></div>
   <div class="jam-transport">
     <div class="jam-bpm-wrap"><div id="jam-bpm">120</div><div class="jam-bpm-label">BPM</div></div>
+    <div class="jam-chord-wrap"><div id="jam-chord-disp">&ndash;</div><div class="jam-bpm-label" id="jam-chord-who">CHORD</div></div>
     <div class="jam-clock"><span id="jam-clock-dot"></span><span id="jam-clock-status">clock stopped</span></div>
     <button id="jam-tap">tap</button>
     <button id="jam-listen" aria-label="listen to the jukebox for tempo">listen</button>
@@ -405,11 +406,12 @@ if ('serviceWorker' in navigator) {
        (under the button) so it can never overlap the title/subtitle -->
   <div id="loading"><span>summoning limbo</span></div>
   <p class="tiny">headphones recommended · 4 realms + sound room + endless journey · 20 echoes</p>
+  <div id="build-stamp" aria-hidden="true"></div>
 </div>
 
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=46"></script>
+<script type="module" src="js/game.js?v=47"></script>
 </body>
 </html>
