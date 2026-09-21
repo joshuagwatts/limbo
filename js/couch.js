@@ -57,6 +57,7 @@ const ROOM_SCOPED = new Set([
   'wallStroke', 'wallSyncReq', 'wallSync', 'wallHello', 'wallUndo',
   'jukeAdd', 'jukeRemove', 'jukePlay', 'jukeSkipVote',
   'jukeStateReq', 'jukeState', 'jukeFileHave', 'jukeLike',
+  'stageSync', 'stageReq', 'fohSync', 'fohReq', // build 66: stage + front of house
 ]);
 const TARGETED = new Set(['jukeFileReq', 'jukeFileChunk']);
 /* Internal control actions, never room-filtered, never reach game.js. */
@@ -435,6 +436,8 @@ export class CouchNet {
       jukeFileChunk: 'onJukeFileChunkCb', jukeFileHave: 'onJukeFileHaveCb',
       jukeStateReq: 'onJukeStateReqCb', jukeState: 'onJukeStateCb',
       jukeLike: 'onJukeLikeCb',
+      stageSync: 'onStageSyncCb', stageReq: 'onStageReqCb',
+      fohSync: 'onFohSyncCb', fohReq: 'onFohReqCb',
     }[action];
     if (!cbProp) return;
     const cb = this[cbProp];
@@ -535,6 +538,10 @@ export class CouchNet {
   sendJukeStateReq(d) { this._bcast('jukeStateReq', d); }
   sendJukeState(d) { this._bcast('jukeState', d); }
   sendJukeLike(d) { this._bcast('jukeLike', d); }
+  sendStageSync(d) { this._bcast('stageSync', d); } // build 66
+  sendStageReq(d) { this._bcast('stageReq', d); } // build 66
+  sendFohSync(d) { this._bcast('fohSync', d); } // build 66
+  sendFohReq(d) { this._bcast('fohReq', d); } // build 66
   sendJukeFileReq(d, target) { this._sendTo('jukeFileReq', d, target); }
   sendJukeFileChunk(d, target) { this._sendTo('jukeFileChunk', d, target); }
 

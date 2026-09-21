@@ -167,6 +167,10 @@ const ACTION_CBS = {
   jukeClaim: 'onJukeClaimCb', // build 43: "I hold this server's line"
   jukeSync: 'onJukeSyncCb', // build 43: canonical queue snapshot from the holder
   jukeClear: 'onJukeClearCb', // build 43: anyone may clear the server's line
+  stageSync: 'onStageSyncCb', // build 66: shared sound-room stage layout
+  stageReq: 'onStageReqCb', // build 66: late joiner asks for the stage
+  fohSync: 'onFohSyncCb', // build 66: shared front-of-house light rig
+  fohReq: 'onFohReqCb', // build 66: late joiner asks for the lights
   voiceChunk: 'onVoiceChunkCb', // build 40: live room voice over the relay
   voiceTalk: 'onVoiceTalkCb',
 };
@@ -560,6 +564,10 @@ export class LimboNet {
     this.onJukeClaimCb = null; // (data, peerId)
     this.onJukeSyncCb = null; // (data, peerId)
     this.onJukeClearCb = null; // (data, peerId)
+    this.onStageSyncCb = null; // (data, peerId)
+    this.onStageReqCb = null; // (data, peerId)
+    this.onFohSyncCb = null; // (data, peerId)
+    this.onFohReqCb = null; // (data, peerId)
     this.onRelayUpCb = null; // () — build 43: relay engaged, safe to sync
     this.onVoiceChunkCb = null; // (data, peerId)
     this.onVoiceTalkCb = null; // (data, peerId)
