@@ -1264,7 +1264,7 @@ html, body {
 #juke-progress-fill {
   height: 100%; width: 0%; border-radius: 2px;
   background: linear-gradient(90deg, #8dff7a, #d2ffc4);
-  transition: width 1s linear;
+  transition: width 0.25s linear;
 }
 #juke-progress-fill.pulse { animation: juke-pulse 1.6s ease-in-out infinite; width: 100%; }
 @keyframes juke-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.9; } }

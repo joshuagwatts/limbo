@@ -5798,18 +5798,32 @@ function jukeArmResync() {
 
 function jukeArmProgress() {
   clearInterval(juke.progressTimer);
+  /* Build 60: monotonic + 4x updates. The bar is wall-clock driven, so a
+     startedAt bump (sync) or duration refinement used to make it jump.
+     Within a track it now never moves backward, and forward leaps are
+     capped — hiccups absorbed, motion stays smooth. */
+  let lastP = -1, lastTrackId = null;
   juke.progressTimer = setInterval(() => {
     const fill = document.getElementById('juke-progress-fill');
     if (!fill || !juke.now) return;
+    const tid = juke.now.id;
+    if (tid !== lastTrackId) { lastP = -1; lastTrackId = tid; }
     const dm = juke.now.durationMs;
     if (dm && dm > 0) {
-      const p = Math.min(1, (Date.now() - juke.now.startedAt) / dm);
+      let p = Math.min(1, (Date.now() - juke.now.startedAt) / dm);
+      if (lastP >= 0) {
+        if (p < lastP) p = lastP; // never backward within a track
+        const maxStep = (5 * 1000) / dm; // cap forward leaps to 5s of progress
+        if (p - lastP > maxStep) p = lastP + maxStep;
+      }
+      lastP = p;
+      fill.classList.remove('pulse');
       fill.style.width = (p * 100).toFixed(1) + '%';
     } else {
       fill.style.width = '';
       fill.classList.add('pulse');
     }
-  }, 1000);
+  }, 250);
 }
 
 function jukeStopPlayer() {
