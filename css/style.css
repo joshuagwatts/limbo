@@ -1268,6 +1268,7 @@ html, body {
 #net-pill[data-cls='on'] { color: #9dffb0; border-color: rgba(120, 255, 160, .38); }
 #net-pill[data-cls='warn'] { color: #ffc98a; border-color: rgba(255, 190, 120, .45); }
 #net-pill[data-cls='off'] { color: #8a8f9d; border-color: rgba(140, 150, 170, .25); }
+#net-pill[data-cls='relay'] { color: #a9c6ff; border-color: rgba(140, 170, 255, .42); }
 /* Build 31: ?debug=net on-screen net log (created by js/net.js only when
    the URL carries ?debug=net — zero DOM/UI change otherwise). Small
    toggleable monospace panel; sits above the paint overlay (z 55) so the
