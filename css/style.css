@@ -414,10 +414,10 @@ html, body {
 #chat-input:focus { border-bottom-color: rgba(159, 216, 255, 0.8); background: rgba(2, 2, 10, 0.75); }
 #chat-send {
   flex: none;
-  width: 34px; height: 34px; border-radius: 50%;
+  width: 42px; height: 42px; border-radius: 50%;
   background: rgba(4, 8, 18, 0.55);
   border: 1px solid rgba(140, 170, 255, 0.35);
-  color: #9fd8ff; font-size: 14px; line-height: 1;
+  color: #9fd8ff; font-size: 16px; line-height: 1;
   cursor: pointer; touch-action: manipulation;
 }
 #chat-send:active { background: rgba(140, 170, 255, 0.2); }
