@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=36';
-import { LimboNet } from './net.js?v=36';
-import { CouchNet } from './couch.js?v=36';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=36';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=36';
+import { AudioEngine } from './audio.js?v=37';
+import { LimboNet } from './net.js?v=37';
+import { CouchNet } from './couch.js?v=37';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=37';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick } from './jam.js?v=37';
 
 /* Build 25: aborted fetches (our own timeout-aborts, the P2P tracker's
    retries, provider player internals) surface as unhandled AbortErrors —
@@ -1444,7 +1444,7 @@ function jamHitChordLocal(chord, vel = 0.85) {
    Routes to the SENDER's instrument voice — the inst rides the message.
    Their wisp glow takes their instrument's color (jam notes only exist
    in the sound room, so the peer is here with us). */
-function handleJamNote(d, peerId) {
+function handleJamNote(peerId, d) {
   if (!d || !Number.isFinite(Number(d.midi))) return;
   const midi = Math.max(0, Math.min(127, Math.round(Number(d.midi))));
   const vel = Math.max(0.05, Math.min(1.2, Number(d.vel) || 0.9));
@@ -1478,7 +1478,7 @@ function handleJamNote(d, peerId) {
 /* Pad trigger from a peer: play OUR local copy of that loop. Clients
    that never grabbed the loop have nothing in the slot — skipped
    silently. */
-function handleJamPad(d, peerId) {
+function handleJamPad(peerId, d) {
   if (!d || !Number.isInteger(d.pad) || d.pad < 0 || d.pad > 3) return;
   const name = String(d.n || 'drifter').slice(0, 16);
   const buf = jam.pads[d.pad];
@@ -1495,7 +1495,7 @@ function handleJamPad(d, peerId) {
 
 /* Clock from the room: only the current DJ's clock counts. Stale clocks
    from a deposed DJ are ignored — the new DJ's grid takes over. */
-function handleJamClock(d, peerId) {
+function handleJamClock(peerId, d) {
   if (!d || !Number.isFinite(Number(d.bpm)) || !Number.isFinite(Number(d.startWall))) return;
   if (peerId && net.clientId && String(peerId) === String(net.clientId)) return; // never follow our own echo
   const t = Number(d.t) || 0;
@@ -2200,7 +2200,7 @@ function wallUndoMyLast() {
   return null;
 }
 
-function handleWallUndo(d, peerId) {
+function handleWallUndo(peerId, d) {
   if (!d || typeof d.id !== 'string' || !d.id) return;
   const i = wall.log.findIndex((e) => e.id === d.id);
   if (i < 0) return; // unknown id — nothing to do
@@ -2227,7 +2227,7 @@ function wallValidStroke(d) {
   return true;
 }
 
-function handleWallStroke(d, peerId) {
+function handleWallStroke(peerId, d) {
   if (!wallValidStroke(d)) return;
   // Group flush chunks into one log entry by gesture id; id-less senders
   // (older builds) get one entry per chunk.
@@ -2316,7 +2316,7 @@ function wallRestoreSnapshot() {
   });
 }
 
-function handleWallSyncReq(d, peerId) {
+function handleWallSyncReq(peerId, d) {
   if (!d || typeof d.reqId !== 'string' || !d.reqId) return;
   if (wall.answeredReq.has(d.reqId)) return; // answer each request once
   if (wall.strokeCount <= 0) return;         // blank wall: nothing to share
@@ -2337,7 +2337,7 @@ function handleWallSyncReq(d, peerId) {
   } catch (e) { /* best effort */ }
 }
 
-function handleWallSync(d, peerId) {
+function handleWallSync(peerId, d) {
   if (!d || typeof d.img !== 'string' || !d.img.startsWith('data:image/')) return;
   // Never stomp a wall that's actively being painted: if my own brush
   // landed in the last ~3s, stash the mural and merge it once I'm quiet
@@ -2359,7 +2359,7 @@ function wallValidHello(d) {
   return d && typeof d === 'object' &&
     typeof d.ts === 'number' && d.ts >= 0 && d.ts < Date.now() + 60000;
 }
-function handleWallHello(d, peerId) {
+function handleWallHello(peerId, d) {
   if (!wallValidHello(d)) return;
   if (!(wall.ts > d.ts)) return;    // only the newer wall speaks
   if (wall.strokeCount <= 0) return; // blank wall: nothing to share
@@ -6839,7 +6839,7 @@ function handlePeerLeave(id) {
 net.onWispCb = handleWisp;
 net.onJukeLikeCb = (cid, d) => handleJukeLike(cid, d); // build 33: track likes
 net.onPeerLeaveCb = handlePeerLeave;
-net.onChatCb = (d, peerId) => {
+net.onChatCb = (peerId, d) => {
   if (!d) return;
   const nm = String(d.n || 'drifter').slice(0, 16) || 'drifter';
   const tx = String(d.t || '').slice(0, 140);
@@ -7397,9 +7397,9 @@ window.__limbo = {
     jam.startWall = Date.now() - startWallAgoMs;
     renderJamTransport();
   },
-  jamNote: (d, pid) => handleJamNote(d, pid),
-  jamPad: (d, pid) => handleJamPad(d, pid),
-  jamClockIn: (d, pid) => handleJamClock(d, pid),
+  jamNote: (d, pid) => handleJamNote(pid, d),
+  jamPad: (d, pid) => handleJamPad(pid, d),
+  jamClockIn: (d, pid) => handleJamClock(pid, d),
   jamPlayLocal: (m, v) => jamPlayLocal(m, v),
   jamGrabLoop: () => jamGrabLoop(),
   // aura ducking (build 22): ambient pad fades out in the sound room.
@@ -7554,30 +7554,30 @@ window.__limbo = {
   wallOpen: (o) => setPaintOpen(o === undefined ? true : !!o),
   wallPaintVisible: () => !!(paintBtn && paintBtn.style.display !== 'none'),
   wallValid: (d) => wallValidStroke(d),
-  wallHandleStroke: (d, pid) => handleWallStroke(d, pid || 'test-peer'),
+  wallHandleStroke: (d, pid) => handleWallStroke(pid || 'test-peer', d),
   wallExportPng: () => wallExportPng(),
   wallLoopback: (d) => {
     const ok = wallValidStroke(d);
     if (net.sendWallStroke) { try { net.sendWallStroke(d); } catch (e) {} }
-    handleWallStroke(d, 'loopback');
+    handleWallStroke('loopback', d);
     return ok;
   },
   wallSnapshot: () => wallSnapshot(),
   wallApplySnapshot: (u) => wallApplySnapshot(u),
-  wallHandleSync: (d, pid) => handleWallSync(d, pid || 'test-peer'),
+  wallHandleSync: (d, pid) => handleWallSync(pid || 'test-peer', d),
   wallSendSyncReq: (id) => { try { return !!(net.sendWallSyncReq && net.sendWallSyncReq({ reqId: id, ts: wall.ts })); } catch (e) { return false; } },
-  wallHandleSyncReq: (d, pid) => handleWallSyncReq(d, pid || 'test-peer'),
+  wallHandleSyncReq: (d, pid) => handleWallSyncReq(pid || 'test-peer', d),
   wallAnswered: () => [...wall.answeredReq],
   // community wall persistence (build 26)
   wallTs: () => wall.ts,
   wallTestSetTs: (t) => { wall.ts = t; return wall.ts; },
   wallSaveSnapshotNow: () => wallSaveSnapshot(),
   wallRestoreSnapshot: () => wallRestoreSnapshot(),
-  wallHandleHello: (d, pid) => handleWallHello(d, pid || 'test-peer'),
+  wallHandleHello: (d, pid) => handleWallHello(pid || 'test-peer', d),
   wallHelloSend: (ts) => { try { return !!(net.sendWallHello && net.sendWallHello({ ts })); } catch (e) { return false; } },
   // community wall undo (build 26)
   wallUndo: () => wallUndoMyLast(),
-  wallHandleUndo: (d, pid) => handleWallUndo(d, pid || 'test-peer'),
+  wallHandleUndo: (d, pid) => handleWallUndo(pid || 'test-peer', d),
   wallUndoSend: (id) => { try { return !!(net.sendWallUndo && net.sendWallUndo({ id })); } catch (e) { return false; } },
   wallLog: () => wall.log.map((e) => ({ id: e.id, byMe: e.byMe, pts: e.points.length, eraser: e.eraser, blend: !!e.blend })),
   wallTestSetCap: (n) => { wall.logCap = n; return wall.logCap; },

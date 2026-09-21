@@ -60,6 +60,20 @@
  * local candidate types incl. whether TURN produced relay candidates,
  * join errors, retry countdowns, watchdog triggers) so a phone test
  * produces a diagnosis instead of a shrug. Zero UI change otherwise.
+ *
+ * RELAY MODE (build 37) — Nostr data-transport fallback for when WebRTC
+ * can't connect (symmetric NAT / CGNAT on mobile carriers, 5G included:
+ * fast pipe, no direct path between phones). Instead of accounts, tokens,
+ * or dashboard taps, the game relays its tiny traffic through the same
+ * public Nostr relays it uses for signaling: ephemeral kind-20001 events
+ * with one `t` tag per room (`<appId>:<roomKey>`), JSON envelope
+ * {a: actionName, d: <the exact payload _bcast would send>, to?}.
+ * Receivers feed it into the same _in() path, so dedup, cid merging, and
+ * the game.js handler contract are untouched. Engages automatically
+ * (watchdog / ICE join-error / 30s of no discovery with reachable
+ * relays), stays on for the session; the pill shows `● N here · relay`.
+ * Oversize payloads (wall JPEG backfills, jukebox file chunks) are
+ * skipped in relay mode — they'd blow past relay event size caps.
  */
 
 const APP_ID = 'limbo_by_holowatts';
@@ -76,7 +90,7 @@ const PRESENCE_SWEEP_MS = 10000;    // how often expired entries are reaped
 const SOUND_ROOM_KEY = 'limbo-realm-5';
 /* Bump on every deploy — shown in the debug HUD (press D) so we can tell
    whether a phone is actually running the latest code or a cached copy. */
-const BUILD = '36';
+const BUILD = '37';
 
 /* Alone in a realm room this long -> suggest the Nexus (once per visit). */
 const QUIET_AFTER_MS = 20000;
@@ -185,6 +199,251 @@ function buildIceServers(creds) {
   ];
 }
 
+/* ---- relay mode (build 37): Nostr data-transport fallback ---- */
+const RELAY_EVENT_KIND = 20001; // ephemeral range: relays forward, never store
+const RELAY_MAX_BYTES = 48 * 1024;
+const RELAY_SKIP_ACTIONS = new Set(['jukeFileReq', 'jukeFileChunk']);
+const RELAY_WISP_MIN_MS = 150; // be polite: ~6-7 pos updates/sec per client in relay mode
+const NOSTR_TOOLS_URL = 'https://esm.sh/nostr-tools@2.10.4';
+
+/* Minimal Nostr client: one WebSocket per pinned relay, one REQ per tag,
+ * raw EVENT publish. Separate from Trystero's sockets — no shared state.
+ * Privacy model is identical to a Trystero room: anyone holding the room
+ * key can read the traffic. Relay mode adds no new exposure. */
+class RelayLink {
+  constructor(net) {
+    this.net = net;
+    this.urls = NOSTR_RELAYS;
+    this.tools = null;
+    this.seckey = null;
+    this.sockets = new Map(); // url -> WebSocket
+    this.subs = new Map(); // tag -> Set<onEvent>
+    this.ready = false;
+    this.tx = 0;
+    this.rx = 0;
+  }
+
+  tagFor(roomKey) {
+    return `${APP_ID}:${roomKey}`;
+  }
+
+  /* Load nostr-tools (graceful: false when the CDN is unreachable) and
+     open relay sockets. Idempotent. */
+  async ensure() {
+    if (this.ready) return true;
+    let tools = null;
+    try {
+      tools = await import(NOSTR_TOOLS_URL);
+    } catch (e) {
+      tools = null;
+    }
+    if (
+      !tools ||
+      typeof tools.finalizeEvent !== 'function' ||
+      typeof tools.generateSecretKey !== 'function' ||
+      typeof tools.getPublicKey !== 'function'
+    ) {
+      this.net._netLog('relay: nostr-tools unavailable — relay mode disabled');
+      return false;
+    }
+    try {
+      this.seckey = tools.generateSecretKey();
+      tools.getPublicKey(this.seckey); // sanity: throws on bad keygen
+    } catch (e) {
+      this.net._netLog('relay: keygen failed — relay mode disabled');
+      return false;
+    }
+    this.tools = tools;
+    this.ready = true;
+    for (const url of this.urls) this._connect(url);
+    return true;
+  }
+
+  _host(url) {
+    try {
+      return new URL(url).host;
+    } catch (e) {
+      return String(url);
+    }
+  }
+
+  _connect(url) {
+    if (!this.ready || this.sockets.has(url)) return;
+    let ws = null;
+    try {
+      ws = new window.WebSocket(url);
+    } catch (e) {
+      return;
+    }
+    ws.addEventListener('open', () => {
+      this.sockets.set(url, ws);
+      this.net._netLog(`relay: socket open (${this._host(url)})`);
+      for (const tag of this.subs.keys()) this._sendReq(ws, tag);
+    });
+    ws.addEventListener('message', (ev) => {
+      try {
+        this._onMessage(String(ev.data));
+      } catch (e) {
+        /* never break on relay data */
+      }
+    });
+    const drop = () => {
+      if (this.sockets.get(url) === ws) this.sockets.delete(url);
+    };
+    ws.addEventListener('close', () => {
+      drop();
+      this.net._netLog(`relay: socket closed (${this._host(url)})`);
+      if (this.ready) setTimeout(() => this._connect(url), 5000);
+    });
+    ws.addEventListener('error', () => {
+      try {
+        ws.close();
+      } catch (e) {}
+    });
+  }
+
+  _subId(tag) {
+    return `limbo37-${tag}`;
+  }
+
+  _sendReq(ws, tag) {
+    try {
+      if (ws.readyState === 1)
+        ws.send(
+          JSON.stringify([
+            'REQ',
+            this._subId(tag),
+            {
+              kinds: [RELAY_EVENT_KIND],
+              '#t': [tag],
+              // Fresh-state only: never replay stored history on (re)subscribe.
+              // Live traffic re-announces continuously (wisp ~7Hz, presence
+              // 15s), so nothing is lost — but stale peers can't resurrect.
+              since: Math.floor(Date.now() / 1000),
+              limit: 50,
+            },
+          ])
+        );
+    } catch (e) {}
+  }
+
+  subscribe(tag, onEvent) {
+    let set = this.subs.get(tag);
+    if (!set) {
+      set = new Set();
+      this.subs.set(tag, set);
+    }
+    set.add(onEvent);
+    for (const ws of this.sockets.values()) this._sendReq(ws, tag);
+  }
+
+  unsubscribe(tag, onEvent) {
+    const set = this.subs.get(tag);
+    if (!set) return;
+    if (onEvent) set.delete(onEvent);
+    else set.clear();
+    if (set.size > 0) return;
+    this.subs.delete(tag);
+    const close = JSON.stringify(['CLOSE', this._subId(tag)]);
+    for (const ws of this.sockets.values()) {
+      try {
+        if (ws.readyState === 1) ws.send(close);
+      } catch (e) {}
+    }
+  }
+
+  _onMessage(data) {
+    if (!data || data.charCodeAt(0) !== 91) return; // '['
+    let arr = null;
+    try {
+      arr = JSON.parse(data);
+    } catch (e) {
+      return;
+    }
+    if (!Array.isArray(arr) || arr[0] !== 'EVENT') return;
+    const ev = arr[2];
+    if (!ev || ev.kind !== RELAY_EVENT_KIND || !Array.isArray(ev.tags)) return;
+    let tag = null;
+    for (const t of ev.tags) {
+      if (Array.isArray(t) && t[0] === 't' && typeof t[1] === 'string') {
+        tag = t[1];
+        break;
+      }
+    }
+    if (!tag) return;
+    const set = this.subs.get(tag);
+    if (!set || set.size === 0) return;
+    let obj = null;
+    try {
+      obj = JSON.parse(ev.content);
+    } catch (e) {
+      return;
+    }
+    this.rx++;
+    for (const fn of set) {
+      try {
+        fn(obj);
+      } catch (e) {}
+    }
+  }
+
+  /* Sign + publish an envelope to every open socket. Returns true when at
+     least one socket accepted it. Oversize payloads are skipped loudly. */
+  publish(tag, obj) {
+    if (!this.ready || !this.tools || !this.seckey) return false;
+    let content = null;
+    try {
+      content = JSON.stringify(obj);
+    } catch (e) {
+      return false;
+    }
+    if (content.length > RELAY_MAX_BYTES) {
+      this.net._netLog(
+        `relay: skipped oversize payload (${content.length}b > ${RELAY_MAX_BYTES}b)`
+      );
+      return false;
+    }
+    let ev = null;
+    try {
+      ev = this.tools.finalizeEvent(
+        {
+          kind: RELAY_EVENT_KIND,
+          tags: [['t', tag]],
+          content,
+          created_at: Math.floor(Date.now() / 1000),
+        },
+        this.seckey
+      );
+    } catch (e) {
+      return false;
+    }
+    let msg = null;
+    try {
+      msg = JSON.stringify(['EVENT', ev]);
+    } catch (e) {
+      return false;
+    }
+    let sent = 0;
+    for (const ws of this.sockets.values()) {
+      try {
+        if (ws.readyState === 1) {
+          ws.send(msg);
+          sent++;
+        }
+      } catch (e) {}
+    }
+    if (sent > 0) this.tx++;
+    return sent > 0;
+  }
+
+  socketStates() {
+    return this.urls.map((u) => {
+      const ws = this.sockets.get(u);
+      return { host: this._host(u), open: !!ws && ws.readyState === 1 };
+    });
+  }
+}
+
 function cap(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
@@ -274,6 +533,15 @@ export class LimboNet {
     this._netLogEl = null;
     this._netLogBody = null;
     this._pcSeen = new Map(); // connKey -> {ice, gathering, typesLogged}
+    // --- relay mode (build 37): Nostr data-transport fallback ---
+    this.relayLink = null; // RelayLink, created lazily on first engage
+    this.relayMode = false;
+    this._relayRoomTag = null;
+    this._relaySince = 0;
+    this._lastRelayWisp = 0;
+    this._relaySkipLogged = new Set();
+    this._relayRoomHandler = (obj) => this._onRelayRoom(obj);
+    this._relayLobbyHandler = (obj) => this._onRelayLobby(obj);
     this._installWsTap();
   }
 
@@ -354,6 +622,7 @@ export class LimboNet {
           ? arr[2]
           : null;
     if (!ev || typeof ev.kind !== 'number') return;
+    if (ev.kind === RELAY_EVENT_KIND) return; // our own relay-mode data frames — not signaling
     let topicKind = '?';
     let peerId = null;
     if (typeof ev.content === 'string') {
@@ -455,6 +724,8 @@ export class LimboNet {
     };
     this._netLog(`joinError via ${this.lastJoinError.strategy}: ${this.lastJoinError.error}`);
     this._scheduleIceRetry();
+    // build 37: SDP was exchanged but ICE failed — bring up the relay backstop.
+    this.enterRelayMode('join-error');
     this._updatePill();
   }
 
@@ -542,6 +813,8 @@ export class LimboNet {
       at: new Date().toLocaleTimeString(),
     };
     this._scheduleIceRetry();
+    // build 37: peer announced but the data channel never opened — relay backstop.
+    this.enterRelayMode('watchdog');
     this._updatePill();
   }
 
@@ -635,6 +908,15 @@ export class LimboNet {
          fall back to STUN-only behavior for this room */
     }
     this._joinAll();
+    // build 37: relay mode is sticky across room hops — move the room
+    // subscription to the new room's tag. (leave() already dropped the old
+    // tag's peers via peers.clear().)
+    if (this.relayMode && this.relayLink && this.relayLink.ready) {
+      if (this._relayRoomTag)
+        this.relayLink.unsubscribe(this._relayRoomTag, this._relayRoomHandler);
+      this._relayRoomTag = this.relayLink.tagFor(roomKey);
+      this.relayLink.subscribe(this._relayRoomTag, this._relayRoomHandler);
+    }
     this._armQuietTimer();
     this._updatePill();
   }
@@ -834,6 +1116,9 @@ export class LimboNet {
         /* best effort per room */
       }
     }
+    // build 37: relay-mode fallback — the same payload rides Nostr when
+    // WebRTC is down. Dedup on receipt collapses double deliveries.
+    if (this.relayMode) this._relayPublish(actionName, out, null);
   }
 
   /* Resolve a canonical cid to one concrete (room, peerId) and send once. */
@@ -850,18 +1135,22 @@ export class LimboNet {
   _sendTo(actionName, data, target) {
     if (!this.enabled || target == null) return;
     const c = this._pickConn(String(target));
-    if (!c) return;
     let out;
     try {
       out = Object.assign({ cid: this.clientId }, data);
     } catch (e) {
       out = { cid: this.clientId };
     }
-    try {
-      c.entry.A[actionName].send(out, c.peerId);
-    } catch (e) {
-      /* ignore */
+    if (c) {
+      try {
+        c.entry.A[actionName].send(out, c.peerId);
+      } catch (e) {
+        /* ignore */
+      }
+      return;
     }
+    // build 37: no data-channel path to this peer — try the relay instead.
+    if (this.relayMode) this._relayPublish(actionName, out, String(target));
   }
 
   /* Suggest the Nexus when a player sits alone in a realm room. */
@@ -898,6 +1187,13 @@ export class LimboNet {
     this.rooms = [];
     this.peers.clear();
     this._nullSends();
+    // build 37: drop the room's relay subscription (the lobby sub survives hops).
+    if (this.relayLink && this._relayRoomTag) {
+      try {
+        this.relayLink.unsubscribe(this._relayRoomTag, this._relayRoomHandler);
+      } catch (e) {}
+      this._relayRoomTag = null;
+    }
     this._updatePill();
   }
 
@@ -926,6 +1222,8 @@ export class LimboNet {
     } catch (e) {
       /* ignore */
     }
+    // build 37: the lobby roster rides the relay too when fallback is on.
+    this._presenceTickRelay();
   }
 
   _notePresence(data) {
@@ -1026,6 +1324,164 @@ export class LimboNet {
     this.lobbyPeers.clear();
   }
 
+  /* ---------------- relay mode (build 37) ----------------
+     Nostr data-transport fallback — see the header comment. These are the
+     LimboNet-side hooks; the wire client is the RelayLink class above. */
+
+  /* Engage the Nostr data-transport fallback. Idempotent; safe to call
+     from any failure path. Sticky for the session once on. */
+  async enterRelayMode(reason) {
+    if (this.relayMode || !this.enabled) return;
+    this.relayMode = true;
+    this._relaySince = Date.now();
+    this._netLog(
+      `RELAY MODE engaged (${reason}) — traffic now rides Nostr relays`
+    );
+    this._updatePill();
+    if (!this.relayLink) this.relayLink = new RelayLink(this);
+    let ok = false;
+    try {
+      ok = await this.relayLink.ensure();
+    } catch (e) {
+      ok = false;
+    }
+    if (!ok) {
+      this.relayMode = false;
+      this._netLog('relay: transport unavailable — staying on WebRTC retries');
+      this._updatePill();
+      return;
+    }
+    if (this.roomKey) {
+      this._relayRoomTag = this.relayLink.tagFor(this.roomKey);
+      this.relayLink.subscribe(this._relayRoomTag, this._relayRoomHandler);
+    }
+    this.relayLink.subscribe(
+      this.relayLink.tagFor(LOBBY_ROOM),
+      this._relayLobbyHandler
+    );
+    this._presenceTickRelay();
+  }
+
+  /* Publish one action payload over the relay. Same envelope the data
+     channel would carry ({cid, ...}), wrapped as {a, d, to?}. */
+  _relayPublish(actionName, data, targetCid) {
+    try {
+      if (!this.relayMode || !this.relayLink || !this._relayRoomTag) return;
+      if (RELAY_SKIP_ACTIONS.has(actionName)) {
+        if (!this._relaySkipLogged.has(actionName)) {
+          this._relaySkipLogged.add(actionName);
+          this._netLog(
+            `relay: ${actionName} needs a direct connection — skipped in relay mode`
+          );
+        }
+        return;
+      }
+      if (actionName === 'wisp') {
+        const now = Date.now();
+        if (now - this._lastRelayWisp < RELAY_WISP_MIN_MS) return;
+        this._lastRelayWisp = now;
+      }
+      const env = { a: actionName, d: data };
+      if (targetCid) env.to = targetCid;
+      this.relayLink.publish(this._relayRoomTag, env);
+    } catch (e) {
+      /* relay must never break the game loop */
+    }
+  }
+
+  /* Incoming room traffic from the relay. Feeds the same _in() path as
+     the data channel — dedup + cid merging handle hybrid peers. */
+  _onRelayRoom(obj) {
+    try {
+      if (!obj || typeof obj !== 'object') return;
+      const actionName = obj.a;
+      const d = obj.d;
+      if (typeof actionName !== 'string' || !d || typeof d !== 'object') return;
+      const cbProp = ACTION_CBS[actionName];
+      if (!cbProp) return;
+      const cid = typeof d.cid === 'string' && d.cid ? d.cid : null;
+      if (!cid || cid === this.clientId) return; // malformed / our own echo
+      if (obj.to && obj.to !== this.clientId) return; // addressed elsewhere
+      let rec = this.peers.get(cid);
+      if (!rec) {
+        rec = { conns: new Map(), relay: true, lastSeen: 0 };
+        this.peers.set(cid, rec);
+      }
+      rec.lastSeen = Date.now();
+      this._in('relay', actionName, cbProp, d, cid);
+      this._updatePill();
+    } catch (e) {
+      /* never break on peer data */
+    }
+  }
+
+  /* Incoming lobby presence from the relay — same roster as _notePresence. */
+  _onRelayLobby(obj) {
+    try {
+      if (!obj || obj.a !== 'presence' || !obj.d || typeof obj.d !== 'object')
+        return;
+      const d = obj.d;
+      if (!d.cid || d.cid === this.clientId) return;
+      this._notePresence(d);
+    } catch (e) {}
+  }
+
+  /* Heartbeat our presence over the relay (lobby tag). Called on engage
+     and piggybacked on the regular 15s _presenceTick. */
+  _presenceTickRelay() {
+    try {
+      if (!this.relayMode || !this.relayLink) return;
+      this.relayLink.publish(this.relayLink.tagFor(LOBBY_ROOM), {
+        a: 'presence',
+        d: Object.assign({ cid: this.clientId }, this._presencePayload()),
+      });
+    } catch (e) {}
+  }
+
+  /* True when at least one pinned relay has an open Trystero socket —
+     meaning the relay path is provably reachable from this client. */
+  _relayReachable() {
+    try {
+      const st = this._getRelayStatus();
+      return !!(st && st.some((r) => r.open));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /* No-discovery trigger: 30s+ in a room with zero peers but reachable
+     relays — the WebRTC path is getting us nothing. The watchdog and
+     join-error paths engage relay mode directly (discovery proven). */
+  _checkRelayTriggers() {
+    if (this.relayMode || !this.enabled || !this.roomKey) return;
+    if (this.peerCount() > 0) return;
+    if (Date.now() - this.joinedAt > 30000 && this._relayReachable()) {
+      this._netLog('relay trigger: 30s, no peers, relays reachable');
+      this.enterRelayMode('no-discovery');
+    }
+  }
+
+  /* Relay peers have no onPeerLeave — expire them like presence entries. */
+  _sweepRelayPeers(now) {
+    const t = typeof now === 'number' ? now : Date.now();
+    let dropped = 0;
+    for (const [cid, rec] of this.peers) {
+      if (cid.startsWith('~prov:')) continue;
+      if (!rec.relay) continue;
+      if (t - (rec.lastSeen || 0) > PRESENCE_EXPIRE_MS) {
+        this.peers.delete(cid);
+        dropped++;
+        this._netLog(`relay: peer ${String(cid).slice(0, 8)} expired`);
+        if (this.onPeerLeaveCb) {
+          try {
+            this.onPeerLeaveCb(cid);
+          } catch (e) {}
+        }
+      }
+    }
+    if (dropped > 0) this._updatePill();
+  }
+
   /* Broadcast our wisp position + heading + name + equipped look (~12Hz
      from the game loop). game.js sets this.cosmetics so peers can render
      our skin, hat, and trail; short string ids keep the payload tiny.
@@ -1101,7 +1557,9 @@ export class LimboNet {
        ○ finding others…      in a room, no peers, no handshake activity
        ○ connecting…          peer announced / handshaking, no data channel yet
        ○ couldn't connect · retrying…   ICE failed (onJoinError), retry scheduled
+       ○ relay: finding others… relay fallback on, no peers yet (build 37)
        ● N here               N humans connected
+       ● N here · relay       N humans connected via relay fallback (build 37)
      Updates on join/leave/error/handshake plus a 2s poll for stage changes.
      pointer-events:none so it never eats game touches. */
 
@@ -1143,6 +1601,17 @@ export class LimboNet {
     } catch (e) {
       /* diagnostics only */
     }
+    // build 37: relay-mode triggers + relay peer expiry (diagnostics-safe)
+    try {
+      this._checkRelayTriggers();
+    } catch (e) {
+      /* diagnostics only */
+    }
+    try {
+      this._sweepRelayPeers();
+    } catch (e) {
+      /* diagnostics only */
+    }
     this._updatePill();
   }
 
@@ -1150,7 +1619,12 @@ export class LimboNet {
     if (!this.enabled) return { cls: 'off', text: '○ offline' };
     if (!this.roomKey) return { cls: 'mid', text: '○ net ready' };
     const n = this.peerCount();
-    if (n > 0) return { cls: 'on', text: `● ${n} here` };
+    if (n > 0)
+      return this.relayMode
+        ? { cls: 'relay', text: `● ${n} here · relay` }
+        : { cls: 'on', text: `● ${n} here` };
+    if (this.relayMode)
+      return { cls: 'relay', text: '○ relay: finding others…' };
     if (this.lastJoinError) return { cls: 'warn', text: "○ couldn't connect · retrying…" };
     const now = Date.now();
     for (const [, r] of this.hsPeers) {
@@ -1381,6 +1855,16 @@ export class LimboNet {
         lastSeenMs: r.lastSeenMs,
       })),
       frames: this.nostrFrames.slice(),
+      // build 37: relay-mode fallback state
+      relay: this.relayMode
+        ? {
+            since: this._relaySince,
+            roomTag: this._relayRoomTag,
+            tx: this.relayLink ? this.relayLink.tx : 0,
+            rx: this.relayLink ? this.relayLink.rx : 0,
+            sockets: this.relayLink ? this.relayLink.socketStates() : [],
+          }
+        : null,
     };
   }
 }
