@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=45">
+<link rel="stylesheet" href="css/style.css?v=46">
 <script type="importmap">
 {
   "imports": {
@@ -148,6 +148,7 @@ if ('serviceWorker' in navigator) {
     <div class="jam-bpm-wrap"><div id="jam-bpm">120</div><div class="jam-bpm-label">BPM</div></div>
     <div class="jam-clock"><span id="jam-clock-dot"></span><span id="jam-clock-status">clock stopped</span></div>
     <button id="jam-tap">tap</button>
+    <button id="jam-listen" aria-label="listen to the jukebox for tempo">listen</button>
     <button id="jam-bpm-down" aria-label="slower">−</button>
     <button id="jam-bpm-up" aria-label="faster">+</button>
   </div>
@@ -409,6 +410,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=45"></script>
+<script type="module" src="js/game.js?v=46"></script>
 </body>
 </html>
