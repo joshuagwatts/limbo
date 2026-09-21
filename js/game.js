@@ -5296,7 +5296,7 @@ function jukePlaySCFresh(d, offset) {
   iframe.id = 'juke-sc-fresh';
   iframe.width = '1'; iframe.height = '1';
   iframe.setAttribute('frameborder', '0');
-  iframe.setAttribute('allow', 'autoplay');
+  iframe.setAttribute('allow', 'autoplay; encrypted-media');
   iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(d.url) +
     '&auto_play=false&hide_related=true&show_comments=false&show_user=false&visual=false';
   holder.appendChild(iframe);
