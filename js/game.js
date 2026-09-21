@@ -10,8 +10,8 @@
 
 import * as THREE from 'three';
 import { AudioEngine } from './audio.js?v=41';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=49';
-import { CouchNet } from './couch.js?v=49';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=50';
+import { CouchNet } from './couch.js?v=50';
 import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=41';
 import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, playBassNote, playDrum, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount } from './jam.js?v=41';
 
@@ -7933,6 +7933,20 @@ function journeyBoostCalc(dt) {
     }
   } catch (e) {}
   if (peerNear < 30) boost += 0.25 * (1 - peerNear / 30);
+  // build 50: drafting a manta ray — tuck in close and it pulls you along;
+  // your called ray tows you a little extra
+  let rayNear = Infinity;
+  let rayTow = false;
+  if (journey.rays) {
+    for (const r of journey.rays) {
+      const d = Math.hypot(wisp.position.x - r.group.position.x,
+        wisp.position.y - r.group.position.y, wisp.position.z - r.group.position.z);
+      if (d < rayNear) rayNear = d;
+      if (r.following && d < 25) rayTow = true;
+    }
+  }
+  if (rayNear < 40) boost += 0.3 * (1 - rayNear / 40);
+  if (rayTow) boost += 0.15;
   // bursts decay
   journey.ringBoost = Math.max(0, (journey.ringBoost || 0) - dt * 0.55);
   journey.gemBoost = Math.max(0, (journey.gemBoost || 0) - dt * 0.8);
