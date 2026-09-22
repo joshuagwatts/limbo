@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=71';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=71';
-import { CouchNet } from './couch.js?v=71';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=71';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=71';
+import { AudioEngine } from './audio.js?v=72';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=72';
+import { CouchNet } from './couch.js?v=72';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=72';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=72';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -1805,9 +1805,10 @@ function jamEnsureChain() {
     conv.buffer = makeImpulseResponse(ctx, 1.9, 2.4);
     const revSend = ctx.createGain(); revSend.gain.value = 0.32;
     const revRet = ctx.createGain(); revRet.gain.value = 0.5;
-    // tempo-synced dotted-eighth feedback delay
+    // build 72: quarter-note (was dotted-eighth) — the echo lands on the
+    // beat grid so the drum loop closes cleanly instead of drifting
     const delay = ctx.createDelay(2.0);
-    delay.delayTime.value = (60 / jam.bpm) * 0.75;
+    delay.delayTime.value = (60 / jam.bpm) * 1.0;
     const fb = ctx.createGain(); fb.gain.value = 0.38;
     const dlySend = ctx.createGain(); dlySend.gain.value = 0.2;
     const dlyRet = ctx.createGain(); dlyRet.gain.value = 0.45;
@@ -2356,12 +2357,14 @@ function voiceTalkers() {
   return out;
 }
 
-/* Keep the delay musical under tempo changes — dotted eighth, eased. */
+/* Keep the delay musical under tempo changes — quarter note, eased.
+ * Build 72: was dotted-eighth; the off-grid echo made the drum loop feel
+ * unsealed. Quarter-note lands on the grid so the loop closes cleanly. */
 function jamSyncDelayToBpm() {
   const ch = jam.chain;
   if (!ch || !audio.ctx) return;
   try {
-    ch.delay.delayTime.setTargetAtTime((60 / jam.bpm) * 0.75, audio.ctx.currentTime, 0.1);
+    ch.delay.delayTime.setTargetAtTime((60 / jam.bpm) * 1.0, audio.ctx.currentTime, 0.1);
     if (ch.synthFx) ch.synthFx.updateTempo(jam.bpm); // build 64: synth delay follows too
   } catch (e) { /* ignore */ }
 }
