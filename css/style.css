@@ -1955,7 +1955,8 @@ html { -webkit-text-size-adjust: 100%; }
   background: rgba(159, 216, 255, 0.3); border-color: #9fd8ff; color: #fff;
 }
 #sc-done { border-color: rgba(140, 255, 170, 0.5); color: #c9ffd9; font-size: 13px; }
-#sc-undo.off { opacity: 0.35; }
+#sc-undo { border-color: rgba(255, 210, 140, 0.55); color: #ffe3b3; }
+#sc-undo.off { opacity: 0.55; }
 .sc-bottom {
   position: absolute; left: 0; right: 0; bottom: 0;
   padding-bottom: calc(12px + env(safe-area-inset-bottom));

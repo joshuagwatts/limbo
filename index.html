@@ -14,7 +14,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=70">
+<link rel="stylesheet" href="css/style.css?v=71">
 <script type="importmap">
 {
   "imports": {
@@ -24,8 +24,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=70"></script>
-<script src="js/vendor/jsqr.js?v=70"></script>
+<script src="js/vendor/qrcode.js?v=71"></script>
+<script src="js/vendor/jsqr.js?v=71"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -437,7 +437,7 @@ if ('serviceWorker' in navigator) {
     </div>
     <button id="sc-sym" class="on" aria-label="mirror symmetry">&#8646;</button>
     <button id="sc-invert" aria-label="invert brush">&#8645;</button>
-    <button id="sc-undo" class="off" aria-label="undo stroke">&#8617;</button>
+    <button id="sc-undo" class="off" aria-label="undo stroke">&#8617; undo</button>
     <button id="sc-done">&#10003; done</button>
   </div>
   <div class="sc-bottom">
@@ -578,6 +578,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=70"></script>
+<script type="module" src="js/game.js?v=71"></script>
 </body>
 </html>
