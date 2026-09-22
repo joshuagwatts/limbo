@@ -14,7 +14,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=72">
+<link rel="stylesheet" href="css/style.css?v=73">
 <script type="importmap">
 {
   "imports": {
@@ -24,8 +24,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=72"></script>
-<script src="js/vendor/jsqr.js?v=72"></script>
+<script src="js/vendor/qrcode.js?v=73"></script>
+<script src="js/vendor/jsqr.js?v=73"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -97,6 +97,8 @@ if ('serviceWorker' in navigator) {
   </div>
   <div id="juke-phone-status" class="juke-phone-status" style="display:none"></div>
   <div id="juke-hint" class="juke-hint">everyone hears the same track at the same time — on their own device</div>
+  <!-- build 73: link diagnostic — sent / received / relay / peers, read it off the phones -->
+  <div id="juke-diag" class="juke-diag">link: —</div>
 </div>
 <!-- jukebox provider players: persistent + permanently invisible (build 25).
      They live at body level so closing the panel never tears them down. -->
@@ -578,6 +580,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=72"></script>
+<script type="module" src="js/game.js?v=73"></script>
 </body>
 </html>

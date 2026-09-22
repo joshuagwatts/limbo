@@ -1515,6 +1515,12 @@ html, body {
   margin-top: 10px; font-size: 11px; letter-spacing: 0.08em;
   color: var(--ink-faint); text-align: center;
 }
+/* Build 73: link diagnostic — tiny mono readout for cross-phone debugging */
+.juke-diag {
+  margin-top: 6px; font-size: 10px; letter-spacing: 0.06em;
+  color: var(--ink-dim); text-align: center; font-family: monospace;
+  opacity: 0.8;
+}
 /* Build 25: provider players are permanently invisible — 1px, off-screen,
    no pointer events. Never display:none (that throttles some players). */
 .juke-embed { position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; overflow: hidden; }

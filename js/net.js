@@ -616,6 +616,10 @@ export class LimboNet {
     this._jukeServerTag = null; // relay tag subscribed for jukebox traffic
     this._jukeServerHandler = (obj) => this._onRelayJukeServer(obj);
     this._lastRelayWisp = 0;
+    // --- jukebox link diagnostics (build 73): tx/rx counters read off the
+    // phones to see which leg is dead instead of guessing.
+    this._jukeTx = 0;
+    this._jukeRx = 0;
     this._relaySkipLogged = new Set();
     this._relayRoomHandler = (obj) => this._onRelayRoom(obj);
     this._relayLobbyHandler = (obj) => this._onRelayLobby(obj);
@@ -1105,6 +1109,7 @@ export class LimboNet {
         /* best effort per room */
       }
     }
+    this._jukeTx++; // build 73: link diagnostic
   }
 
   /* Build 41: point the server-wide jukebox channel at a Nexus server room.
@@ -1254,6 +1259,8 @@ export class LimboNet {
         if (this._seen.size <= 400) break;
       }
     }
+    // build 73: count live jukebox arrivals (post-dedup) for the link diagnostic
+    if (JUKE_SERVER_ACTIONS.has(actionName)) this._jukeRx++;
     const cb = this[cbProp];
     if (cb) {
       try {
@@ -1736,6 +1743,16 @@ export class LimboNet {
     let n = 0;
     for (const k of this.peers.keys()) if (!k.startsWith('~prov:')) n++;
     return n;
+  }
+
+  /* Build 73: one-line jukebox link diagnostic for the phones.
+     tx = jukebox broadcasts sent, rx = jukebox messages arrived,
+     relay = relay transport engaged, peers = data-channel peers seen. */
+  jukeDiag() {
+    let relay = false;
+    try { relay = !!(this.relayMode && this.relayLink && this.relayLink.ready); }
+    catch (e) {}
+    return { tx: this._jukeTx | 0, rx: this._jukeRx | 0, relay, peers: this.peerCount() };
   }
 
   /* Raw RTCPeerConnections across all strategy rooms, keyed

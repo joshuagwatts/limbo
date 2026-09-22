@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=72';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=72';
-import { CouchNet } from './couch.js?v=72';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=72';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=72';
+import { AudioEngine } from './audio.js?v=73';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=73';
+import { CouchNet } from './couch.js?v=73';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=73';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=73';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -6069,7 +6069,25 @@ function renderJuke() {
     }
   }
   jukeBadge(); // build 40: the shared list is visible on the button itself
+  jukeRenderDiag(); // build 73: keep the link diagnostic fresh
 }
+
+/* Build 73: jukebox link diagnostic — one line read off the phones.
+   sent = broadcasts this phone fired, got = jukebox messages arrived,
+   relay = relay transport engaged, peers = data-channel peers seen. */
+function jukeRenderDiag() {
+  const el = document.getElementById('juke-diag');
+  if (!el) return;
+  let d = null;
+  try { d = net.jukeDiag(); } catch (e) {}
+  if (!d) { el.textContent = 'link: —'; return; }
+  el.textContent = `link: sent ${d.tx} · got ${d.rx} · relay ${d.relay ? 'on' : 'off'} · peers ${d.peers}`;
+}
+// refresh the line while the panel is open — counters move live
+setInterval(() => {
+  const p = document.getElementById('juke-panel');
+  if (p && p.style.display !== 'none') { try { jukeRenderDiag(); } catch (e) {} }
+}, 1000);
 
 /* Build 40: the queue lives on every phone — show it without opening the
    panel. The button carries now-playing + how many are in line. */
