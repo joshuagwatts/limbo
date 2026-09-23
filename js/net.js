@@ -627,6 +627,8 @@ export class LimboNet {
     // phones to see which leg is dead instead of guessing.
     this._jukeTx = 0;
     this._jukeRx = 0;
+    this._theatreTx = 0; // build 79: theatre-only link counters
+    this._theatreRx = 0;
     this._relaySkipLogged = new Set();
     this._relayRoomHandler = (obj) => this._onRelayRoom(obj);
     this._relayLobbyHandler = (obj) => this._onRelayLobby(obj);
@@ -1117,6 +1119,7 @@ export class LimboNet {
       }
     }
     this._jukeTx++; // build 73: link diagnostic
+    if (actionName.indexOf('theatre') === 0) this._theatreTx++; // build 79
   }
 
   /* Build 41: point the server-wide jukebox channel at a Nexus server room.
@@ -1268,6 +1271,7 @@ export class LimboNet {
     }
     // build 73: count live jukebox arrivals (post-dedup) for the link diagnostic
     if (JUKE_SERVER_ACTIONS.has(actionName)) this._jukeRx++;
+    if (actionName.indexOf('theatre') === 0) this._theatreRx++; // build 79
     const cb = this[cbProp];
     if (cb) {
       try {

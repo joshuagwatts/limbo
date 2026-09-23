@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=78';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=78';
-import { CouchNet } from './couch.js?v=78';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=78';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=78';
+import { AudioEngine } from './audio.js?v=79';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=79';
+import { CouchNet } from './couch.js?v=79';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=79';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=79';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -592,17 +592,17 @@ function renderJukeHolder() {
       : '';
   } catch (e) {}
 }
-function handleJukeHello(d, peerId) {
+function handleJukeHello(peerId, d) {
   if (!jukeSrvOk(d)) return;
   jukeNotePeer(peerId, d);
 }
-function handleJukeClaim(d, peerId) {
+function handleJukeClaim(peerId, d) {
   if (!jukeSrvOk(d)) return;
   jukeNotePeer(peerId, d); // a claim is a hello with authority
 }
 /* Canonical snapshot from the holder. A sync doubles as a claim — the
    sender is alive and asserting the line. */
-function handleJukeSync(d, peerId) {
+function handleJukeSync(peerId, d) {
   if (!jukeSrvOk(d) || !d || typeof d.rev !== 'number') return;
   const cid = String(peerId || '');
   if (!cid) return;
@@ -684,7 +684,7 @@ function jukeClearQueue() {
   } catch (e) {}
   if (jukeIAmHolder) jukeBroadcastSync();
 }
-function handleJukeClear(d, peerId) {
+function handleJukeClear(peerId, d) {
   if (!jukeSrvOk(d)) return;
   jukeStopPlayback();
   juke.now = null;
@@ -2253,7 +2253,7 @@ function voiceRxEntry(id) {
   return r;
 }
 
-function handleVoiceTalk(d, peerId) {
+function handleVoiceTalk(peerId, d) {
   if (!d || typeof d.on !== 'boolean') return;
   const r = voiceRxEntry(peerId || 'unknown');
   if (d.on) {
@@ -2267,7 +2267,7 @@ function handleVoiceTalk(d, peerId) {
   renderVoiceUI();
 }
 
-function handleVoiceChunk(d, peerId) {
+function handleVoiceChunk(peerId, d) {
   if (!d || typeof d.seq !== 'number' || typeof d.data !== 'string') return;
   if (d.data.length > 60000) return; // absurd — drop
   const r = voiceRxEntry(peerId || 'unknown');
@@ -4622,7 +4622,7 @@ function jukeSortQueue() {
     (a.addedAt - b.addedAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-function handleJukeAdd(d, peerId) {
+function handleJukeAdd(peerId, d) {
   if (!jukeSrvOk(d)) { jukeDrops.srv++; return; }
   if (!jukeValidAdd(d)) { jukeDrops.valid++; return; }
   if (juke.now && juke.now.id === d.id) { jukeDrops.playing++; return; } // the play beat the add here — already spinning
@@ -4656,7 +4656,7 @@ function jukeRemoveTrack(id) {
   return true;
 }
 
-function handleJukeRemove(d, peerId) {
+function handleJukeRemove(peerId, d) {
   if (!jukeSrvOk(d)) return;
   if (!d || typeof d.id !== 'string') return;
   try { jukeRemovedIds.set(d.id, Date.now()); } catch (e) {} // build 44: tombstone — a racing snapshot can't resurrect it
@@ -4688,7 +4688,7 @@ function jukeSkipNow() {
   handleJukeSkip({ id, voter: myName }, 'self');
 }
 
-function handleJukeSkip(d, peerId) {
+function handleJukeSkip(peerId, d) {
   if (!jukeSrvOk(d)) return;
   if (!d || typeof d.id !== 'string') return;
   if (!juke.now || juke.now.id !== d.id) return; // stale skip — already moved on
@@ -4847,7 +4847,7 @@ function jukeRequestPhoneFile(d) {
   }
 }
 
-function handleJukeFileReq(d, peerId) {
+function handleJukeFileReq(peerId, d) {
   if (!d || typeof d.fileId !== 'string' || typeof d.from !== 'number' || d.from < 0) return;
   const f = juke.phoneFiles[d.fileId];
   if (!f || !f.buf || !f.buf.length) return;
@@ -4863,7 +4863,7 @@ function handleJukeFileReq(d, peerId) {
   }
 }
 
-function handleJukeFileChunk(d, peerId) {
+function handleJukeFileChunk(peerId, d) {
   if (!d || typeof d.fileId !== 'string' || typeof d.i !== 'number' ||
       typeof d.n !== 'number' || typeof d.data !== 'string') return;
   const st = juke.phoneFetch[d.fileId];
@@ -4922,7 +4922,7 @@ function jukePhoneFetchTimeout(fileId) {
   }
 }
 
-function handleJukeFileHave(d, peerId) {
+function handleJukeFileHave(peerId, d) {
   if (!d || typeof d.fileId !== 'string') return;
   if (!juke.phoneHave[d.fileId]) juke.phoneHave[d.fileId] = new Set();
   juke.phoneHave[d.fileId].add(d.by || peerId);
@@ -4970,7 +4970,7 @@ function jukeAdvance() {
   return play;
 }
 
-function handleJukePlay(d, peerId) {
+function handleJukePlay(peerId, d) {
   if (!jukeSrvOk(d)) return;
   if (!jukeValidPlay(d)) return;
   if (d.stopped) {
@@ -5891,7 +5891,7 @@ function jukeStopPlayback() {
 
 /* ---------- late-joiner state sync ---------- */
 
-function handleJukeStateReq(d, peerId) {
+function handleJukeStateReq(peerId, d) {
   if (!jukeSrvOk(d)) return;
   /* Build 43: one canonical answer — the holder's. (Pre-relay, before any
      election can run, fall back to anyone-answers like before.)
@@ -5921,7 +5921,7 @@ function handleJukeStateReq(d, peerId) {
   } catch (e) { /* best effort */ }
 }
 
-function handleJukeState(d, peerId) {
+function handleJukeState(peerId, d) {
   if (!jukeSrvOk(d)) return;
   if (!d || typeof d.reqId !== 'string') return;
   /* Build 53: collecting handoff answers — the freshest one wins when the
@@ -6110,6 +6110,7 @@ const theatre = {
   playing: false, position: 0, startedAt: 0,
   player: null, playerReady: false,
   volume: 0.7, muted: false, // build 77: living-room mute — video room audio
+  playBlocked: false, // build 79: mobile blocked our programmatic play() — needs a tap
 };
 const theatrePanel = document.getElementById('theatre-panel');
 const theatreScreen3dEl = document.getElementById('theatre-screen3d');
@@ -6120,7 +6121,8 @@ const theatrePlayPauseEl = document.getElementById('theatre-playpause');
 
 function theatreExtractId(url) {
   if (!url) return null;
-  const m = String(url).match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  // build 79: also accept youtube.com/live/ links
+  const m = String(url).match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
   return m ? m[1] : null;
 }
 
@@ -6142,9 +6144,12 @@ function theatreEnsurePlayer() {
           },
           onStateChange: (ev) => {
             // keep the play/pause button honest
-            if (!theatrePlayPauseEl) return;
-            const playing = ev.data === window.YT.PlayerState.PLAYING;
-            theatrePlayPauseEl.innerHTML = playing ? '&#10074;&#10074;' : '&#9654;';
+            if (theatrePlayPauseEl) {
+              const playing = ev.data === window.YT.PlayerState.PLAYING;
+              theatrePlayPauseEl.innerHTML = playing ? '&#10074;&#10074;' : '&#9654;';
+            }
+            // build 79: a real PLAYING state clears the autoplay-block flag
+            if (ev.data === window.YT.PlayerState.PLAYING) theatreClearPlayBlock();
           },
         },
       });
@@ -6170,6 +6175,7 @@ function theatreApplyState() {
       const pos = theatre.position + (Date.now() - theatre.startedAt) / 1000;
       try { p.seekTo(Math.max(0, pos), true); } catch (e) {}
       p.playVideo();
+      theatreWatchPlayBlock(); // build 79: catch the mobile autoplay block
     } else {
       try { p.seekTo(Math.max(0, theatre.position), true); } catch (e) {}
       p.pauseVideo();
@@ -6179,11 +6185,21 @@ function theatreApplyState() {
 }
 
 function theatreRender() {
-  if (theatreNoteEl) theatreNoteEl.textContent = theatre.videoId
-    ? 'now showing on the big screen — look up'
-    : 'paste a youtube link — it plays on the big screen';
+  if (theatreNoteEl) theatreNoteEl.textContent = theatre.playBlocked
+    ? 'tap \u25b6 on this phone to start the movie' // build 79: autoplay-block hint
+    : (theatre.videoId
+      ? 'now showing on the big screen — look up'
+      : 'paste a youtube link — it plays on the big screen');
   if (theatreByEl) theatreByEl.textContent = theatre.videoId ? ('queued by ' + (theatre.addedBy || 'a drifter')) : '';
   if (theatrePlayPauseEl) theatrePlayPauseEl.innerHTML = theatre.playing ? '&#10074;&#10074;' : '&#9654;';
+  // build 79: link diagnostic — the read-back line for sync issues
+  const linkEl = document.getElementById('theatre-link');
+  if (linkEl) {
+    let tx = 0, rx = 0;
+    try { tx = net._theatreTx || 0; rx = net._theatreRx || 0; } catch (e) {}
+    const pst = !theatre.player ? 'no player' : (theatre.playerReady ? 'ready' : 'loading\u2026');
+    linkEl.textContent = 'link: sent ' + tx + ' \u00b7 got ' + rx + ' \u00b7 player ' + pst;
+  }
   // jam monitor visibility — show when there's a video and we're in the sound room
   theatreUpdateJamMonitor();
 }
@@ -6191,7 +6207,11 @@ function theatreRender() {
 /* Queue a video: broadcast it, then start playing from 0. */
 function theatreQueue(url) {
   const videoId = theatreExtractId(url);
-  if (!videoId) return;
+  if (!videoId) {
+    // build 79: a bad paste used to die silently — say so
+    if (theatreNoteEl) theatreNoteEl.textContent = 'that link didn\u2019t look like a youtube link \u2014 try again';
+    return;
+  }
   const data = { videoId, title: '', addedBy: myName };
   theatre.videoId = videoId;
   theatre.title = '';
@@ -6207,19 +6227,29 @@ function theatreQueue(url) {
 
 function theatreTogglePlay() {
   if (!theatre.videoId || !theatre.player || !theatre.playerReady) return;
+  // build 79: a blocked play means the tap is "start the movie", not pause —
+  // otherwise the first tap would pause the whole room instead of unlocking
+  const wasBlocked = theatre.playBlocked;
+  theatreClearPlayBlock(); // this tap is a real gesture — it unlocks play
   try {
     const p = theatre.player;
     const now = Date.now();
-    if (theatre.playing) {
+    if (theatre.playing && !wasBlocked) {
       const pos = p.getCurrentTime ? p.getCurrentTime() : theatre.position;
       theatre.playing = false;
       theatre.position = pos;
+      theatre.startedAt = 0; // build 79: no live clock while paused
       p.pauseVideo();
       try { if (net && net.sendTheatrePause) net.sendTheatrePause({ videoId: theatre.videoId, position: pos, by: myName }); } catch (e) {}
     } else {
+      // build 79: resume from the LIVE position — a phone whose synced play
+      // was autoplay-blocked taps ▶ and lands on the same spot as everyone
+      const live = theatre.startedAt > 0
+        ? theatre.position + (now - theatre.startedAt) / 1000
+        : theatre.position;
       theatre.playing = true;
+      theatre.position = Math.max(0, live);
       theatre.startedAt = now;
-      // resume from where we paused
       try { p.seekTo(theatre.position, true); } catch (e) {}
       p.playVideo();
       try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId: theatre.videoId, position: theatre.position, startedAt: now, by: myName }); } catch (e) {}
@@ -6228,7 +6258,7 @@ function theatreTogglePlay() {
   theatreRender();
 }
 
-function handleTheatreAdd(d) {
+function handleTheatreAdd(peerId, d) {
   if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
   // server check — same as jukebox
   if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
@@ -6241,9 +6271,25 @@ function handleTheatreAdd(d) {
   theatreRender();
 }
 
-function handleTheatrePlay(d) {
+function handleTheatrePlay(peerId, d) {
   if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
   if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  // build 79: already watching this one in sync — don't re-seek. Walk-ins
+  // ask for state on entry and the rebroadcast must not skip the room.
+  if (theatre.playing && theatre.videoId === d.videoId && theatre.player && theatre.playerReady) {
+    try {
+      const target = (typeof d.position === 'number' ? d.position : 0) +
+        (typeof d.startedAt === 'number' ? (Date.now() - d.startedAt) / 1000 : 0);
+      const cur = theatre.player.getCurrentTime ? theatre.player.getCurrentTime() : -99;
+      if (cur >= 0 && Math.abs(cur - target) < 4) {
+        theatre.position = typeof d.position === 'number' ? d.position : theatre.position;
+        theatre.startedAt = typeof d.startedAt === 'number' ? d.startedAt : theatre.startedAt;
+        if (d.by) theatre.addedBy = d.by;
+        theatreRender();
+        return;
+      }
+    } catch (e) {}
+  }
   theatre.videoId = d.videoId;
   theatre.playing = true;
   theatre.position = typeof d.position === 'number' ? d.position : 0;
@@ -6253,19 +6299,50 @@ function handleTheatrePlay(d) {
   theatreApplyState();
 }
 
-function handleTheatrePause(d) {
+function handleTheatrePause(peerId, d) {
   if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
   if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
   if (theatre.videoId !== d.videoId) return;
   theatre.playing = false;
   theatre.position = typeof d.position === 'number' ? d.position : theatre.position;
+  theatre.startedAt = 0; // build 79: no live clock while paused
   theatreEnsurePlayer();
   theatreApplyState();
 }
 
+/* Build 79: mobile browsers block playVideo() unless it follows a tap. The
+   queue tap is long gone by the time the player is ready, and a synced play
+   arriving on another phone never had a tap at all — so the movie can sit
+   cued on a black screen with no hint. If we asked for play and the player
+   still isn't playing a few seconds later, flag it: tapping ▶ is a real
+   gesture and unlocks it. */
+let theatrePlayWatchTimer = 0;
+function theatreWatchPlayBlock() {
+  theatre.playBlocked = false;
+  if (theatrePlayWatchTimer) { clearTimeout(theatrePlayWatchTimer); theatrePlayWatchTimer = 0; }
+  theatrePlayWatchTimer = setTimeout(() => {
+    theatrePlayWatchTimer = 0;
+    if (!theatre.playing) return;
+    try {
+      const st = theatre.player && theatre.player.getPlayerState
+        ? theatre.player.getPlayerState() : -1;
+      const YTST = window.YT && window.YT.PlayerState;
+      const playing = !!(YTST && (st === YTST.PLAYING || st === YTST.BUFFERING));
+      if (!playing && theatre.playing) {
+        theatre.playBlocked = true;
+        theatreRender();
+      }
+    } catch (e) {}
+  }, 2500);
+}
+function theatreClearPlayBlock() {
+  if (theatrePlayWatchTimer) { clearTimeout(theatrePlayWatchTimer); theatrePlayWatchTimer = 0; }
+  if (theatre.playBlocked) { theatre.playBlocked = false; theatreRender(); }
+}
+
 /* Late joiner asks what's playing — anyone holding a video rebroadcasts
    the full state as a play (or pause). */
-function handleTheatreStateReq(d) {
+function handleTheatreStateReq(peerId, d) {
   if (!theatre.videoId) return;
   if (d && d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
   try {
@@ -6291,12 +6368,12 @@ function theatreOnRealm(key) {
   if (inTheatre) {
     theatreEnsurePlayer();
     theatreRender();
-    // late joiner: ask what's playing if we have nothing
-    if (!theatre.videoId) {
-      setTimeout(() => {
-        try { if (net && net.sendTheatreStateReq && !theatre.videoId) net.sendTheatreStateReq({}); } catch (e) {}
-      }, 1500);
-    }
+    // build 79: late joiner always asks what's playing — a phone holding a
+    // stale videoId would otherwise never catch up. The in-sync skip in
+    // handleTheatrePlay keeps the rebroadcast from skipping the room.
+    setTimeout(() => {
+      try { if (net && net.sendTheatreStateReq) net.sendTheatreStateReq({}); } catch (e) {}
+    }, 1500);
   }
   theatreUpdateJamMonitor();
 }
@@ -12370,6 +12447,11 @@ window.__limbo = {
   jukeLikeCount: (id) => (jukeLikes.get(id) || new Set()).size,
   /* build 75 test seam: theatre state */
   theatreState: () => ({ videoId: theatre.videoId, playing: theatre.playing, position: theatre.position }),
+  /* build 79 test seams: drive theatre handlers exactly as net._in does (cid, data) */
+  theatreRxAdd: (cid, d) => handleTheatreAdd(cid, d),
+  theatreRxPlay: (cid, d) => handleTheatrePlay(cid, d),
+  theatreRxPause: (cid, d) => handleTheatrePause(cid, d),
+  theatreExtractId: (u) => theatreExtractId(u),
   /* build 33 test seam: fake a live jukebox track to drive the like pill */
   jukeFakePlaying: (id) => {
     juke.now = { id: String(id), stopped: false, title: 'test track' };
@@ -12396,8 +12478,8 @@ window.__limbo = {
   // room voice (build 40)
   voiceTalkToggle: () => voiceTalkToggle(),
   voiceTxState: () => ({ on: voice.tx.on, starting: voice.tx.starting, seq: voice.tx.seq, hasNode: !!voice.tx.node, lastError: voice.lastError }),
-  voiceRxTalk: (d, pid) => handleVoiceTalk(d, pid),
-  voiceRxChunk: (d, pid) => handleVoiceChunk(d, pid),
+  voiceRxTalk: (d, pid) => handleVoiceTalk(pid || 'test-peer', d),
+  voiceRxChunk: (d, pid) => handleVoiceChunk(pid || 'test-peer', d),
   voiceRxState: () => [...voice.rx.entries()].map(([id, r]) => ({ id, name: r.name, queued: r.q.size, ended: r.ended, started: r.started })),
   voiceTalkers: () => voiceTalkers(),
   voiceInGainTarget: () => (voice.inGain ? 'master' : null),
@@ -12735,12 +12817,12 @@ window.__limbo = {
   jukeDetect: (u) => jukeDetectProvider(u),
   jukeAdd: (u, t) => jukeAddTrack(u, t),
   jukeRemove: (id) => jukeRemoveTrack(id),
-  jukeHandleAdd: (d, pid) => handleJukeAdd(d, pid || 'test-peer'),
-  jukeHandleRemove: (d, pid) => handleJukeRemove(d, pid || 'test-peer'),
-  jukeHandlePlay: (d, pid) => handleJukePlay(d, pid || 'test-peer'),
-  jukeHandleSkip: (d, pid) => handleJukeSkip(d, pid || 'test-peer'),
-  jukeHandleState: (d, pid) => handleJukeState(d, pid || 'test-peer'),
-  jukeHandleStateReq: (d, pid) => handleJukeStateReq(d, pid || 'test-peer'),
+  jukeHandleAdd: (d, pid) => handleJukeAdd(pid || 'test-peer', d),
+  jukeHandleRemove: (d, pid) => handleJukeRemove(pid || 'test-peer', d),
+  jukeHandlePlay: (d, pid) => handleJukePlay(pid || 'test-peer', d),
+  jukeHandleSkip: (d, pid) => handleJukeSkip(pid || 'test-peer', d),
+  jukeHandleState: (d, pid) => handleJukeState(pid || 'test-peer', d),
+  jukeHandleStateReq: (d, pid) => handleJukeStateReq(pid || 'test-peer', d),
   jukeAdvance: () => jukeAdvance(),
   jukeSkipNow: () => jukeSkipNow(),
   jukeOffsetFor: (d, nowMs) => jukeOffsetFor(d, nowMs),
