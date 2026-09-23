@@ -1345,7 +1345,15 @@ export class LimboNet {
   }
 
   _sendTo(actionName, data, target) {
-    if (!this.enabled || target == null) return;
+    if (!this.enabled) return;
+    if (target == null) {
+      // build 81: a null-target jukeFileReq is discovery ("who has this file?") —
+      // broadcast it so a holder can answer and get pinned for the rest of the
+      // transfer. Chunks stay targeted-only (a null chunk target is a bug, not
+      // discovery, so those still drop).
+      if (actionName === 'jukeFileReq') return this._bcast(actionName, data);
+      return;
+    }
     const c = this._pickConn(String(target));
     let out;
     try {

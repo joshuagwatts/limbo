@@ -6324,11 +6324,17 @@ function handleTheatreAdd(peerId, d) {
   if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
   // server check — same as jukebox
   if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  // build 81: add+play ride different channels with no ordering guarantee. If
+  // the paired play already landed for this same video, don't clobber it back
+  // to paused — only reset playback state for a genuinely new video.
+  const isNewVideo = theatre.videoId !== d.videoId;
   theatre.videoId = d.videoId;
   theatre.title = d.title || '';
   theatre.addedBy = d.addedBy || 'a drifter';
-  theatre.playing = false;
-  theatre.position = 0;
+  if (isNewVideo) {
+    theatre.playing = false;
+    theatre.position = 0;
+  }
   theatreEnsurePlayer();
   theatreRender();
 }
