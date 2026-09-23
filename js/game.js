@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=77';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=77';
-import { CouchNet } from './couch.js?v=77';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=77';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=77';
+import { AudioEngine } from './audio.js?v=78';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=78';
+import { CouchNet } from './couch.js?v=78';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=78';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=78';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -6394,7 +6394,9 @@ function theatreScreenTick() {
   }
   const hw = 14, hh = 7.875; // 28 x 15.75, matches the mesh
   const dst = [];
-  for (const [lx, ly] of [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]]) {
+  // build 78: corner order must match _tsSrc — top-left, top-right,
+  // bottom-right, bottom-left — or the picture lands upside down.
+  for (const [lx, ly] of [[-hw, hh], [hw, hh], [hw, -hh], [-hw, -hh]]) {
     _tsV.set(lx, ly, 0).applyMatrix4(mesh.matrixWorld);
     _tsV.applyMatrix4(camera.matrixWorldInverse); // view space: must be in front
     if (_tsV.z > -0.1) {
