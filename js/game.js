@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=73';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=73';
-import { CouchNet } from './couch.js?v=73';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=73';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=73';
+import { AudioEngine } from './audio.js?v=74';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=74';
+import { CouchNet } from './couch.js?v=74';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=74';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=74';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -312,6 +312,8 @@ let jukeLastClearAt = 0; // Date.now() of the last clear we applied — stale sn
    track isn't in the canonical line after a while, it re-sends until the
    holder confirms it. */
 const jukePendingAck = new Map(); // id -> { track, sentAt, retries }
+/* build 74: drop-reason counters — which gate in handleJukeAdd kills arrivals */
+const jukeDrops = { srv: 0, valid: 0, playing: 0, dup: 0, full: 0 };
 const JUKE_ACK_MS = 20000; // wait this long for the holder's sync to confirm
 const JUKE_ACK_RETRIES = 8;
 let jukeAckTimer = null;
@@ -4616,11 +4618,11 @@ function jukeSortQueue() {
 }
 
 function handleJukeAdd(d, peerId) {
-  if (!jukeSrvOk(d)) return;
-  if (!jukeValidAdd(d)) return;
-  if (juke.now && juke.now.id === d.id) return; // the play beat the add here — already spinning
-  if (juke.queue.some((t) => t.id === d.id)) return; // dedupe
-  if (juke.queue.length >= JUKE_MAX_QUEUE) return; // line is full — the adder was told
+  if (!jukeSrvOk(d)) { jukeDrops.srv++; return; }
+  if (!jukeValidAdd(d)) { jukeDrops.valid++; return; }
+  if (juke.now && juke.now.id === d.id) { jukeDrops.playing++; return; } // the play beat the add here — already spinning
+  if (juke.queue.some((t) => t.id === d.id)) { jukeDrops.dup++; return; } // dedupe
+  if (juke.queue.length >= JUKE_MAX_QUEUE) { jukeDrops.full++; return; } // line is full — the adder was told
   juke.queue.push(d);
   jukeSortQueue(); // FIFO by queue time, identical on every phone
   renderJuke();
@@ -6081,7 +6083,11 @@ function jukeRenderDiag() {
   let d = null;
   try { d = net.jukeDiag(); } catch (e) {}
   if (!d) { el.textContent = 'link: —'; return; }
-  el.textContent = `link: sent ${d.tx} · got ${d.rx} · relay ${d.relay ? 'on' : 'off'} · peers ${d.peers}`;
+  // build 74: drop reasons — which gate kills arrivals (srv/valid/playing/dup/full)
+  const dr = jukeDrops;
+  const drops = (dr.srv + dr.valid + dr.playing + dr.dup + dr.full) > 0
+    ? ` · drops srv:${dr.srv}/valid:${dr.valid}/play:${dr.playing}/dup:${dr.dup}/full:${dr.full}` : '';
+  el.textContent = `link: sent ${d.tx} · got ${d.rx} · relay ${d.relay ? 'on' : 'off'} · peers ${d.peers}${drops}`;
 }
 // refresh the line while the panel is open — counters move live
 setInterval(() => {
