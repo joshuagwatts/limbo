@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=74';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=74';
-import { CouchNet } from './couch.js?v=74';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=74';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=74';
+import { AudioEngine } from './audio.js?v=75';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=75';
+import { CouchNet } from './couch.js?v=75';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=75';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=75';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -89,6 +89,11 @@ const JOURNEY_ROOM_KEY = JOURNEY_DEF.key;
    P2P room, like the sound room. */
 const WORKSHOP_DEF = { key: 'workshop', name: 'MODEL ROOM', accent: 0x9fd8ff, root: 146.83 };
 const WORKSHOP_ROOM_KEY = WORKSHOP_DEF.key;
+/* The theatre (build 75): a cinema room for watching videos together.
+   Paste a YouTube URL, everyone sees the same frame at the same time.
+   Its own P2P room, like the sound room. */
+const THEATRE_DEF = { key: 'theatre', name: 'THEATRE', accent: 0xff5566, root: 120.0 };
+const THEATRE_ROOM_KEY = THEATRE_DEF.key;
 const NEXUS_BOUND = 40;       // horizontal leash in the hub
 const PORTAL_TRIGGER = 3.0;   // wisp-to-portal distance that teleports
 const ECHO_TRIGGER = 2.6;     // wisp-to-echo distance that collects
@@ -6095,6 +6100,244 @@ setInterval(() => {
   if (p && p.style.display !== 'none') { try { jukeRenderDiag(); } catch (e) {} }
 }, 1000);
 
+/* ---------------- theatre (build 75) ----------------
+   Synced video watching. One video at a time per server; whoever queues
+   or hits play/pause drives — last action wins, timestamps keep everyone
+   on the same frame. The player is global (body level) so audio continues
+   in every room; the panel shows the video large only in the theatre. */
+const theatre = {
+  videoId: null, title: '', addedBy: '',
+  playing: false, position: 0, startedAt: 0,
+  player: null, playerReady: false,
+  volume: 0.7,
+};
+const theatrePanel = document.getElementById('theatre-panel');
+const theatrePlayerEl = document.getElementById('theatre-player');
+const theatreEmptyEl = document.getElementById('theatre-empty');
+const theatreUrlEl = document.getElementById('theatre-url');
+const theatreByEl = document.getElementById('theatre-by');
+const theatrePlayPauseEl = document.getElementById('theatre-playpause');
+
+function theatreExtractId(url) {
+  if (!url) return null;
+  const m = String(url).match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+function theatreEnsurePlayer() {
+  if (theatre.player) return;
+  // load the YouTube IFrame API via the jukebox's loader if needed
+  const make = () => {
+    if (theatre.player || !window.YT) return;
+    try {
+      theatre.player = new window.YT.Player(theatrePlayerEl, {
+        width: '100%', height: '100%',
+        videoId: '',
+        playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
+        events: {
+          onReady: (ev) => {
+            theatre.playerReady = true;
+            try { ev.target.setVolume(Math.round(theatre.volume * 100)); } catch (e) {}
+            if (theatre.videoId) theatreApplyState();
+          },
+          onStateChange: (ev) => {
+            // keep the play/pause button honest
+            if (!theatrePlayPauseEl) return;
+            const playing = ev.data === window.YT.PlayerState.PLAYING;
+            theatrePlayPauseEl.innerHTML = playing ? '&#10074;&#10074;' : '&#9654;';
+          },
+        },
+      });
+    } catch (e) { /* player failed — panel still shows the empty state */ }
+  };
+  if (window.YT && window.YT.Player) { make(); return; }
+  try { jukeLoadYTApi((ok) => { if (ok) make(); }); } catch (e) {}
+}
+
+/* Apply the current theatre state to the local player: seek to the synced
+   position and play or pause. */
+function theatreApplyState() {
+  if (!theatre.player || !theatre.playerReady || !theatre.videoId) return;
+  try {
+    const p = theatre.player;
+    // only load if it's a different video
+    let curId = '';
+    try { curId = p.getVideoData().video_id || ''; } catch (e) {}
+    if (curId !== theatre.videoId) {
+      p.cueVideoById(theatre.videoId);
+    }
+    if (theatre.playing) {
+      const pos = theatre.position + (Date.now() - theatre.startedAt) / 1000;
+      try { p.seekTo(Math.max(0, pos), true); } catch (e) {}
+      p.playVideo();
+    } else {
+      try { p.seekTo(Math.max(0, theatre.position), true); } catch (e) {}
+      p.pauseVideo();
+    }
+  } catch (e) {}
+  theatreRender();
+}
+
+function theatreRender() {
+  if (theatreEmptyEl) theatreEmptyEl.style.display = theatre.videoId ? 'none' : '';
+  if (theatreByEl) theatreByEl.textContent = theatre.videoId ? ('queued by ' + (theatre.addedBy || 'a drifter')) : '';
+  if (theatrePlayPauseEl) theatrePlayPauseEl.innerHTML = theatre.playing ? '&#10074;&#10074;' : '&#9654;';
+  // jam monitor visibility — show when there's a video and we're in the sound room
+  theatreUpdateJamMonitor();
+}
+
+/* Queue a video: broadcast it, then start playing from 0. */
+function theatreQueue(url) {
+  const videoId = theatreExtractId(url);
+  if (!videoId) return;
+  const data = { videoId, title: '', addedBy: myName };
+  theatre.videoId = videoId;
+  theatre.title = '';
+  theatre.addedBy = myName;
+  theatre.playing = true;
+  theatre.position = 0;
+  theatre.startedAt = Date.now();
+  try { if (net && net.sendTheatreAdd) net.sendTheatreAdd(data); } catch (e) {}
+  try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId, position: 0, startedAt: Date.now(), by: myName }); } catch (e) {}
+  theatreEnsurePlayer();
+  theatreApplyState();
+}
+
+function theatreTogglePlay() {
+  if (!theatre.videoId || !theatre.player || !theatre.playerReady) return;
+  try {
+    const p = theatre.player;
+    const now = Date.now();
+    if (theatre.playing) {
+      const pos = p.getCurrentTime ? p.getCurrentTime() : theatre.position;
+      theatre.playing = false;
+      theatre.position = pos;
+      p.pauseVideo();
+      try { if (net && net.sendTheatrePause) net.sendTheatrePause({ videoId: theatre.videoId, position: pos, by: myName }); } catch (e) {}
+    } else {
+      theatre.playing = true;
+      theatre.startedAt = now;
+      // resume from where we paused
+      try { p.seekTo(theatre.position, true); } catch (e) {}
+      p.playVideo();
+      try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId: theatre.videoId, position: theatre.position, startedAt: now, by: myName }); } catch (e) {}
+    }
+  } catch (e) {}
+  theatreRender();
+}
+
+function handleTheatreAdd(d) {
+  if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
+  // server check — same as jukebox
+  if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  theatre.videoId = d.videoId;
+  theatre.title = d.title || '';
+  theatre.addedBy = d.addedBy || 'a drifter';
+  theatre.playing = false;
+  theatre.position = 0;
+  theatreEnsurePlayer();
+  theatreRender();
+}
+
+function handleTheatrePlay(d) {
+  if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
+  if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  theatre.videoId = d.videoId;
+  theatre.playing = true;
+  theatre.position = typeof d.position === 'number' ? d.position : 0;
+  theatre.startedAt = typeof d.startedAt === 'number' ? d.startedAt : Date.now();
+  if (d.by) theatre.addedBy = d.by;
+  theatreEnsurePlayer();
+  theatreApplyState();
+}
+
+function handleTheatrePause(d) {
+  if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
+  if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  if (theatre.videoId !== d.videoId) return;
+  theatre.playing = false;
+  theatre.position = typeof d.position === 'number' ? d.position : theatre.position;
+  theatreEnsurePlayer();
+  theatreApplyState();
+}
+
+/* Late joiner asks what's playing — anyone holding a video rebroadcasts
+   the full state as a play (or pause). */
+function handleTheatreStateReq(d) {
+  if (!theatre.videoId) return;
+  if (d && d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  try {
+    if (theatre.playing) {
+      if (net && net.sendTheatrePlay) net.sendTheatrePlay({
+        videoId: theatre.videoId, position: theatre.position,
+        startedAt: theatre.startedAt, by: theatre.addedBy,
+      });
+    } else {
+      if (net && net.sendTheatrePause) net.sendTheatrePause({
+        videoId: theatre.videoId, position: theatre.position, by: theatre.addedBy,
+      });
+    }
+  } catch (e) {}
+}
+
+/* Show the theatre panel only in the theatre room; the player (and its
+   audio) is global. Called on realm change. */
+function theatreOnRealm(key) {
+  if (!theatrePanel) return;
+  const inTheatre = key === THEATRE_ROOM_KEY;
+  theatrePanel.style.display = inTheatre ? '' : 'none';
+  if (inTheatre) {
+    theatreEnsurePlayer();
+    theatreRender();
+    // late joiner: ask what's playing if we have nothing
+    if (!theatre.videoId) {
+      setTimeout(() => {
+        try { if (net && net.sendTheatreStateReq && !theatre.videoId) net.sendTheatreStateReq({}); } catch (e) {}
+      }, 1500);
+    }
+  }
+  theatreUpdateJamMonitor();
+}
+
+/* Jam monitor: while in the sound room with a video playing, show a tiny
+   volume strip so the theatre audio can sit under the jam. */
+function theatreUpdateJamMonitor() {
+  const el = document.getElementById('jam-theatre');
+  if (!el) return;
+  const inJam = active && active.key === SOUND_ROOM_KEY;
+  const show = inJam && !!theatre.videoId;
+  el.style.display = show ? '' : 'none';
+}
+
+function theatreSetVolume(v) {
+  theatre.volume = Math.max(0, Math.min(1, v));
+  try {
+    if (theatre.player && theatre.playerReady) theatre.player.setVolume(Math.round(theatre.volume * 100));
+  } catch (e) {}
+}
+
+// wire the theatre UI
+(function theatreWire() {
+  const qbtn = document.getElementById('theatre-queue-btn');
+  if (qbtn) qbtn.addEventListener('click', () => {
+    if (theatreUrlEl && theatreUrlEl.value.trim()) {
+      theatreQueue(theatreUrlEl.value.trim());
+      theatreUrlEl.value = '';
+    }
+  });
+  if (theatreUrlEl) theatreUrlEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && theatreUrlEl.value.trim()) {
+      theatreQueue(theatreUrlEl.value.trim());
+      theatreUrlEl.value = '';
+    }
+  });
+  if (theatrePlayPauseEl) theatrePlayPauseEl.addEventListener('click', theatreTogglePlay);
+  const close = document.getElementById('theatre-close');
+  if (close) close.addEventListener('click', () => { if (theatrePanel) theatrePanel.style.display = 'none'; });
+  const jvol = document.getElementById('jam-theatre-vol');
+  if (jvol) jvol.addEventListener('input', () => theatreSetVolume(jvol.value / 100));
+})();
+
 /* Build 40: the queue lives on every phone — show it without opening the
    panel. The button carries now-playing + how many are in line. */
 function jukeBadge() {
@@ -7422,6 +7665,34 @@ function makeWorkshopTexture() {
   return tex;
 }
 
+/* Theatre portal texture (build 75): a cinema screen with play triangle. */
+function makeTheatreTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#0c0608';
+  g.fillRect(0, 0, 256, 256);
+  // screen
+  g.fillStyle = '#1a0e12';
+  g.fillRect(48, 64, 160, 96);
+  g.strokeStyle = '#ff5566';
+  g.lineWidth = 4;
+  g.strokeRect(48, 64, 160, 96);
+  // play triangle
+  g.fillStyle = '#ff5566';
+  g.beginPath();
+  g.moveTo(112, 88); g.lineTo(112, 136); g.lineTo(152, 112);
+  g.closePath(); g.fill();
+  // seats hint
+  g.fillStyle = 'rgba(255, 85, 102, 0.25)';
+  for (let i = 0; i < 4; i++) {
+    g.fillRect(64 + i * 36, 184, 28, 18);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 function buildWorkshop() {
   const accent = WORKSHOP_DEF.accent;
   const scene = new THREE.Scene();
@@ -7518,6 +7789,82 @@ function modelDisposeGroup(group) {
     }
   });
   group.clear();
+}
+
+/* ---------------- theatre (build 75) ----------------
+   Cinema room for watching videos together. Dark space, big glowing
+   screen frame on the north wall (the video itself is a DOM overlay —
+   YouTube iframes can't be WebGL textures). Seats as simple rows. */
+function buildTheatre() {
+  const accent = THEATRE_DEF.accent;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x050304);
+  scene.fog = new THREE.FogExp2(0x080405, 0.014);
+  scene.add(new THREE.AmbientLight(0xff8899, 0.35));
+
+  // Floor — dark carpet.
+  const floor = new THREE.Mesh(
+    new THREE.CircleGeometry(30, 48),
+    new THREE.MeshStandardMaterial({ color: 0x0a0708, roughness: 1 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  scene.add(floor);
+
+  // Screen frame on the north wall — big glowing rectangle.
+  const screenW = 28, screenH = 15;
+  const frame = new THREE.Mesh(
+    new THREE.PlaneGeometry(screenW + 1.5, screenH + 1.5),
+    new THREE.MeshStandardMaterial({ color: 0x111111, emissive: accent, emissiveIntensity: 0.35, roughness: 0.4 })
+  );
+  frame.position.set(0, 9, -29);
+  scene.add(frame);
+  const screenGlow = new THREE.Mesh(
+    new THREE.PlaneGeometry(screenW, screenH),
+    new THREE.MeshBasicMaterial({ color: 0x0a0a0c })
+  );
+  screenGlow.position.set(0, 9, -28.9);
+  screenGlow.name = 'theatre-screen';
+  scene.add(screenGlow);
+
+  // Seat rows — simple dark boxes with a hint of red.
+  const seatMat = new THREE.MeshStandardMaterial({ color: 0x1a0d10, roughness: 0.9 });
+  for (let row = 0; row < 3; row++) {
+    for (let i = 0; i < 6; i++) {
+      const seat = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.6, 1.2), seatMat);
+      seat.position.set((i - 2.5) * 3.2, 0.8, -8 + row * 4.5);
+      scene.add(seat);
+    }
+  }
+
+  // Soft red wash from the screen.
+  const wash = new THREE.PointLight(0xff5566, 0.6, 60);
+  wash.position.set(0, 9, -24);
+  scene.add(wash);
+
+  // Return portal to the Nexus.
+  const { group, ring } = makePortal(makeTheatreTexture(), accent, 'NEXUS', 1.7, 0.14);
+  group.position.set(12, 3, 12);
+  group.lookAt(0, 3, 0);
+  scene.add(group);
+  const portals = [{ group, ring, pos: group.position.clone(), target: 'nexus', phase: 0.6, baseY: 3 }];
+
+  return {
+    key: THEATRE_DEF.key, name: THEATRE_DEF.name, root: THEATRE_DEF.root,
+    scene, portals, echoes: [],
+    spawn: new THREE.Vector3(0, 2, 14), spawnYaw: 0, // face the screen (-Z)
+    bound: 'realm',
+    anim: { wash, screenGlow },
+    attunedShown: true,
+    update(dt, t) {
+      const { wash } = this.anim;
+      wash.intensity = 0.5 + Math.sin(t * 0.7) * 0.15;
+      for (const pt of this.portals) {
+        pt.group.position.y = pt.baseY + Math.sin(t * 0.8 + pt.phase) * 0.3;
+        pt.ring.rotation.z -= dt * 0.15;
+        pt.pos.copy(pt.group.position);
+      }
+    },
+  };
 }
 
 /* ---------------- the workbench (build 66) ----------------
@@ -10123,6 +10470,9 @@ function buildNexus(textures) {
   }, {
     key: WORKSHOP_DEF.key, name: WORKSHOP_DEF.name, accent: WORKSHOP_DEF.accent,
     tex: makeWorkshopTexture(),
+  }, {
+    key: THEATRE_DEF.key, name: THEATRE_DEF.name, accent: THEATRE_DEF.accent,
+    tex: makeTheatreTexture(),
   }]);
   portalDefs.forEach((def, i) => {
     const a = (i / portalDefs.length) * Math.PI * 2;
@@ -10322,6 +10672,7 @@ function finishBoot() {
     worlds[SOUND_DEF.key] = buildSoundRoom(textures);
     worlds[JOURNEY_DEF.key] = buildJourneyRoom();
     worlds[WORKSHOP_DEF.key] = buildWorkshop();
+    worlds[THEATRE_DEF.key] = buildTheatre();
     try { stageLoad(); stageRebuild(); } catch (e) { /* stage starts empty */ }
     try { fohRestore(); } catch (e) { /* FOH starts at defaults */ }
   } catch (err) {
@@ -10998,6 +11349,7 @@ function goTo(key) {
     audio.setAuraDucked(key === SOUND_ROOM_KEY);
     showTitleCard(active.name);
     renderRoomChrome(); // show/hide each room's buttons for this room
+    try { theatreOnRealm(key); } catch (e) {} // build 75: theatre panel only in the theatre
     // Build 33: entering the journey resets the sky and starts the album probe.
     const musicRoom = key === SOUND_ROOM_KEY || key === JOURNEY_ROOM_KEY;
     // Build 41: the jukebox queue is server-wide — entering a music room
@@ -11307,6 +11659,11 @@ net.onJukeHelloCb = handleJukeHello; // build 43: holder election presence
 net.onJukeClaimCb = handleJukeClaim; // build 43: "I hold this server's line"
 net.onJukeSyncCb = handleJukeSync; // build 43: canonical queue snapshot
 net.onJukeClearCb = handleJukeClear; // build 43: anyone may clear the line
+// Theatre (build 75): synced video watching.
+net.onTheatreAddCb = handleTheatreAdd;
+net.onTheatrePlayCb = handleTheatrePlay;
+net.onTheatrePauseCb = handleTheatrePause;
+net.onTheatreStateReqCb = handleTheatreStateReq;
 // Stage builder + front of house (build 66): layout + light rig ride the room.
 net.onStageSyncCb = handleStageSync;
 net.onStageReqCb = handleStageReq;
@@ -11805,6 +12162,8 @@ window.__limbo = {
   journeyPinZone: (z) => { journey.zone = z; },
   albumState: () => ({ state: album.state, tracks: album.tracks.map((t) => t.title) }),
   jukeLikeCount: (id) => (jukeLikes.get(id) || new Set()).size,
+  /* build 75 test seam: theatre state */
+  theatreState: () => ({ videoId: theatre.videoId, playing: theatre.playing, position: theatre.position }),
   /* build 33 test seam: fake a live jukebox track to drive the like pill */
   jukeFakePlaying: (id) => {
     juke.now = { id: String(id), stopped: false, title: 'test track' };

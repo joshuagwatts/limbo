@@ -167,6 +167,10 @@ const ACTION_CBS = {
   jukeClaim: 'onJukeClaimCb', // build 43: "I hold this server's line"
   jukeSync: 'onJukeSyncCb', // build 43: canonical queue snapshot from the holder
   jukeClear: 'onJukeClearCb', // build 43: anyone may clear the server's line
+  theatreAdd: 'onTheatreAddCb', // build 75: queue a video in the theatre
+  theatrePlay: 'onTheatrePlayCb', // build 75: play video from position (synced)
+  theatrePause: 'onTheatrePauseCb', // build 75: pause video at position
+  theatreStateReq: 'onTheatreStateReqCb', // build 75: late joiner asks what's playing
   stageSync: 'onStageSyncCb', // build 66: shared sound-room stage layout
   stageReq: 'onStageReqCb', // build 66: late joiner asks for the stage
   fohSync: 'onFohSyncCb', // build 66: shared front-of-house light rig
@@ -196,6 +200,9 @@ const JUKE_SERVER_ACTIONS = new Set([
      the server channel, claims announce the holder, syncs carry the
      canonical line, and anyone can ask for a clear. */
   'jukeHello', 'jukeClaim', 'jukeSync', 'jukeClear',
+  /* Build 75: the theatre rides the same server channel — one shared
+     screen per server, audible from any room (including the jam). */
+  'theatreAdd', 'theatrePlay', 'theatrePause', 'theatreStateReq',
 ]);
 
 /* OpenRelay static-auth (no signup): time-limited HMAC-SHA1 credentials. */

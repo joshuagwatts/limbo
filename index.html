@@ -14,7 +14,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=74">
+<link rel="stylesheet" href="css/style.css?v=75">
 <script type="importmap">
 {
   "imports": {
@@ -24,8 +24,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=74"></script>
-<script src="js/vendor/jsqr.js?v=74"></script>
+<script src="js/vendor/qrcode.js?v=75"></script>
+<script src="js/vendor/jsqr.js?v=75"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -103,6 +103,22 @@ if ('serviceWorker' in navigator) {
 <!-- jukebox provider players: persistent + permanently invisible (build 25).
      They live at body level so closing the panel never tears them down. -->
 <div id="juke-yt-holder" class="juke-embed"></div>
+<!-- theatre (build 75): synced video watching. The player is global (body
+     level) so audio continues outside the theatre room; the panel only
+     shows the video large when you're in the theatre. -->
+<div id="theatre-panel" style="display:none">
+  <div class="theatre-head"><span>&#127916; THEATRE</span><span id="theatre-by" class="theatre-by"></span><button id="theatre-close" aria-label="close">&#10005;</button></div>
+  <div id="theatre-screen-wrap" class="theatre-screen-wrap">
+    <div id="theatre-player"></div>
+    <div id="theatre-empty" class="theatre-empty">paste a youtube link below — everyone watches together</div>
+  </div>
+  <div class="theatre-controls">
+    <button id="theatre-playpause" aria-label="play or pause">&#9654;</button>
+    <input id="theatre-url" placeholder="paste a youtube link…" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="theatre-queue-btn">watch</button>
+  </div>
+  <div id="theatre-hint" class="theatre-hint">everyone sees the same frame — audio plays in every room</div>
+</div>
 <div id="juke-sc-holder" class="juke-embed"></div>
 <div id="paint-overlay" style="display:none">
   <div class="paint-head">
@@ -154,6 +170,10 @@ if ('serviceWorker' in navigator) {
 <button id="sound-pill" style="display:none">&#128263; tap for sound</button>
 <div id="jam-panel">
   <div class="jam-head"><span>&#127925; JAM ROOM</span><button id="jam-close" aria-label="close">&#10005;</button></div>
+  <!-- build 75: theatre monitor — hear the theatre's video while jamming -->
+  <div id="jam-theatre" class="jam-theatre" style="display:none">
+    <span>&#127916; theatre</span><input id="jam-theatre-vol" type="range" min="0" max="100" value="70" aria-label="theatre volume">
+  </div>
   <!-- build 66: the loop, simplified. One big unmissable button at the top
        of the jam UI: tap = record, tap = close + loop, tap = stop,
        hold = clear. -->
@@ -580,6 +600,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=74"></script>
+<script type="module" src="js/game.js?v=75"></script>
 </body>
 </html>
