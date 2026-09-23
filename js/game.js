@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=76';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=76';
-import { CouchNet } from './couch.js?v=76';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=76';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=76';
+import { AudioEngine } from './audio.js?v=77';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=77';
+import { CouchNet } from './couch.js?v=77';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=77';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=77';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -6109,7 +6109,7 @@ const theatre = {
   videoId: null, title: '', addedBy: '',
   playing: false, position: 0, startedAt: 0,
   player: null, playerReady: false,
-  volume: 0.7,
+  volume: 0.7, muted: false, // build 77: living-room mute — video room audio
 };
 const theatrePanel = document.getElementById('theatre-panel');
 const theatreScreen3dEl = document.getElementById('theatre-screen3d');
@@ -6137,7 +6137,7 @@ function theatreEnsurePlayer() {
         events: {
           onReady: (ev) => {
             theatre.playerReady = true;
-            try { ev.target.setVolume(Math.round(theatre.volume * 100)); } catch (e) {}
+            theatreApplyVolume();
             if (theatre.videoId) theatreApplyState();
           },
           onStateChange: (ev) => {
@@ -6313,9 +6313,31 @@ function theatreUpdateJamMonitor() {
 
 function theatreSetVolume(v) {
   theatre.volume = Math.max(0, Math.min(1, v));
+  theatreApplyVolume();
+}
+
+/* The player's real level: muted pins it at 0, otherwise the fader level. */
+function theatreApplyVolume() {
   try {
-    if (theatre.player && theatre.playerReady) theatre.player.setVolume(Math.round(theatre.volume * 100));
+    if (theatre.player && theatre.playerReady) {
+      theatre.player.setVolume(theatre.muted ? 0 : Math.round(theatre.volume * 100));
+    }
   } catch (e) {}
+}
+
+/* Build 77: living-room mute for the video room. Every mute button with
+   .theatre-mutebtn stays in sync — there's one in the theatre strip and
+   one on the jam panel's theatre monitor. */
+function theatreSetMuted(m) {
+  theatre.muted = !!m;
+  theatreApplyVolume();
+  const icon = theatre.muted ? '&#128263;' : '&#128250;'; // 🔇 / 📺
+  for (const b of document.querySelectorAll('.theatre-mutebtn')) {
+    b.innerHTML = icon;
+    b.classList.toggle('muted', theatre.muted);
+    b.setAttribute('aria-label', theatre.muted ? 'unmute the video room' : 'mute the video room');
+    b.title = theatre.muted ? 'unmute the video room' : 'mute the video room';
+  }
 }
 
 /* Build 76: pin the YouTube player onto the 3D cinema screen. Every frame
@@ -6408,7 +6430,18 @@ function theatreScreenTick() {
   const close = document.getElementById('theatre-close');
   if (close) close.addEventListener('click', () => { if (theatrePanel) theatrePanel.style.display = 'none'; });
   const jvol = document.getElementById('jam-theatre-vol');
-  if (jvol) jvol.addEventListener('input', () => theatreSetVolume(jvol.value / 100));
+  if (jvol) jvol.addEventListener('input', () => {
+    if (theatre.muted && +jvol.value > 0) theatreSetMuted(false); // dragging volume unmutes
+    theatreSetVolume(jvol.value / 100);
+  });
+  // build 77: living-room mutes — each room's mute toggle lives in both
+  // rooms' UI, so you can mix from wherever you're standing.
+  for (const b of document.querySelectorAll('.theatre-mutebtn')) {
+    b.addEventListener('click', () => theatreSetMuted(!theatre.muted));
+  }
+  for (const b of document.querySelectorAll('.jam-mutebtn')) {
+    b.addEventListener('click', () => setJamMuted(!jamMuted));
+  }
 })();
 
 /* Build 40: the queue lives on every phone — show it without opening the
@@ -6470,10 +6503,26 @@ function jamJourneyDuck() {
       typeof active !== 'undefined' && active && active.key === JOURNEY_ROOM_KEY) ? 0 : 1;
   } catch (e) { return 1; }
 }
+/* Build 77: living-room mute for the sound room — the jam instruments go
+   silent, voices (people talking) never do. Rides the same duck as the
+   journey mute in mixerApplyGains. */
+let jamMuted = false;
+function setJamMuted(m) {
+  jamMuted = !!m;
+  try { mixerApplyGains(); } catch (e) {}
+  const icon = jamMuted ? '&#128263;' : '&#127925;'; // 🔇 / 🎵
+  for (const b of document.querySelectorAll('.jam-mutebtn')) {
+    b.innerHTML = icon;
+    b.classList.toggle('muted', jamMuted);
+    b.setAttribute('aria-label', jamMuted ? 'unmute the sound room' : 'mute the sound room');
+    b.title = jamMuted ? 'unmute the sound room' : 'mute the sound room';
+  }
+}
 function mixerApplyGains() {
   const ch = (typeof audio !== 'undefined' && audio.ctx && jam.chain) || null;
   if (!ch || !ch.gains) return;
-  const duck = jamJourneyDuck();
+  // build 77: living-room mute — the jam bus ducks to 0, voice never does.
+  const duck = jamJourneyDuck() * (jamMuted ? 0 : 1);
   try {
     if (ch.gains.lead) ch.gains.lead.gain.setTargetAtTime(mixer.levels.lead * duck, audio.ctx.currentTime, 0.02);
     if (ch.gains.drums) ch.gains.drums.gain.setTargetAtTime(mixer.levels.drums * duck, audio.ctx.currentTime, 0.02);
@@ -10881,7 +10930,8 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     chatInput.focus();
   }
-  if (e.code === 'KeyD' && started && !chatFocused) setSettings(!settingsOpen);
+  // (build 77: KeyD used to toggle settings AND strafe right — settings
+  // opens from the gear button now, so D is just movement again.)
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 

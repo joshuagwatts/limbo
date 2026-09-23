@@ -1557,6 +1557,18 @@ html, body {
   border-radius: 8px; padding: 8px 10px; color: var(--ink); font-size: 13px;
 }
 /* Jam monitor (build 75): tiny theatre volume strip in the jam UI. */
+/* Build 77: living-room mutes — mute the video room or the sound room
+   independently, from either room; both on by default. */
+.mini-mutebtn {
+  flex: none; width: 34px; height: 34px; padding: 0;
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 8px; font-size: 16px; cursor: pointer; color: var(--ink);
+  touch-action: manipulation;
+}
+.mini-mutebtn.muted { background: rgba(255,85,102,0.18); border-color: rgba(255,85,102,0.5); }
+.jam-head-btns { display: flex; align-items: center; gap: 6px; }
+.jam-head .mini-mutebtn { width: 32px; height: 32px; font-size: 14px; }
+.jam-theatre .mini-mutebtn { width: 28px; height: 28px; font-size: 13px; }
 .jam-theatre {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--ink-dim);

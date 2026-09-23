@@ -14,7 +14,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=76">
+<link rel="stylesheet" href="css/style.css?v=77">
 <script type="importmap">
 {
   "imports": {
@@ -24,8 +24,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=76"></script>
-<script src="js/vendor/jsqr.js?v=76"></script>
+<script src="js/vendor/qrcode.js?v=77"></script>
+<script src="js/vendor/jsqr.js?v=77"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -113,6 +113,8 @@ if ('serviceWorker' in navigator) {
   <div id="theatre-screen-note" class="theatre-screen-note">look up — the video plays on the big screen</div>
   <div class="theatre-controls">
     <button id="theatre-playpause" aria-label="play or pause">&#9654;</button>
+    <button class="theatre-mutebtn mini-mutebtn" aria-label="mute the video room" title="mute the video room">&#128250;</button>
+    <button class="jam-mutebtn mini-mutebtn" aria-label="mute the sound room" title="mute the sound room">&#127925;</button>
     <input id="theatre-url" placeholder="paste a youtube link…" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="theatre-queue-btn">watch</button>
   </div>
@@ -167,10 +169,10 @@ if ('serviceWorker' in navigator) {
      current track starts at the room's wall-clock offset. -->
 <button id="sound-pill" style="display:none">&#128263; tap for sound</button>
 <div id="jam-panel">
-  <div class="jam-head"><span>&#127925; JAM ROOM</span><button id="jam-close" aria-label="close">&#10005;</button></div>
+  <div class="jam-head"><span>&#127925; JAM ROOM</span><span class="jam-head-btns"><button class="jam-mutebtn mini-mutebtn" aria-label="mute the sound room" title="mute the sound room">&#127925;</button><button id="jam-close" aria-label="close">&#10005;</button></span></div>
   <!-- build 75: theatre monitor — hear the theatre's video while jamming -->
   <div id="jam-theatre" class="jam-theatre" style="display:none">
-    <span>&#127916; theatre</span><input id="jam-theatre-vol" type="range" min="0" max="100" value="70" aria-label="theatre volume">
+    <span>&#127916; theatre</span><button class="theatre-mutebtn mini-mutebtn" aria-label="mute the video room" title="mute the video room">&#128250;</button><input id="jam-theatre-vol" type="range" min="0" max="100" value="70" aria-label="theatre volume">
   </div>
   <!-- build 66: the loop, simplified. One big unmissable button at the top
        of the jam UI: tap = record, tap = close + loop, tap = stop,
@@ -598,6 +600,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=76"></script>
+<script type="module" src="js/game.js?v=77"></script>
 </body>
 </html>
