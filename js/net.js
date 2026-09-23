@@ -287,6 +287,19 @@ class RelayLink {
      open relay sockets. Idempotent. */
   async ensure() {
     if (this.ready) return true;
+    // build 80: overlapping enterRelayMode() calls (a goTo() mid-flight)
+    // must share one import — two concurrent ensures would mint two
+    // keypairs and double every socket.
+    if (this._ensuring) return this._ensuring;
+    this._ensuring = this._ensureInner();
+    try {
+      return await this._ensuring;
+    } finally {
+      this._ensuring = null;
+    }
+  }
+
+  async _ensureInner() {
     let tools = null;
     try {
       tools = await import(NOSTR_TOOLS_URL);
@@ -618,6 +631,7 @@ export class LimboNet {
     this.relayMode = false;
     this._relayRoomTag = null;
     this._relaySince = 0;
+    this._relayRetryT = null; // build 80: one delayed re-engage after a failed ensure()
     // --- server-wide jukebox channel (build 41) ---
     this._jukeServerKey = null; // e.g. 'limbo-nexus-3'
     this._jukeServerTag = null; // relay tag subscribed for jukebox traffic
@@ -1554,6 +1568,23 @@ export class LimboNet {
     if (!ok) {
       this.relayMode = false;
       this._netLog('relay: transport unavailable — staying on WebRTC retries');
+      // build 80: a goTo() during ensure() returns early from ITS
+      // enterRelayMode() (relayMode was already true), so after this failure
+      // nothing will ever re-engage the relay — the room-tag subscription
+      // is skipped and the client is silently relay-less. One delayed retry
+      // closes the hole; the watchdog / join-error / no-discovery triggers
+      // stay as backstops.
+      if (this.enabled && this.roomKey && !this._relayRetryT) {
+        this._relayRetryT = setTimeout(() => {
+          this._relayRetryT = null;
+          if (!this.relayMode && this.enabled && this.roomKey) {
+            this._netLog('relay: retrying transport after failed ensure()');
+            try {
+              this.enterRelayMode('retry-after-fail').catch(() => {});
+            } catch (e) {}
+          }
+        }, 5000);
+      }
       this._updatePill();
       return;
     }

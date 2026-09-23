@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=79';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=79';
-import { CouchNet } from './couch.js?v=79';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=79';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=79';
+import { AudioEngine } from './audio.js?v=80';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=80';
+import { CouchNet } from './couch.js?v=80';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=80';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=80';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -4685,7 +4685,7 @@ function jukeSkipNow() {
   if (net.enabled && net.sendJukeSkipVote) {
     try { net.sendJukeSkipVote({ id, voter: myName }); } catch (e) {}
   }
-  handleJukeSkip({ id, voter: myName }, 'self');
+  handleJukeSkip('self', { id, voter: myName }); // build 80: (peerId, d) order — was flipped by the build-79 swap, so the skipper never skipped locally
 }
 
 function handleJukeSkip(peerId, d) {
@@ -6111,9 +6111,16 @@ const theatre = {
   player: null, playerReady: false,
   volume: 0.7, muted: false, // build 77: living-room mute — video room audio
   playBlocked: false, // build 79: mobile blocked our programmatic play() — needs a tap
+  playerError: 0, errorMsg: '', // build 80: YT player error code + human message
 };
 const theatrePanel = document.getElementById('theatre-panel');
 const theatreScreen3dEl = document.getElementById('theatre-screen3d');
+// build 80: the player target lives INSIDE the projection layer. The YT
+// IFrame API replaces its target element with the <iframe> — if we handed it
+// the layer itself, the captured reference would point at a detached node
+// and every matrix3d write in theatreScreenTick() would silently no-op,
+// leaving the video as a flat 2D box instead of on the 3D screen.
+const theatreScreenSlotEl = document.getElementById('theatre-screen3d-slot');
 const theatreNoteEl = document.getElementById('theatre-screen-note');
 const theatreUrlEl = document.getElementById('theatre-url');
 const theatreByEl = document.getElementById('theatre-by');
@@ -6132,7 +6139,7 @@ function theatreEnsurePlayer() {
   const make = () => {
     if (theatre.player || !window.YT) return;
     try {
-      theatre.player = new window.YT.Player(theatreScreen3dEl, {
+      theatre.player = new window.YT.Player(theatreScreenSlotEl, {
         width: '100%', height: '100%',
         videoId: '',
         playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
@@ -6151,6 +6158,9 @@ function theatreEnsurePlayer() {
             // build 79: a real PLAYING state clears the autoplay-block flag
             if (ev.data === window.YT.PlayerState.PLAYING) theatreClearPlayBlock();
           },
+          // build 80: surface player failures — an embedding-disabled or
+          // deleted video used to fail silently to a black 3D screen.
+          onError: (ev) => { theatreOnPlayerError(ev && ev.data); },
         },
       });
     } catch (e) { /* player failed — panel still shows the empty state */ }
@@ -6161,6 +6171,25 @@ function theatreEnsurePlayer() {
 
 /* Apply the current theatre state to the local player: seek to the synced
    position and play or pause. */
+function theatreOnPlayerError(code) {
+  // build 80: the YT player failed on this video — say why instead of a
+  // black 3D screen. 101/150 = owner disabled embedding, 100 = not
+  // found/private/deleted, 5 = HTML5 player error, 2 = bad video id.
+  theatre.playerError = code || 'unknown';
+  const msg = (code === 101 || code === 150)
+    ? 'this video can\u2019t play here \u2014 the owner turned off embedding. try another link.'
+    : (code === 100
+      ? 'youtube can\u2019t find this video \u2014 it may be private or deleted.'
+      : 'the video player hit an error — try another link.');
+  theatre.errorMsg = msg;
+  theatre.playing = false;
+  try { theatreRender(); } catch (e) {}
+}
+function theatreClearPlayerError() {
+  if (!theatre.playerError) return;
+  theatre.playerError = 0; theatre.errorMsg = '';
+  try { theatreRender(); } catch (e) {}
+}
 function theatreApplyState() {
   if (!theatre.player || !theatre.playerReady || !theatre.videoId) return;
   try {
@@ -6169,6 +6198,7 @@ function theatreApplyState() {
     let curId = '';
     try { curId = p.getVideoData().video_id || ''; } catch (e) {}
     if (curId !== theatre.videoId) {
+      theatreClearPlayerError(); // build 80: new video, fresh chance
       p.cueVideoById(theatre.videoId);
     }
     if (theatre.playing) {
@@ -6185,11 +6215,13 @@ function theatreApplyState() {
 }
 
 function theatreRender() {
-  if (theatreNoteEl) theatreNoteEl.textContent = theatre.playBlocked
-    ? 'tap \u25b6 on this phone to start the movie' // build 79: autoplay-block hint
-    : (theatre.videoId
-      ? 'now showing on the big screen — look up'
-      : 'paste a youtube link — it plays on the big screen');
+  if (theatreNoteEl) theatreNoteEl.textContent = theatre.playerError
+    ? theatre.errorMsg // build 80: the player said why — not a black screen
+    : (theatre.playBlocked
+      ? 'tap \u25b6 on this phone to start the movie' // build 79: autoplay-block hint
+      : (theatre.videoId
+        ? 'now showing on the big screen — look up'
+        : 'paste a youtube link — it plays on the big screen'));
   if (theatreByEl) theatreByEl.textContent = theatre.videoId ? ('queued by ' + (theatre.addedBy || 'a drifter')) : '';
   if (theatrePlayPauseEl) theatrePlayPauseEl.innerHTML = theatre.playing ? '&#10074;&#10074;' : '&#9654;';
   // build 79: link diagnostic — the read-back line for sync issues
@@ -6198,7 +6230,12 @@ function theatreRender() {
     let tx = 0, rx = 0;
     try { tx = net._theatreTx || 0; rx = net._theatreRx || 0; } catch (e) {}
     const pst = !theatre.player ? 'no player' : (theatre.playerReady ? 'ready' : 'loading\u2026');
-    linkEl.textContent = 'link: sent ' + tx + ' \u00b7 got ' + rx + ' \u00b7 player ' + pst;
+    // build 80: a player error (e.g. embedding disabled) shows on the read-back line
+    const perr = theatre.playerError ? ' \u00b7 err ' + theatre.playerError : '';
+    // build 80: screen state is the read-back for the 3D-screen fix —
+    // '3D screen' means the layer is projected onto the cinema screen mesh.
+    const scr = theatreScreen3dEl && theatreScreen3dEl.style.display !== 'none' ? '3D screen' : 'off';
+    linkEl.textContent = 'link: sent ' + tx + ' \u00b7 got ' + rx + ' \u00b7 player ' + pst + perr + ' \u00b7 screen ' + scr;
   }
   // jam monitor visibility — show when there's a video and we're in the sound room
   theatreUpdateJamMonitor();
@@ -6219,6 +6256,7 @@ function theatreQueue(url) {
   theatre.playing = true;
   theatre.position = 0;
   theatre.startedAt = Date.now();
+  theatreClearPlayerError(); // build 80: a fresh queue clears a stale player error
   try { if (net && net.sendTheatreAdd) net.sendTheatreAdd(data); } catch (e) {}
   try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId, position: 0, startedAt: Date.now(), by: myName }); } catch (e) {}
   theatreEnsurePlayer();
@@ -6231,6 +6269,7 @@ function theatreTogglePlay() {
   // otherwise the first tap would pause the whole room instead of unlocking
   const wasBlocked = theatre.playBlocked;
   theatreClearPlayBlock(); // this tap is a real gesture — it unlocks play
+  theatreClearPlayerError(); // build 80: a tap retries — drop the old error
   try {
     const p = theatre.player;
     const now = Date.now();
@@ -12446,11 +12485,61 @@ window.__limbo = {
   albumState: () => ({ state: album.state, tracks: album.tracks.map((t) => t.title) }),
   jukeLikeCount: (id) => (jukeLikes.get(id) || new Set()).size,
   /* build 75 test seam: theatre state */
-  theatreState: () => ({ videoId: theatre.videoId, playing: theatre.playing, position: theatre.position }),
+  theatreState: () => ({ videoId: theatre.videoId, playing: theatre.playing, position: theatre.position, startedAt: theatre.startedAt, playBlocked: theatre.playBlocked, playerReady: theatre.playerReady, hasPlayer: !!theatre.player }),
   /* build 79 test seams: drive theatre handlers exactly as net._in does (cid, data) */
   theatreRxAdd: (cid, d) => handleTheatreAdd(cid, d),
   theatreRxPlay: (cid, d) => handleTheatrePlay(cid, d),
   theatreRxPause: (cid, d) => handleTheatrePause(cid, d),
+  /* build 80 test seam: fake a ready player (headless Chromium cannot build
+     a real YT.Player iframe). Lets tests drive the projection + the UI
+     toggle path without the network player. */
+  theatreForceReady: (videoId) => {
+    theatre.videoId = String(videoId || 'testvideoid1');
+    theatre.playing = true;
+    // the seam simulates a happily-playing player: clear any autoplay-block
+    // flag and disarm the play-block watchdog so the UI toggle takes the
+    // pause branch instead of the unblock-and-resume branch.
+    theatre.playBlocked = false;
+    if (theatrePlayWatchTimer) { clearTimeout(theatrePlayWatchTimer); theatrePlayWatchTimer = 0; }
+    theatre.position = 0;
+    theatre.startedAt = Date.now();
+    const cur = { t: 0 };
+    theatre.player = {
+      getVideoData: () => ({ video_id: theatre.videoId }),
+      cueVideoById: () => {},
+      seekTo: (s) => { cur.t = s; },
+      playVideo: () => {},
+      pauseVideo: () => {},
+      getCurrentTime: () => cur.t,
+      getPlayerState: () => 1,
+      setVolume: () => {},
+    };
+    theatre.playerReady = true;
+    theatreRender();
+    return { videoId: theatre.videoId, playing: theatre.playing, position: theatre.position };
+  },
+  theatreScreenLayer: () => document.getElementById('theatre-screen3d'),
+  /* build 80 test seam: the screen mesh's four corners in page pixels,
+     same math as theatreScreenTick() (read-only). */
+  theatreTestCorners: () => {
+    const mesh = active && active.key === THEATRE_ROOM_KEY && active.anim ? active.anim.screenMesh : null;
+    if (!mesh || !camera) return null;
+    mesh.updateWorldMatrix(true, false);
+    const hw = 14, hh = 7.875;
+    const v = new THREE.Vector3();
+    const dst = [];
+    for (const [lx, ly] of [[-hw, hh], [hw, hh], [hw, -hh], [-hw, -hh]]) {
+      v.set(lx, ly, 0).applyMatrix4(mesh.matrixWorld).project(camera);
+      dst.push([(v.x * 0.5 + 0.5) * window.innerWidth, (-v.y * 0.5 + 0.5) * window.innerHeight]);
+    }
+    const [tl, tr, br, bl] = dst;
+    return { tl, tr, br, bl };
+  },
+  // build 80 test seam: drive the player-error path without a real YT player
+  theatreSimError: (code) => {
+    if (code) theatreOnPlayerError(code); else theatreClearPlayerError();
+    return document.getElementById('theatre-link').textContent;
+  },
   theatreExtractId: (u) => theatreExtractId(u),
   /* build 33 test seam: fake a live jukebox track to drive the like pill */
   jukeFakePlaying: (id) => {
