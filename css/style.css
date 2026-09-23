@@ -1525,35 +1525,37 @@ html, body {
    no pointer events. Never display:none (that throttles some players). */
 .juke-embed { position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; overflow: hidden; }
 .juke-embed iframe { display: block; border: none; width: 1px !important; height: 1px !important; }
-/* Theatre (build 75): cinema panel. The video is large in the theatre room;
-   the player itself is global so audio continues everywhere. */
+/* Theatre (build 76): the 3D-anchored video layer. Fixed 960x540 (16:9);
+   every frame a CSS matrix3d homography pins it onto the cinema screen
+   mesh, so the video lives on the wall, in the space. */
+#theatre-screen3d {
+  position: fixed; left: 0; top: 0; width: 960px; height: 540px;
+  transform-origin: 0 0; z-index: 30; overflow: hidden; background: #000;
+}
+#theatre-screen3d iframe { width: 100% !important; height: 100% !important; border: none; display: block; }
+/* Theatre (build 76): slim control strip — the video is on the big screen now. */
 #theatre-panel {
-  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
-  width: min(92vw, 860px); z-index: 40;
-  background: rgba(8, 4, 6, 0.96); border: 1px solid rgba(255, 85, 102, 0.35);
-  border-radius: 12px; padding: 12px; box-shadow: 0 0 60px rgba(255, 85, 102, 0.15);
+  position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
+  transform: translateX(-50%);
+  width: min(94vw, 520px); z-index: 40;
+  background: rgba(8, 4, 6, 0.92); border: 1px solid rgba(255, 85, 102, 0.35);
+  border-radius: 12px; padding: 10px 12px; box-shadow: 0 0 60px rgba(255, 85, 102, 0.15);
 }
 .theatre-head {
   display: flex; align-items: center; gap: 8px;
-  font-size: 13px; letter-spacing: 0.18em; color: #ff8899; margin-bottom: 10px;
+  font-size: 13px; letter-spacing: 0.18em; color: #ff8899; margin-bottom: 6px;
 }
 .theatre-head #theatre-close { margin-left: auto; }
 .theatre-by { font-size: 11px; color: var(--ink-dim); letter-spacing: 0.04em; }
-.theatre-screen-wrap {
-  position: relative; width: 100%; aspect-ratio: 16 / 9;
-  background: #000; border-radius: 8px; overflow: hidden;
+.theatre-screen-note {
+  font-size: 11px; color: var(--ink-dim); text-align: center;
+  letter-spacing: 0.04em; margin-bottom: 8px;
 }
-.theatre-screen-wrap iframe { width: 100% !important; height: 100% !important; border: none; }
-.theatre-empty {
-  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  color: var(--ink-dim); font-size: 13px; text-align: center; padding: 20px;
-}
-.theatre-controls { display: flex; gap: 8px; margin-top: 10px; }
+.theatre-controls { display: flex; gap: 8px; }
 .theatre-controls input {
   flex: 1; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
   border-radius: 8px; padding: 8px 10px; color: var(--ink); font-size: 13px;
 }
-.theatre-hint { margin-top: 8px; font-size: 11px; color: var(--ink-dim); text-align: center; }
 /* Jam monitor (build 75): tiny theatre volume strip in the jam UI. */
 .jam-theatre {
   display: flex; align-items: center; gap: 6px;

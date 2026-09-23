@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=75';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=75';
-import { CouchNet } from './couch.js?v=75';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=75';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=75';
+import { AudioEngine } from './audio.js?v=76';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=76';
+import { CouchNet } from './couch.js?v=76';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=76';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=76';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -6112,8 +6112,8 @@ const theatre = {
   volume: 0.7,
 };
 const theatrePanel = document.getElementById('theatre-panel');
-const theatrePlayerEl = document.getElementById('theatre-player');
-const theatreEmptyEl = document.getElementById('theatre-empty');
+const theatreScreen3dEl = document.getElementById('theatre-screen3d');
+const theatreNoteEl = document.getElementById('theatre-screen-note');
 const theatreUrlEl = document.getElementById('theatre-url');
 const theatreByEl = document.getElementById('theatre-by');
 const theatrePlayPauseEl = document.getElementById('theatre-playpause');
@@ -6130,7 +6130,7 @@ function theatreEnsurePlayer() {
   const make = () => {
     if (theatre.player || !window.YT) return;
     try {
-      theatre.player = new window.YT.Player(theatrePlayerEl, {
+      theatre.player = new window.YT.Player(theatreScreen3dEl, {
         width: '100%', height: '100%',
         videoId: '',
         playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
@@ -6179,7 +6179,9 @@ function theatreApplyState() {
 }
 
 function theatreRender() {
-  if (theatreEmptyEl) theatreEmptyEl.style.display = theatre.videoId ? 'none' : '';
+  if (theatreNoteEl) theatreNoteEl.textContent = theatre.videoId
+    ? 'now showing on the big screen — look up'
+    : 'paste a youtube link — it plays on the big screen';
   if (theatreByEl) theatreByEl.textContent = theatre.videoId ? ('queued by ' + (theatre.addedBy || 'a drifter')) : '';
   if (theatrePlayPauseEl) theatrePlayPauseEl.innerHTML = theatre.playing ? '&#10074;&#10074;' : '&#9654;';
   // jam monitor visibility — show when there's a video and we're in the sound room
@@ -6314,6 +6316,77 @@ function theatreSetVolume(v) {
   try {
     if (theatre.player && theatre.playerReady) theatre.player.setVolume(Math.round(theatre.volume * 100));
   } catch (e) {}
+}
+
+/* Build 76: pin the YouTube player onto the 3D cinema screen. Every frame
+   we project the screen mesh's four corners to pixels and set a CSS
+   matrix3d homography on the player layer, so the video sits exactly on
+   the wall — in the space, not in a 2D box. Hidden whenever we're not in
+   the theatre, there's no video, or the screen faces away. */
+const TS_W = 960, TS_H = 540; // player layer size, 16:9 like the screen mesh
+const _tsSrc = [[0, 0], [TS_W, 0], [TS_W, TS_H], [0, TS_H]];
+const _tsV = new THREE.Vector3();
+const _tsQ = new THREE.Quaternion();
+const _tsP = new THREE.Vector3();
+const _tsN = new THREE.Vector3();
+
+// 3x3 homography mapping src quad -> dst quad (8 unknowns, h33 = 1).
+function theatreHomography(src, dst) {
+  const M = [];
+  for (let i = 0; i < 4; i++) {
+    const x = src[i][0], y = src[i][1], u = dst[i][0], v = dst[i][1];
+    M.push([x, y, 1, 0, 0, 0, -u * x, -u * y, u]);
+    M.push([0, 0, 0, x, y, 1, -v * x, -v * y, v]);
+  }
+  const n = 8;
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    const tmp = M[col]; M[col] = M[piv]; M[piv] = tmp;
+    const d = M[col][col] || 1e-12;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col] / d;
+      for (let c = col; c <= n; c++) M[r][c] -= f * M[col][c];
+    }
+  }
+  return M.map((row, i) => row[n] / (M[i][i] || 1e-12));
+}
+
+function theatreScreenTick() {
+  if (!theatreScreen3dEl) return;
+  const mesh = active && active.key === THEATRE_ROOM_KEY && active.anim ? active.anim.screenMesh : null;
+  const show = !!(mesh && theatre.videoId && theatre.playerReady);
+  if (!show) {
+    if (theatreScreen3dEl.style.display !== 'none') theatreScreen3dEl.style.display = 'none';
+    return;
+  }
+  mesh.updateWorldMatrix(true, false);
+  mesh.getWorldPosition(_tsP);
+  mesh.getWorldQuaternion(_tsQ);
+  _tsN.set(0, 0, 1).applyQuaternion(_tsQ); // the screen faces +Z (toward the seats)
+  _tsV.copy(camera.position).sub(_tsP);
+  if (_tsV.dot(_tsN) <= 0) { // behind the screen — nothing to show
+    theatreScreen3dEl.style.display = 'none';
+    return;
+  }
+  const hw = 14, hh = 7.875; // 28 x 15.75, matches the mesh
+  const dst = [];
+  for (const [lx, ly] of [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]]) {
+    _tsV.set(lx, ly, 0).applyMatrix4(mesh.matrixWorld);
+    _tsV.applyMatrix4(camera.matrixWorldInverse); // view space: must be in front
+    if (_tsV.z > -0.1) {
+      theatreScreen3dEl.style.display = 'none';
+      return;
+    }
+    _tsV.set(lx, ly, 0).applyMatrix4(mesh.matrixWorld).project(camera);
+    dst.push([(_tsV.x * 0.5 + 0.5) * window.innerWidth, (-_tsV.y * 0.5 + 0.5) * window.innerHeight]);
+  }
+  const h = theatreHomography(_tsSrc, dst);
+  theatreScreen3dEl.style.display = '';
+  // CSS matrix3d is column-major: the 2D homography sits in the x/y columns.
+  theatreScreen3dEl.style.transform =
+    `matrix3d(${h[0]},${h[3]},0,${h[6]},${h[1]},${h[4]},0,${h[7]},0,0,1,0,${h[2]},${h[5]},0,1)`;
 }
 
 // wire the theatre UI
@@ -7810,21 +7883,22 @@ function buildTheatre() {
   floor.rotation.x = -Math.PI / 2;
   scene.add(floor);
 
-  // Screen frame on the north wall — big glowing rectangle.
-  const screenW = 28, screenH = 15;
+  // Screen frame on the north wall — big glowing rectangle, exact 16:9 so
+  // the projected video layer lands on it pixel-true (build 76).
+  const screenW = 28, screenH = 15.75, screenY = 9.5, screenZ = -28.9;
   const frame = new THREE.Mesh(
     new THREE.PlaneGeometry(screenW + 1.5, screenH + 1.5),
     new THREE.MeshStandardMaterial({ color: 0x111111, emissive: accent, emissiveIntensity: 0.35, roughness: 0.4 })
   );
-  frame.position.set(0, 9, -29);
+  frame.position.set(0, screenY, screenZ - 0.1);
   scene.add(frame);
-  const screenGlow = new THREE.Mesh(
+  const screenMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(screenW, screenH),
     new THREE.MeshBasicMaterial({ color: 0x0a0a0c })
   );
-  screenGlow.position.set(0, 9, -28.9);
-  screenGlow.name = 'theatre-screen';
-  scene.add(screenGlow);
+  screenMesh.position.set(0, screenY, screenZ);
+  screenMesh.name = 'theatre-screen';
+  scene.add(screenMesh);
 
   // Seat rows — simple dark boxes with a hint of red.
   const seatMat = new THREE.MeshStandardMaterial({ color: 0x1a0d10, roughness: 0.9 });
@@ -7833,6 +7907,10 @@ function buildTheatre() {
       const seat = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.6, 1.2), seatMat);
       seat.position.set((i - 2.5) * 3.2, 0.8, -8 + row * 4.5);
       scene.add(seat);
+      // seat back — a little taller so rows read as a cinema
+      const back = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.1, 0.5), seatMat);
+      back.position.set((i - 2.5) * 3.2, 1.9, -7.5 + row * 4.5);
+      scene.add(back);
     }
   }
 
@@ -7840,6 +7918,63 @@ function buildTheatre() {
   const wash = new THREE.PointLight(0xff5566, 0.6, 60);
   wash.position.set(0, 9, -24);
   scene.add(wash);
+
+  // Projector booth at the back (build 76) — the beam is what sells it.
+  const booth = new THREE.Mesh(
+    new THREE.BoxGeometry(3, 2, 2.5),
+    new THREE.MeshStandardMaterial({ color: 0x141114, roughness: 0.7 })
+  );
+  booth.position.set(0, 7.5, 23.5);
+  scene.add(booth);
+  const lens = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: makeGlowTexture(), color: 0xcfe8ff, transparent: true,
+    opacity: 0.9, depthWrite: false, fog: false,
+  }));
+  lens.scale.set(1.4, 1.4, 1);
+  lens.position.set(0, 7.5, 22.1);
+  scene.add(lens);
+
+  // Light beam: projector lens -> screen. Narrow at the booth, wide at the
+  // screen. Only visible while a video is playing.
+  const projPos = new THREE.Vector3(0, 7.5, 22.1);
+  const screenPos = new THREE.Vector3(0, screenY, screenZ);
+  const beamLen = projPos.distanceTo(screenPos);
+  const beam = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.5, 13, beamLen, 20, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0x9db8ff, transparent: true, opacity: 0,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+      depthWrite: false, fog: false,
+    })
+  );
+  beam.position.copy(projPos).add(screenPos).multiplyScalar(0.5);
+  beam.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), projPos.clone().sub(screenPos).normalize());
+  beam.visible = false;
+  scene.add(beam);
+
+  // Dust motes drifting in the beam.
+  const dustN = 70;
+  const dustArr = new Float32Array(dustN * 3);
+  const dustSeed = [];
+  for (let i = 0; i < dustN; i++) {
+    const f = Math.random(); // 0 at projector, 1 at screen
+    const cx = projPos.x + (screenPos.x - projPos.x) * f;
+    const cy = projPos.y + (screenPos.y - projPos.y) * f;
+    const cz = projPos.z + (screenPos.z - projPos.z) * f;
+    const r = 0.5 + f * 11;
+    dustArr[i * 3] = cx + (Math.random() - 0.5) * 2 * r * 0.6;
+    dustArr[i * 3 + 1] = cy + (Math.random() - 0.5) * 2 * r * 0.4;
+    dustArr[i * 3 + 2] = cz + (Math.random() - 0.5) * 2;
+    dustSeed.push({ sp: 0.2 + Math.random() * 0.6, ph: Math.random() * Math.PI * 2 });
+  }
+  const dustGeo = new THREE.BufferGeometry();
+  dustGeo.setAttribute('position', new THREE.BufferAttribute(dustArr, 3));
+  const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+    color: 0xbfd4ff, size: 0.12, transparent: true, opacity: 0.55,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  dust.visible = false;
+  scene.add(dust);
 
   // Return portal to the Nexus.
   const { group, ring } = makePortal(makeTheatreTexture(), accent, 'NEXUS', 1.7, 0.14);
@@ -7853,11 +7988,29 @@ function buildTheatre() {
     scene, portals, echoes: [],
     spawn: new THREE.Vector3(0, 2, 14), spawnYaw: 0, // face the screen (-Z)
     bound: 'realm',
-    anim: { wash, screenGlow },
+    anim: { wash, screenMesh, beam, lens, dust, dustSeed },
     attunedShown: true,
     update(dt, t) {
-      const { wash } = this.anim;
-      wash.intensity = 0.5 + Math.sin(t * 0.7) * 0.15;
+      const a = this.anim;
+      const playing = theatre.playing && !!theatre.videoId;
+      // Screen-light wash: gentle idle breathing, lively flicker while the
+      // projector is running — light spilling off the screen.
+      a.wash.intensity = playing
+        ? 0.75 + Math.sin(t * 9.3) * 0.12 + Math.sin(t * 23.7) * 0.08
+        : 0.5 + Math.sin(t * 0.7) * 0.15;
+      a.beam.visible = playing;
+      a.dust.visible = playing;
+      if (playing) {
+        a.beam.material.opacity = 0.045 + Math.sin(t * 7.1) * 0.012 + Math.sin(t * 17.3) * 0.008;
+        a.lens.material.opacity = 0.75 + Math.sin(t * 11.7) * 0.15;
+        const pos = a.dust.geometry.attributes.position;
+        for (let i = 0; i < a.dustSeed.length; i++) {
+          const s = a.dustSeed[i];
+          pos.array[i * 3 + 1] += Math.sin(t * s.sp + s.ph) * dt * 0.35;
+          pos.array[i * 3] += Math.cos(t * s.sp * 0.7 + s.ph) * dt * 0.25;
+        }
+        pos.needsUpdate = true;
+      }
       for (const pt of this.portals) {
         pt.group.position.y = pt.baseY + Math.sin(t * 0.8 + pt.phase) * 0.3;
         pt.ring.rotation.z -= dt * 0.15;
@@ -12041,6 +12194,7 @@ function loop() {
   }
 
   renderer.render(active.scene, camera);
+  theatreScreenTick(); // build 76: pin the video layer onto the 3D cinema screen
 }
 
 /* ---------------- resize ---------------- */
