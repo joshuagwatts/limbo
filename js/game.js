@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=80';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=80';
-import { CouchNet } from './couch.js?v=80';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=80';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=80';
+import { AudioEngine } from './audio.js?v=81';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=81';
+import { CouchNet } from './couch.js?v=81';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=81';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=81';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -6112,7 +6112,24 @@ const theatre = {
   volume: 0.7, muted: false, // build 77: living-room mute — video room audio
   playBlocked: false, // build 79: mobile blocked our programmatic play() — needs a tap
   playerError: 0, errorMsg: '', // build 80: YT player error code + human message
+  seq: 0, // build 80: monotonic state version, bumped on every local play/pause
+          // broadcast so a late stateReq answer can't resurrect a paused movie
+  peerSeq: {}, // build 80: last applied theatre seq per sender cid
 };
+// build 80: stamp the next local state version on an outgoing broadcast
+function theatreNextSeq() { theatre.seq += 1; return theatre.seq; }
+// build 80: drop stale theatre state (seq at or behind what we already applied
+// from this sender). A late-joiner's stateReq answer is a rebroadcast of the
+// sender's CURRENT state — if a newer pause already landed, the older play
+// answer must not win. Payloads without seq (older builds) always apply.
+function theatreSeqFresh(peerId, d) {
+  const s = (d && typeof d.seq === 'number') ? d.seq : 0;
+  if (s <= 0) return true;
+  const last = theatre.peerSeq[peerId] || 0;
+  if (s <= last) return false;
+  theatre.peerSeq[peerId] = s;
+  return true;
+}
 const theatrePanel = document.getElementById('theatre-panel');
 const theatreScreen3dEl = document.getElementById('theatre-screen3d');
 // build 80: the player target lives INSIDE the projection layer. The YT
@@ -6139,17 +6156,22 @@ function theatreEnsurePlayer() {
   const make = () => {
     if (theatre.player || !window.YT) return;
     try {
-      theatre.player = new window.YT.Player(theatreScreenSlotEl, {
+      // build 80: callbacks ignore events from a stale player — the YT API
+      // can fire onError/onReady late, after theatre.player was replaced
+      // (a late onError must not nuke the current playing state).
+      const p = new window.YT.Player(theatreScreenSlotEl, {
         width: '100%', height: '100%',
         videoId: '',
         playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
         events: {
           onReady: (ev) => {
+            if (theatre.player !== p) return;
             theatre.playerReady = true;
             theatreApplyVolume();
             if (theatre.videoId) theatreApplyState();
           },
           onStateChange: (ev) => {
+            if (theatre.player !== p) return;
             // keep the play/pause button honest
             if (theatrePlayPauseEl) {
               const playing = ev.data === window.YT.PlayerState.PLAYING;
@@ -6160,9 +6182,10 @@ function theatreEnsurePlayer() {
           },
           // build 80: surface player failures — an embedding-disabled or
           // deleted video used to fail silently to a black 3D screen.
-          onError: (ev) => { theatreOnPlayerError(ev && ev.data); },
+          onError: (ev) => { if (theatre.player === p) theatreOnPlayerError(ev && ev.data); },
         },
       });
+      theatre.player = p;
     } catch (e) { /* player failed — panel still shows the empty state */ }
   };
   if (window.YT && window.YT.Player) { make(); return; }
@@ -6258,7 +6281,7 @@ function theatreQueue(url) {
   theatre.startedAt = Date.now();
   theatreClearPlayerError(); // build 80: a fresh queue clears a stale player error
   try { if (net && net.sendTheatreAdd) net.sendTheatreAdd(data); } catch (e) {}
-  try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId, position: 0, startedAt: Date.now(), by: myName }); } catch (e) {}
+  try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId, position: 0, startedAt: Date.now(), by: myName, seq: theatreNextSeq() }); } catch (e) {}
   theatreEnsurePlayer();
   theatreApplyState();
 }
@@ -6279,7 +6302,7 @@ function theatreTogglePlay() {
       theatre.position = pos;
       theatre.startedAt = 0; // build 79: no live clock while paused
       p.pauseVideo();
-      try { if (net && net.sendTheatrePause) net.sendTheatrePause({ videoId: theatre.videoId, position: pos, by: myName }); } catch (e) {}
+      try { if (net && net.sendTheatrePause) net.sendTheatrePause({ videoId: theatre.videoId, position: pos, by: myName, seq: theatreNextSeq() }); } catch (e) {}
     } else {
       // build 79: resume from the LIVE position — a phone whose synced play
       // was autoplay-blocked taps ▶ and lands on the same spot as everyone
@@ -6291,7 +6314,7 @@ function theatreTogglePlay() {
       theatre.startedAt = now;
       try { p.seekTo(theatre.position, true); } catch (e) {}
       p.playVideo();
-      try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId: theatre.videoId, position: theatre.position, startedAt: now, by: myName }); } catch (e) {}
+      try { if (net && net.sendTheatrePlay) net.sendTheatrePlay({ videoId: theatre.videoId, position: theatre.position, startedAt: now, by: myName, seq: theatreNextSeq() }); } catch (e) {}
     }
   } catch (e) {}
   theatreRender();
@@ -6313,6 +6336,7 @@ function handleTheatreAdd(peerId, d) {
 function handleTheatrePlay(peerId, d) {
   if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
   if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  if (!theatreSeqFresh(peerId, d)) return; // build 80: stale (late answer) — drop
   // build 79: already watching this one in sync — don't re-seek. Walk-ins
   // ask for state on entry and the rebroadcast must not skip the room.
   if (theatre.playing && theatre.videoId === d.videoId && theatre.player && theatre.playerReady) {
@@ -6341,6 +6365,7 @@ function handleTheatrePlay(peerId, d) {
 function handleTheatrePause(peerId, d) {
   if (!d || typeof d.videoId !== 'string' || !d.videoId) return;
   if (d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
+  if (!theatreSeqFresh(peerId, d)) return; // build 80: stale (late answer) — drop
   if (theatre.videoId !== d.videoId) return;
   theatre.playing = false;
   theatre.position = typeof d.position === 'number' ? d.position : theatre.position;
@@ -6388,11 +6413,12 @@ function handleTheatreStateReq(peerId, d) {
     if (theatre.playing) {
       if (net && net.sendTheatrePlay) net.sendTheatrePlay({
         videoId: theatre.videoId, position: theatre.position,
-        startedAt: theatre.startedAt, by: theatre.addedBy,
+        startedAt: theatre.startedAt, by: theatre.addedBy, seq: theatre.seq,
       });
     } else {
       if (net && net.sendTheatrePause) net.sendTheatrePause({
         videoId: theatre.videoId, position: theatre.position, by: theatre.addedBy,
+        seq: theatre.seq,
       });
     }
   } catch (e) {}

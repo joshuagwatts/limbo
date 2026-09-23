@@ -1532,7 +1532,7 @@ html, body {
   position: fixed; left: 0; top: 0; width: 960px; height: 540px;
   transform-origin: 0 0; z-index: 30; overflow: hidden; background: #000;
 }
-#theatre-screen3d iframe { width: 100% !important; height: 100% !important; border: none; display: block; }
+#theatre-screen3d-slot, #theatre-screen3d iframe { width: 100% !important; height: 100% !important; border: none; display: block; }
 /* Theatre (build 76): slim control strip — the video is on the big screen now. */
 #theatre-panel {
   position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
