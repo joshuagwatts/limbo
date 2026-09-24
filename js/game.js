@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=81';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=81';
-import { CouchNet } from './couch.js?v=81';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=81';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=81';
+import { AudioEngine } from './audio.js?v=82';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=82';
+import { CouchNet } from './couch.js?v=82';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=82';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=82';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -6411,23 +6411,29 @@ function theatreClearPlayBlock() {
 }
 
 /* Late joiner asks what's playing — anyone holding a video rebroadcasts
-   the full state as a play (or pause). */
+   the full state as a play (or pause). Build 82: the media host answers
+   immediately; everyone else waits a beat so the host's authoritative
+   state wins and late answers can't fight it. */
 function handleTheatreStateReq(peerId, d) {
   if (!theatre.videoId) return;
   if (d && d.srv != null && String(d.srv) !== nexusServerKey(selectedServer)) return;
-  try {
-    if (theatre.playing) {
-      if (net && net.sendTheatrePlay) net.sendTheatrePlay({
-        videoId: theatre.videoId, position: theatre.position,
-        startedAt: theatre.startedAt, by: theatre.addedBy, seq: theatre.seq,
-      });
-    } else {
-      if (net && net.sendTheatrePause) net.sendTheatrePause({
-        videoId: theatre.videoId, position: theatre.position, by: theatre.addedBy,
-        seq: theatre.seq,
-      });
-    }
-  } catch (e) {}
+  const answer = () => {
+    try {
+      if (theatre.playing) {
+        if (net && net.sendTheatrePlay) net.sendTheatrePlay({
+          videoId: theatre.videoId, position: theatre.position,
+          startedAt: theatre.startedAt, by: theatre.addedBy, seq: theatre.seq,
+        });
+      } else {
+        if (net && net.sendTheatrePause) net.sendTheatrePause({
+          videoId: theatre.videoId, position: theatre.position, by: theatre.addedBy,
+          seq: theatre.seq,
+        });
+      }
+    } catch (e) {}
+  };
+  if (mediaIAmHost()) answer();
+  else setTimeout(answer, 800);
 }
 
 /* Show the theatre panel only in the theatre room; the player (and its
@@ -6439,12 +6445,19 @@ function theatreOnRealm(key) {
   if (inTheatre) {
     theatreEnsurePlayer();
     theatreRender();
-    // build 79: late joiner always asks what's playing — a phone holding a
+    // Build 79: late joiner always asks what's playing — a phone holding a
     // stale videoId would otherwise never catch up. The in-sync skip in
     // handleTheatrePlay keeps the rebroadcast from skipping the room.
-    setTimeout(() => {
+    // Build 82: retry — the data channel might not be up yet on the first
+    // try, and the host (best internet) answers first. Stop once we have
+    // a video; the host's heartbeat keeps us honest after that.
+    let attempts = 0;
+    const ask = () => {
+      attempts++;
       try { if (net && net.sendTheatreStateReq) net.sendTheatreStateReq({}); } catch (e) {}
-    }, 1500);
+      if (attempts < 3 && !theatre.videoId) setTimeout(ask, 2500);
+    };
+    setTimeout(ask, 1500);
   }
   theatreUpdateJamMonitor();
 }
@@ -6471,6 +6484,124 @@ function theatreApplyVolume() {
       theatre.player.setVolume(theatre.muted ? 0 : Math.round(theatre.volume * 100));
     }
   } catch (e) {}
+}
+
+/* ---------------- media host (build 82) ----------------
+   Best internet wins. Every peer measures RTT to the peers it can see,
+   broadcasts its average, and everyone independently elects the peer with
+   the lowest average as the media host. The host is the authoritative
+   source for theatre state: it answers late-joiner state requests first
+   and heartbeats the canonical state. If the host leaves, the next-best
+   takes over — the space heals itself from whoever's left. Combined
+   connectivity creating the space. */
+const MEDIA_PING_MS = 5000;
+const MEDIA_SCORE_MS = 5000;
+const MEDIA_HOST_SYNC_MS = 10000;
+const MEDIA_SCORE_TTL_MS = 20000;
+const mediaHost = {
+  cid: null,          // elected host's cid; my own cid if I win
+  score: Infinity,
+  name: '',
+  rtts: new Map(),    // cid -> EMA RTT in ms
+  scores: new Map(),   // cid -> {score, name, lastSeen}
+  pingTimer: 0,
+  scoreTimer: 0,
+  syncTimer: 0,
+};
+function mediaMyCid() { try { return (net && net.clientId) || ''; } catch (e) { return ''; } }
+function mediaMyScore() {
+  if (mediaHost.rtts.size === 0) return Infinity;
+  let sum = 0;
+  for (const rtt of mediaHost.rtts.values()) sum += rtt;
+  return sum / mediaHost.rtts.size;
+}
+function mediaIAmHost() { return mediaHost.cid !== null && mediaHost.cid === mediaMyCid(); }
+function mediaRecomputeHost() {
+  const now = Date.now();
+  for (const [cid, rec] of mediaHost.scores) {
+    if (now - rec.lastSeen > MEDIA_SCORE_TTL_MS) mediaHost.scores.delete(cid);
+  }
+  const myCid = mediaMyCid();
+  const myScore = mediaMyScore();
+  let bestCid = myCid || null;
+  let bestScore = myScore;
+  let bestName = (typeof myName === 'string' && myName) || 'drifter';
+  for (const [cid, rec] of mediaHost.scores) {
+    if (typeof rec.score !== 'number') continue;
+    if (rec.score < bestScore || (rec.score === bestScore && cid < (bestCid || ''))) {
+      bestScore = rec.score;
+      bestCid = cid;
+      bestName = rec.name || 'a drifter';
+    }
+  }
+  const prev = mediaHost.cid;
+  mediaHost.cid = bestCid;
+  mediaHost.score = bestScore;
+  mediaHost.name = bestName;
+  if (prev !== bestCid) mediaHostUpdateSyncTimer();
+}
+function mediaHostUpdateSyncTimer() {
+  if (mediaHost.syncTimer) { clearInterval(mediaHost.syncTimer); mediaHost.syncTimer = 0; }
+  if (mediaIAmHost() && net && net.enabled && net.sendMediaHostSync) {
+    mediaBroadcastHostState(); // announce immediately on winning
+    mediaHost.syncTimer = setInterval(() => { try { mediaBroadcastHostState(); } catch (e) {} }, MEDIA_HOST_SYNC_MS);
+  }
+}
+function mediaBroadcastHostState() {
+  if (!mediaIAmHost() || !net || !net.sendMediaHostSync) return;
+  const t = theatre.videoId ? {
+    videoId: theatre.videoId, title: theatre.title,
+    playing: theatre.playing, position: theatre.position,
+    startedAt: theatre.startedAt, by: theatre.addedBy, seq: theatre.seq,
+  } : null;
+  try {
+    net.sendMediaHostSync({ theatre: t, hostName: (typeof myName === 'string' && myName) || 'drifter', at: Date.now() });
+  } catch (e) {}
+}
+function handleMediaHostSync(peerId, d) {
+  if (mediaIAmHost()) return;
+  if (!mediaHost.cid || peerId !== mediaHost.cid) return; // only the elected host is authoritative
+  if (!d || !d.theatre || typeof d.theatre.videoId !== 'string' || !d.theatre.videoId) return;
+  const t = d.theatre;
+  // Reuse the play/pause handlers — seq guard + in-sync skip come free.
+  if (t.playing) {
+    handleTheatrePlay(peerId, { videoId: t.videoId, position: t.position, startedAt: t.startedAt, by: t.by, seq: t.seq });
+  } else {
+    handleTheatrePause(peerId, { videoId: t.videoId, position: t.position, by: t.by, seq: t.seq });
+  }
+}
+function mediaPingTick() {
+  if (!net || !net.enabled || !net.sendMediaPing) return;
+  try { net.sendMediaPing({ ts: Date.now(), from: mediaMyCid() }); } catch (e) {}
+}
+function handleMediaPing(peerId, d) {
+  if (!d || typeof d.ts !== 'number') return;
+  try { if (net && net.sendMediaPong) net.sendMediaPong({ ts: d.ts, from: mediaMyCid(), to: d.from }); } catch (e) {}
+}
+function handleMediaPong(peerId, d) {
+  if (!d || typeof d.ts !== 'number' || d.to !== mediaMyCid()) return;
+  const rtt = Date.now() - d.ts;
+  if (!(rtt >= 0) || rtt > 10000) return;
+  const prev = mediaHost.rtts.get(peerId);
+  mediaHost.rtts.set(peerId, prev == null ? rtt : prev * 0.7 + rtt * 0.3);
+  mediaRecomputeHost();
+}
+function mediaScoreTick() {
+  if (!net || !net.enabled || !net.sendMediaScore) return;
+  try { net.sendMediaScore({ score: mediaMyScore(), name: (typeof myName === 'string' && myName) || 'drifter' }); } catch (e) {}
+  mediaRecomputeHost();
+}
+function handleMediaScore(peerId, d) {
+  if (!d || typeof d.score !== 'number') return;
+  mediaHost.scores.set(peerId, { score: d.score, name: d.name || 'a drifter', lastSeen: Date.now() });
+  mediaRecomputeHost();
+}
+function mediaHostStart() {
+  if (mediaHost.pingTimer) return;
+  mediaPingTick(); mediaScoreTick();
+  mediaHost.pingTimer = setInterval(() => { try { mediaPingTick(); } catch (e) {} }, MEDIA_PING_MS);
+  mediaHost.scoreTimer = setInterval(() => { try { mediaScoreTick(); } catch (e) {} }, MEDIA_SCORE_MS);
+  mediaRecomputeHost();
 }
 
 /* Build 77: living-room mute for the video room. Every mute button with
@@ -6559,6 +6690,67 @@ function theatreScreenTick() {
   // CSS matrix3d is column-major: the 2D homography sits in the x/y columns.
   theatreScreen3dEl.style.transform =
     `matrix3d(${h[0]},${h[3]},0,${h[6]},${h[1]},${h[4]},0,${h[7]},0,0,1,0,${h[2]},${h[5]},0,1)`;
+  // Build 82: the DOM overlay can't depth-test against WebGL. If the wisp
+  // (orb) is in front of the screen, punch a hole in the overlay via a
+  // radial mask so the orb renders in front like it should.
+  theatreScreenOcclusion(dst);
+}
+
+/* Build 82: wisp-vs-screen occlusion. Returns the wisp's screen-space
+   circle if it's in front of (and overlapping) the screen quad. */
+const _tsW = { x: 0, y: 0, z: 0 };
+function theatreWispScreen() {
+  try {
+    if (!wisp || !camera) return null;
+    _tsV.copy(wisp.position).project(camera);
+    if (_tsV.z > 1) return null; // behind camera
+    const wx = (_tsV.x * 0.5 + 0.5) * window.innerWidth;
+    const wy = (-_tsV.y * 0.5 + 0.5) * window.innerHeight;
+    // Screen-space radius: wisp core is ~0.32 world units + glow.
+    const dist = camera.position.distanceTo(wisp.position);
+    if (dist <= 0.1) return null;
+    const worldR = 0.9; // orb + glow
+    const fovRad = (camera.fov || 60) * Math.PI / 180;
+    const pxPerUnit = (window.innerHeight / 2) / (Math.tan(fovRad / 2) * dist);
+    const r = Math.max(24, Math.min(220, worldR * pxPerUnit));
+    return { x: wx, y: wy, r: r, depth: _tsV.z };
+  } catch (e) { return null; }
+}
+function theatreScreenOcclusion(dst) {
+  try {
+    const ws = theatreWispScreen();
+    if (!ws) {
+      theatreScreen3dEl.style.webkitMaskImage = 'none';
+      theatreScreen3dEl.style.maskImage = 'none';
+      return;
+    }
+    // Is the wisp over the screen quad? (bounding-box check on the 4 corners)
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const [cx, cy] of dst) {
+      if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+    }
+    const over = ws.x > minX - ws.r && ws.x < maxX + ws.r && ws.y > minY - ws.r && ws.y < maxY + ws.r;
+    // Is the wisp in front of the screen? Compare depth at screen center.
+    const mesh = active && active.key === THEATRE_ROOM_KEY && active.anim ? active.anim.screenMesh : null;
+    let inFront = false;
+    if (mesh) {
+      mesh.getWorldPosition(_tsP);
+      _tsP.project(camera);
+      inFront = ws.depth < _tsP.z - 0.002;
+    }
+    if (over && inFront) {
+      // Punch a soft-edged hole so the orb shows through.
+      const m = `radial-gradient(circle ${ws.r}px at ${ws.x}px ${ws.y}px, transparent ${ws.r * 0.7}px, black ${ws.r}px)`;
+      theatreScreen3dEl.style.webkitMaskImage = m;
+      theatreScreen3dEl.style.maskImage = m;
+    } else {
+      theatreScreen3dEl.style.webkitMaskImage = 'none';
+      theatreScreen3dEl.style.maskImage = 'none';
+    }
+  } catch (e) {
+    try { theatreScreen3dEl.style.webkitMaskImage = 'none'; theatreScreen3dEl.style.maskImage = 'none'; } catch (e2) {}
+  }
 }
 
 // wire the theatre UI
@@ -6598,19 +6790,22 @@ function theatreScreenTick() {
    panel. The button carries now-playing + how many are in line. */
 function jukeBadge() {
   if (!jukeBtn) return;
-  jukeBtn.innerHTML = '';
-  const add = (html, text) => {
-    if (jukeBtn.childNodes.length) jukeBtn.appendChild(document.createTextNode(' · '));
-    const s = document.createElement('span');
-    if (html) s.innerHTML = html; else s.textContent = text;
-    jukeBtn.appendChild(s);
-  };
-  add('&#127925; jukebox');
+  // Build 82: the button is a side tab (emoji + label spans). Update the
+  // label in place so the tab structure survives.
+  let label = jukeBtn.querySelector('.side-tab-label');
+  if (!label) { jukeBtn.innerHTML = ''; label = document.createElement('span'); label.className = 'side-tab-label'; jukeBtn.appendChild(label); }
+  const parts = ['jukebox'];
   if (juke.now && !juke.now.stopped) {
     const t = (juke.now.title || 'untitled').toString().slice(0, 18);
-    add(null, `now: ${t}`);
+    parts.push(`now: ${t}`);
   }
-  if (juke.queue.length) add(null, `${juke.queue.length} in line`);
+  if (juke.queue.length) parts.push(`${juke.queue.length} in line`);
+  label.textContent = parts.join(' · ');
+  if (!jukeBtn.querySelector('.side-tab-emoji')) {
+    const e = document.createElement('span');
+    e.className = 'side-tab-emoji'; e.innerHTML = '&#127925;';
+    jukeBtn.insertBefore(e, label);
+  }
 }
 
 function jukeSetVolume(v) {
@@ -12017,6 +12212,11 @@ net.onTheatreAddCb = handleTheatreAdd;
 net.onTheatrePlayCb = handleTheatrePlay;
 net.onTheatrePauseCb = handleTheatrePause;
 net.onTheatreStateReqCb = handleTheatreStateReq;
+// Build 82: media host election — best internet wins, hosts the links.
+net.onMediaPingCb = handleMediaPing;
+net.onMediaPongCb = handleMediaPong;
+net.onMediaScoreCb = handleMediaScore;
+net.onMediaHostSyncCb = handleMediaHostSync;
 // Stage builder + front of house (build 66): layout + light rig ride the room.
 net.onStageSyncCb = handleStageSync;
 net.onStageReqCb = handleStageReq;
@@ -12029,7 +12229,7 @@ net.onModelReqCb = handleModelReq;
 net.onModelChunkCb = handleModelChunk;
 /* Build 43: the relay is live — start holder election hellos and ask the
    holder for the line if we're empty (the old blind timer fired too early). */
-net.onRelayUpCb = () => { jukeStartHellos(); jukeMaybeSync(); };
+net.onRelayUpCb = () => { jukeStartHellos(); jukeMaybeSync(); mediaHostStart(); };
 net.onJukeFileReqCb = handleJukeFileReq; // build 27: phone-file P2P
 net.onJukeFileChunkCb = handleJukeFileChunk;
 net.onJukeFileHaveCb = handleJukeFileHave;

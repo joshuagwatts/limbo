@@ -14,7 +14,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=81">
+<link rel="stylesheet" href="css/style.css?v=82">
 <script type="importmap">
 {
   "imports": {
@@ -24,8 +24,8 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=81"></script>
-<script src="js/vendor/jsqr.js?v=81"></script>
+<script src="js/vendor/qrcode.js?v=82"></script>
+<script src="js/vendor/jsqr.js?v=82"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
@@ -66,8 +66,12 @@ if ('serviceWorker' in navigator) {
 <!-- community wall paint mode — only visible inside the sound room (build 18) -->
 <button id="paint-btn" style="display:none">&#127912; paint</button>
 
-<!-- jukebox — synced queue playback, only visible inside the sound room (build 21) -->
-<button id="juke-btn" style="display:none">&#127925; jukebox</button>
+<!-- jukebox — synced queue playback, only visible inside the sound room (build 21).
+     Build 82: the trigger is a side tab on the right edge; the panel is a
+     drawer that slides in from the right. -->
+<div id="side-tabs">
+  <button id="juke-btn" class="side-tab" style="display:none" aria-label="jukebox"><span class="side-tab-emoji">&#127925;</span><span class="side-tab-label">jukebox</span></button>
+</div>
 <div id="juke-panel" style="display:none">
   <div class="juke-head"><span>&#127925; JUKEBOX</span><span style="display:flex;align-items:center;gap:2px"><span id="juke-holder" class="juke-holder"></span><button id="juke-clear" aria-label="clear the queue">clear</button><button id="juke-close" aria-label="close">&#10005;</button></span></div>
   <div class="juke-now">
@@ -605,6 +609,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=81"></script>
+<script type="module" src="js/game.js?v=82"></script>
 </body>
 </html>
