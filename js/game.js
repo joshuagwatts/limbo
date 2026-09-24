@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=85';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=85';
-import { CouchNet } from './couch.js?v=85';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=85';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=85';
+import { AudioEngine } from './audio.js?v=86';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=86';
+import { CouchNet } from './couch.js?v=86';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=86';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=86';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -10739,7 +10739,7 @@ function buildJourneyRays(scene) {
       heading: rnd() * Math.PI * 2,
       yaw: 0,
       cruise: 22 + rnd() * 10,
-      baseY: 14 + rnd() * 26, // 14–40: wisp-flyable
+      baseY: 12 + rnd() * 33, // 12–45 (±7 → 5–52): inside the wisp's Journey band (2.5–60)
       tp1: rnd() * Math.PI * 2, // turn phases (seeded → same sky, every phone)
       tp2: rnd() * Math.PI * 2,
       yp: rnd() * Math.PI * 2,  // altitude phase
