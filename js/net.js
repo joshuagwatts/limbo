@@ -153,6 +153,7 @@ const ACTION_CBS = {
   wallSync: 'onWallSyncCb',
   wallHello: 'onWallHelloCb',
   wallUndo: 'onWallUndoCb',
+  wallFresh: 'onWallFreshCb', // build 84: a wall was archived + cleared
   jukeAdd: 'onJukeAddCb',
   jukeRemove: 'onJukeRemoveCb',
   jukePlay: 'onJukePlayCb',
@@ -582,6 +583,7 @@ export class LimboNet {
     this.onWallSyncCb = null; // (data, peerId)
     this.onWallHelloCb = null; // (data, peerId)
     this.onWallUndoCb = null; // (data, peerId)
+    this.onWallFreshCb = null; // (data, peerId) — build 84
     this.onJukeAddCb = null; // (data, peerId)
     this.onJukeRemoveCb = null; // (data, peerId)
     this.onJukePlayCb = null; // (data, peerId)

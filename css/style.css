@@ -1255,6 +1255,20 @@ html, body {
   padding: 10px 16px; min-height: 44px;
   cursor: pointer; touch-action: manipulation;
 }
+/* Build 84: wall picker — N/E/S/W tabs */
+#wall-picker { display: flex; gap: 4px; flex-shrink: 0; }
+.wall-pick {
+  width: 44px; height: 44px; border-radius: 50%;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: #fff; font-family: inherit; font-size: 13px; font-weight: bold;
+  cursor: pointer; touch-action: manipulation;
+}
+.wall-pick.active {
+  background: rgba(141, 255, 122, 0.20);
+  border-color: rgba(141, 255, 122, 0.70);
+  color: #d2ffc4;
+}
 #paint-wrap {
   flex: 1 1 auto; min-height: 0; width: 100%;
   display: flex; align-items: center; justify-content: stretch;

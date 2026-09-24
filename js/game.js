@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=83';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=83';
-import { CouchNet } from './couch.js?v=83';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=83';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=83';
+import { AudioEngine } from './audio.js?v=84';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=84';
+import { CouchNet } from './couch.js?v=84';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=84';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=84';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -188,6 +188,7 @@ const paintEraserBtn  = document.getElementById('paint-eraser');
 const paintUndoBtn    = document.getElementById('paint-undo');
 const paintBlendBtn   = document.getElementById('paint-blend');
 const paintSaveBtn    = document.getElementById('paint-save');
+const paintFreshBtn   = document.getElementById('paint-fresh'); // build 84
 
 /* ---------------- multiplayer state ---------------- */
 
@@ -3682,43 +3683,85 @@ const WALL_W = 1024, WALL_H = 512;
 const WALL_BG = '#0b0b13';
 const WALL_BG_RGB = [11, 11, 19];
 const WALL_AMB_BASE = 0x99aacc; // sound room's default ambient tint
-const wall = {
-  canvas: null, ctx: null, tex: null,
-  strokeCount: 0,      // local + remote strokes this session; >0 means "has ink"
-  strokeTimes: [],     // Date.now() of recent strokes (5s activity window)
-  texDirty: false,
-  answeredReq: new Set(), // wallSyncReq ids we've already answered
-  ts: 0,               // build 26: version time of my wall (last stroke/apply/restore)
-  snapTimer: null,     // build 26: debounce timer for the localStorage snapshot
-  snapKey: 'limbo-wall-v1', // build 26: localStorage key — never renamed, so the mural survives game updates
-  // build 26 (undo): every stroke gets an id (per-session peer prefix +
-  // counter). The wall is a flattened base canvas plus an undoable stroke
-  // log; undo clears the canvas and replays base + remaining log.
-  selfId: Math.random().toString(36).slice(2, 10),
-  strokeSeq: 0,
-  log: [],             // [{id, points, color, size, eraser, byMe}] — undoable strokes
-  base: null, baseCtx: null, // flattened non-undoable mural underneath the log
-  logCap: 500,         // over this, bake the log into the base (pixels kept, history dropped)
-  lastLocalStroke: 0,  // Date.now() of my last local paint input — anti-stomp guard
-  pendingSync: null,   // wallSync JPEG stashed while I was painting; applied once quiet
-};
-wall.canvas = document.createElement('canvas');
-wall.canvas.width = WALL_W;
-wall.canvas.height = WALL_H;
-wall.ctx = wall.canvas.getContext('2d', { willReadFrequently: true });
-wall.ctx.fillStyle = WALL_BG;
-wall.ctx.fillRect(0, 0, WALL_W, WALL_H);
-/* Build 26 (undo): the flattened base under the undoable log. Starts blank
-   like the wall itself; wallRestoreSnapshot / wallApplySnapshot adopt a
-   mural into it. */
-wall.base = document.createElement('canvas');
-wall.base.width = WALL_W;
-wall.base.height = WALL_H;
-wall.baseCtx = wall.base.getContext('2d');
-wall.baseCtx.fillStyle = WALL_BG;
-wall.baseCtx.fillRect(0, 0, WALL_W, WALL_H);
-wall.tex = new THREE.CanvasTexture(wall.canvas);
-wall.tex.colorSpace = THREE.SRGBColorSpace;
+/* Build 84: four separate paint walls (north/east/south/west), one per
+   sound-room wall. Each has its own canvas, stroke log, texture, and sync.
+   `wall` is the ACTIVE wall — all existing wall.* code keeps working;
+   wallUse(id) switches which one is active. */
+const WALL_IDS = ['north', 'east', 'south', 'west'];
+const WALL_LABEL = { north: 'N', east: 'E', south: 'S', west: 'W' };
+function makeWallState(id) {
+  return {
+    id,
+    canvas: null, ctx: null, tex: null,
+    strokeCount: 0,
+    strokeTimes: [],
+    texDirty: false,
+    answeredReq: new Set(),
+    ts: 0,
+    snapTimer: null,
+    snapKey: 'limbo-wall-v1-' + id, // per-wall — murals survive game updates
+    selfId: Math.random().toString(36).slice(2, 10),
+    strokeSeq: 0,
+    log: [],
+    base: null, baseCtx: null,
+    logCap: 500,
+    lastLocalStroke: 0,
+    mesh: null, // build 84: the 3D plane showing this wall's texture
+  };
+}
+const wallStates = {};
+for (const wid of WALL_IDS) wallStates[wid] = makeWallState(wid);
+let wall = wallStates.north; // the active wall — wallUse(id) switches it
+/* Build 84: run fn with a specific wall active, then restore. For sync
+   handlers that land on a non-active wall. */
+function withWall(wid, fn) {
+  const prev = wall;
+  const st = wallStates[wid] || wallStates.north;
+  wall = st;
+  try { return fn(st); }
+  finally { wall = prev; }
+}
+function wallUse(wid) {
+  if (!wallStates[wid] || wall === wallStates[wid]) return;
+  wall = wallStates[wid];
+  if (typeof paint !== 'undefined') paint.wallId = wid;
+  if (typeof paintCtx !== 'undefined' && paintCtx && typeof paint !== 'undefined' && paint.open) {
+    paintCtx.drawImage(wall.canvas, 0, 0, WALL_W, WALL_H);
+  }
+  if (typeof wallPickerSync === 'function') wallPickerSync();
+}
+/* Build 84: restore all four walls from localStorage. */
+function wallRestoreAll() {
+  // Migrate the old single-wall key to north (one-time).
+  try {
+    if (!localStorage.getItem('limbo-wall-v1-north') && localStorage.getItem('limbo-wall-v1')) {
+      localStorage.setItem('limbo-wall-v1-north', localStorage.getItem('limbo-wall-v1'));
+    }
+  } catch (e) {}
+  for (const wid of WALL_IDS) {
+    withWall(wid, () => { wallRestoreSnapshot(); });
+  }
+}
+/* Build 84: init all four wall canvases. */
+for (const wid of WALL_IDS) {
+  const st = wallStates[wid];
+  st.canvas = document.createElement('canvas');
+  st.canvas.width = WALL_W; st.canvas.height = WALL_H;
+  st.ctx = st.canvas.getContext('2d');
+  st.ctx.fillStyle = WALL_BG; st.ctx.fillRect(0, 0, WALL_W, WALL_H);
+  st.base = document.createElement('canvas');
+  st.base.width = WALL_W; st.base.height = WALL_H;
+  st.baseCtx = st.base.getContext('2d');
+  st.baseCtx.fillStyle = WALL_BG; st.baseCtx.fillRect(0, 0, WALL_W, WALL_H);
+}
+wallRestoreAll();
+wall = wallStates.north;
+/* Build 84: one live texture per wall. */
+for (const wid of WALL_IDS) {
+  const st = wallStates[wid];
+  st.tex = new THREE.CanvasTexture(st.canvas);
+  st.tex.colorSpace = THREE.SRGBColorSpace;
+}
 
 function wallMarkDirty() { wall.texDirty = true; }
 
@@ -3740,6 +3783,7 @@ function wallNoteStroke() {
   wallPruneTimes();
   wallMarkDirty();
   wallTouch();
+  wallCheckBudget(); // build 84: spend the budget — archive + fresh at 800
 }
 
 /* Raw polyline draw — no bookkeeping. Callers note the stroke once per
@@ -3890,7 +3934,7 @@ function wallUndoMyLast() {
       wallSaveSnapshot(); // the undone state is the truth now — persist it, don't wait for debounce
       if (typeof paintMirror === 'function' && typeof paint !== 'undefined' && paint.open) paintMirror();
       if (net.enabled && net.sendWallUndo && active && active.key === SOUND_ROOM_KEY) {
-        try { net.sendWallUndo({ id: gone.id }); } catch (err) { /* best effort */ }
+        try { net.sendWallUndo({ w: wall.id, id: gone.id }); } catch (err) { /* best effort */ }
       }
       return gone.id;
     }
@@ -3900,12 +3944,14 @@ function wallUndoMyLast() {
 
 function handleWallUndo(peerId, d) {
   if (!d || typeof d.id !== 'string' || !d.id) return;
-  const i = wall.log.findIndex((e) => e.id === d.id);
-  if (i < 0) return; // unknown id — nothing to do
-  wall.log.splice(i, 1);
-  wallRedraw();
-  wallTouch();
-  if (typeof paintMirror === 'function' && typeof paint !== 'undefined' && paint.open) paintMirror();
+  withWall(d.w, () => {
+    const i = wall.log.findIndex((e) => e.id === d.id);
+    if (i < 0) return; // unknown id — nothing to do
+    wall.log.splice(i, 1);
+    wallRedraw();
+    wallTouch();
+    if (typeof paintMirror === 'function' && typeof paint !== 'undefined' && paint.open && paint.wallId === wall.id) paintMirror();
+  });
 }
 
 /* Strict shape check for incoming strokes — small messages only.
@@ -3927,14 +3973,16 @@ function wallValidStroke(d) {
 
 function handleWallStroke(peerId, d) {
   if (!wallValidStroke(d)) return;
-  // Group flush chunks into one log entry by gesture id; id-less senders
-  // (older builds) get one entry per chunk.
-  const id = (typeof d.id === 'string' && d.id)
-    ? d.id
-    : 'legacy-' + String(peerId || 'x').slice(0, 24) + '-' + (wall.strokeSeq++);
-  wallDrawSeg(d.pts, d.c, d.s, d.b === 1);
-  wallLogAppend(id, d.pts, d.c, d.s, false, d.b === 1);
-  if (paint.open) paintMirror(); // someone's painting while we paint
+  withWall(d.w, () => {
+    // Group flush chunks into one log entry by gesture id; id-less senders
+    // (older builds) get one entry per chunk.
+    const id = (typeof d.id === 'string' && d.id)
+      ? d.id
+      : 'legacy-' + String(peerId || 'x').slice(0, 24) + '-' + (wall.strokeSeq++);
+    wallDrawSeg(d.pts, d.c, d.s, d.b === 1);
+    wallLogAppend(id, d.pts, d.c, d.s, false, d.b === 1);
+    if (paint.open && paint.wallId === wall.id) paintMirror(); // someone's painting while we paint
+  });
 }
 
 /* Late-joiner sync: downscaled JPEG snapshot. */
@@ -4016,37 +4064,41 @@ function wallRestoreSnapshot() {
 
 function handleWallSyncReq(peerId, d) {
   if (!d || typeof d.reqId !== 'string' || !d.reqId) return;
-  if (wall.answeredReq.has(d.reqId)) return; // answer each request once
-  if (wall.strokeCount <= 0) return;         // blank wall: nothing to share
-  // Build 26: only answer when my wall is NEWER than the requester's
-  // (they send their wall.ts along). Peers on older builds send no ts —
-  // treat as 0, i.e. the pre-26 behavior.
-  const theirTs = (typeof d.ts === 'number' && d.ts >= 0) ? d.ts : 0;
-  if (!(wall.ts > theirTs)) return;
-  wall.answeredReq.add(d.reqId);
-  if (wall.answeredReq.size > 40) {
-    const oldest = wall.answeredReq.values().next().value;
-    wall.answeredReq.delete(oldest);
-  }
-  if (!net.enabled || !net.sendWallSync) return;
-  try {
-    const img = wallSnapshot();
-    if (img) net.sendWallSync({ reqId: d.reqId, img });
-  } catch (e) { /* best effort */ }
+  withWall(d.w, () => {
+    if (wall.answeredReq.has(d.reqId)) return; // answer each request once
+    if (wall.strokeCount <= 0) return;         // blank wall: nothing to share
+    // Build 26: only answer when my wall is NEWER than the requester's
+    // (they send their wall.ts along). Peers on older builds send no ts —
+    // treat as 0, i.e. the pre-26 behavior.
+    const theirTs = (typeof d.ts === 'number' && d.ts >= 0) ? d.ts : 0;
+    if (!(wall.ts > theirTs)) return;
+    wall.answeredReq.add(d.reqId);
+    if (wall.answeredReq.size > 40) {
+      const oldest = wall.answeredReq.values().next().value;
+      wall.answeredReq.delete(oldest);
+    }
+    if (!net.enabled || !net.sendWallSync) return;
+    try {
+      const img = wallSnapshot();
+      if (img) net.sendWallSync({ reqId: d.reqId, w: wall.id, img });
+    } catch (e) { /* best effort */ }
+  });
 }
 
 function handleWallSync(peerId, d) {
   if (!d || typeof d.img !== 'string' || !d.img.startsWith('data:image/')) return;
-  // Never stomp a wall that's actively being painted: if my own brush
-  // landed in the last ~3s, stash the mural and merge it once I'm quiet
-  // (drained by wallSaveSnapshot at the debounce quiet point). Otherwise
-  // merge now — their mural becomes the base, my strokes stay on top.
-  if (Date.now() - wall.lastLocalStroke < 3000) {
-    wall.pendingSync = d.img; // latest wins
-    return;
-  }
-  wall.pendingSync = null;
-  wallApplySnapshot(d.img, 'merge');
+  withWall(d.w, () => {
+    // Never stomp a wall that's actively being painted: if my own brush
+    // landed in the last ~3s, stash the mural and merge it once I'm quiet
+    // (drained by wallSaveSnapshot at the debounce quiet point). Otherwise
+    // merge now — their mural becomes the base, my strokes stay on top.
+    if (Date.now() - wall.lastLocalStroke < 3000) {
+      wall.pendingSync = d.img; // latest wins
+      return;
+    }
+    wall.pendingSync = null;
+    wallApplySnapshot(d.img, 'merge');
+  });
 }
 
 /* Build 26: last-writer-wins convergence. A newcomer announces its wall's
@@ -4059,13 +4111,88 @@ function wallValidHello(d) {
 }
 function handleWallHello(peerId, d) {
   if (!wallValidHello(d)) return;
-  if (!(wall.ts > d.ts)) return;    // only the newer wall speaks
-  if (wall.strokeCount <= 0) return; // blank wall: nothing to share
-  if (!net.enabled || !net.sendWallSync) return;
+  withWall(d.w, () => {
+    if (!(wall.ts > d.ts)) return;    // only the newer wall speaks
+    if (wall.strokeCount <= 0) return; // blank wall: nothing to share
+    if (!net.enabled || !net.sendWallSync) return;
+    try {
+      const img = wallSnapshot();
+      if (img) net.sendWallSync({ reqId: 'hello-' + Date.now().toString(36), w: wall.id, img });
+    } catch (e) { /* best effort */ }
+  });
+}
+
+/* Build 84: anti-deterioration. Each wall has a stroke budget; when it's
+   spent, the mural is archived (kept, not lost) and the wall starts fresh.
+   There's also a manual "fresh" button. Peers are told via wallFresh so
+   everyone converges to the blank wall. */
+const WALL_STROKE_BUDGET = 800;
+const WALL_ARCHIVE_MAX = 5;
+function wallArchiveKey(wid) { return 'limbo-wall-archive-v1-' + wid; }
+function wallArchivePush(wid, dataUrl) {
   try {
-    const img = wallSnapshot();
-    if (img) net.sendWallSync({ reqId: 'hello-' + Date.now().toString(36), img });
-  } catch (e) { /* best effort */ }
+    const key = wallArchiveKey(wid);
+    let arr = [];
+    try { arr = JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) {}
+    if (!Array.isArray(arr)) arr = [];
+    arr.push({ ts: Date.now(), img: dataUrl });
+    while (arr.length > WALL_ARCHIVE_MAX) arr.shift();
+    localStorage.setItem(key, JSON.stringify(arr));
+  } catch (e) { /* best effort — archive is a bonus, not a promise */ }
+}
+function wallClearState(st) {
+  st.ctx.fillStyle = WALL_BG; st.ctx.fillRect(0, 0, WALL_W, WALL_H);
+  st.baseCtx.fillStyle = WALL_BG; st.baseCtx.fillRect(0, 0, WALL_W, WALL_H);
+  st.log.length = 0;
+  st.strokeCount = 0;
+  st.strokeTimes.length = 0;
+  st.pendingSync = null;
+  st.texDirty = true;
+}
+function wallArchiveAndFresh(wid, reason) {
+  const st = wallStates[wid];
+  if (!st) return;
+  // Archive the mural if it has any ink.
+  if (st.strokeCount > 0) {
+    const img = withWall(wid, () => wallSnapshot());
+    if (img) wallArchivePush(wid, img);
+  }
+  withWall(wid, () => {
+    wallClearState(wall);
+    wall.ts = Date.now(); // I'm the newest — peers accept my fresh
+    wallTouch(); // schedule the (now blank) snapshot
+  });
+  // If I'm looking at this wall in paint mode, show the blank.
+  if (paint.wallId === wid && paint.open && paintCtx) {
+    paintCtx.fillStyle = WALL_BG; paintCtx.fillRect(0, 0, WALL_W, WALL_H);
+  }
+  // Tell the room.
+  if (net.enabled && net.sendWallFresh && active && active.key === SOUND_ROOM_KEY) {
+    try { net.sendWallFresh({ w: wid, ts: st.ts, reason: reason || 'manual' }); } catch (e) {}
+  }
+}
+function handleWallFresh(peerId, d) {
+  if (!d || typeof d.w !== 'string' || !wallStates[d.w]) return;
+  if (typeof d.ts !== 'number' || d.ts <= 0) return;
+  withWall(d.w, () => {
+    if (!(d.ts > wall.ts)) return; // only accept a newer fresh
+    // Archive what I had (in case I had something they didn't).
+    if (wall.strokeCount > 0) {
+      const img = wallSnapshot();
+      if (img) wallArchivePush(wall.id, img);
+    }
+    wallClearState(wall);
+    wall.ts = d.ts;
+    if (paint.wallId === wall.id && paint.open && paintCtx) {
+      paintCtx.fillStyle = WALL_BG; paintCtx.fillRect(0, 0, WALL_W, WALL_H);
+    }
+  });
+}
+/* Build 84: called after each stroke lands — spend the budget. */
+function wallCheckBudget() {
+  if (wall.strokeCount >= WALL_STROKE_BUDGET) {
+    wallArchiveAndFresh(wall.id, 'budget');
+  }
 }
 
 /* NOTE: there is deliberately no wall-clear action. The only way paint
@@ -4098,15 +4225,23 @@ const _wallTmpColor = new THREE.Color(); // scratch for the room-reactivity lerp
 /* One room-reactivity sample: read the wall's colors + paint energy and
    retarget the room lights. Called ~1s from the sound room's update(). */
 function wallReactSample(a) {
-  const s = wallSample();
-  if (wall.strokeCount === 0 || s.coverage <= 0.001) {
+  // Build 84: the room drinks from all four walls — blend their hues.
+  let r = 0, g = 0, b = 0, inkWalls = 0, recent = 0, coverage = 0;
+  for (const wid of WALL_IDS) {
+    const s = withWall(wid, () => wallSample());
+    if (wallStates[wid].strokeCount === 0 || s.coverage <= 0.001) continue;
+    r += s.r; g += s.g; b += s.b;
+    recent += s.recent; coverage += s.coverage;
+    inkWalls++;
+  }
+  if (inkWalls === 0) {
     a.wallTarget.set(WALL_AMB_BASE);
   } else {
-    // 55% toward the wall's average hue — never near-black, since the
+    // 55% toward the walls' average hue — never near-black, since the
     // other 45% is always the room's base tint.
-    a.wallTarget.set(WALL_AMB_BASE).lerp(_wallTmpColor.setRGB(s.r, s.g, s.b), 0.55);
+    a.wallTarget.set(WALL_AMB_BASE).lerp(_wallTmpColor.setRGB(r / inkWalls, g / inkWalls, b / inkWalls), 0.55);
   }
-  const energy = Math.min(1, (s.recent / 6) * 0.8 + s.coverage * 1.5);
+  const energy = Math.min(1, (recent / 6) * 0.8 + coverage * 1.5);
   a.wallPulse += (energy - a.wallPulse) * 0.5;
 }
 function wallSample() {
@@ -6179,6 +6314,18 @@ function theatreEnsurePlayer() {
             }
             // build 79: a real PLAYING state clears the autoplay-block flag
             if (ev.data === window.YT.PlayerState.PLAYING) theatreClearPlayBlock();
+            // Build 84: when content (re)starts playing — e.g. after an ad —
+            // check if we've drifted from the synced position and correct.
+            // Ads desync everyone; this pulls us back.
+            if (ev.data === window.YT.PlayerState.PLAYING && theatre.playing && theatre.videoId) {
+              try {
+                const target = theatre.position + (Date.now() - theatre.startedAt) / 1000;
+                const cur = p.getCurrentTime ? p.getCurrentTime() : -99;
+                if (cur >= 0 && Math.abs(cur - target) > 4) {
+                  p.seekTo(Math.max(0, target), true);
+                }
+              } catch (e) {}
+            }
           },
           // build 80: surface player failures — an embedding-disabled or
           // deleted video used to fail silently to a black 3D screen.
@@ -6222,9 +6369,18 @@ function theatreApplyState() {
     try { curId = p.getVideoData().video_id || ''; } catch (e) {}
     if (curId !== theatre.videoId) {
       theatreClearPlayerError(); // build 80: new video, fresh chance
-      p.cueVideoById(theatre.videoId);
-    }
-    if (theatre.playing) {
+      if (theatre.playing) {
+        // Build 84: loadVideoById with startSeconds auto-plays from the
+        // synced position — cueVideoById + seek + play was racy (the seek
+        // fired before the video loaded, so nothing auto-started).
+        const pos = theatre.position + (Date.now() - theatre.startedAt) / 1000;
+        try { p.loadVideoById({ videoId: theatre.videoId, startSeconds: Math.max(0, pos) }); } catch (e) {
+          p.cueVideoById(theatre.videoId);
+        }
+      } else {
+        p.cueVideoById(theatre.videoId);
+      }
+    } else if (theatre.playing) {
       const pos = theatre.position + (Date.now() - theatre.startedAt) / 1000;
       try { p.seekTo(Math.max(0, pos), true); } catch (e) {}
       p.playVideo();
@@ -6420,9 +6576,23 @@ function handleTheatreStateReq(peerId, d) {
   const answer = () => {
     try {
       if (theatre.playing) {
+        // Build 84: broadcast the ACTUAL player time, not the calculated
+        // one — if an ad is playing (or was skipped), the calculated
+        // position drifts from reality. Peers re-sync from this.
+        let pos = theatre.position;
+        let startedAt = theatre.startedAt;
+        try {
+          if (theatre.player && theatre.player.getCurrentTime) {
+            pos = theatre.player.getCurrentTime();
+            startedAt = Date.now();
+            // keep our local clock honest too
+            theatre.position = pos;
+            theatre.startedAt = startedAt;
+          }
+        } catch (e) {}
         if (net && net.sendTheatrePlay) net.sendTheatrePlay({
-          videoId: theatre.videoId, position: theatre.position,
-          startedAt: theatre.startedAt, by: theatre.addedBy, seq: theatre.seq,
+          videoId: theatre.videoId, position: pos,
+          startedAt: startedAt, by: theatre.addedBy, seq: theatre.seq,
         });
       } else {
         if (net && net.sendTheatrePause) net.sendTheatrePause({
@@ -6970,6 +7140,7 @@ const PAINT_COLORS = [
 ];
 const paint = {
   open: false,
+  wallId: 'north', // build 84: which of the four walls is being painted
   color: '#7ae0ff',
   blend: false,      // build 28: blend brush — smudge the canvas, don't lay color
   lastColor: '#7ae0ff',
@@ -7077,6 +7248,7 @@ function paintFlush() {
   if (net.enabled && net.sendWallStroke && active && active.key === SOUND_ROOM_KEY) {
     try {
       net.sendWallStroke({
+        w: wall.id, // build 84: which of the four walls
         id: paint.gesture ? paint.gesture.id : undefined, // groups this gesture's chunks for peers
         n: myName,
         c: paint.color,
@@ -7107,11 +7279,33 @@ function setPaintOpen(open) {
   chatFocused = paint.open; // reuse the chat guard: keys never fly the wisp mid-paint
   if (paint.open) {
     paintBuildPalette();
+    wallPickerSync();
     if (paintCtx) paintCtx.drawImage(wall.canvas, 0, 0, WALL_W, WALL_H);
   } else {
     paintEndStroke();
   }
 }
+
+/* Build 84: wall picker — highlight the active wall's tab. */
+function wallPickerSync() {
+  try {
+    const btns = document.querySelectorAll('#wall-picker .wall-pick');
+    for (const b of btns) {
+      b.classList.toggle('active', b.dataset.wall === paint.wallId);
+    }
+  } catch (e) {}
+}
+(function wallPickerWire() {
+  try {
+    const btns = document.querySelectorAll('#wall-picker .wall-pick');
+    for (const b of btns) {
+      b.addEventListener('click', () => {
+        wallUse(b.dataset.wall);
+        b.blur();
+      });
+    }
+  } catch (e) {}
+})();
 
 if (paintCanvas) {
   paintCanvas.addEventListener('pointerdown', (e) => {
@@ -7210,6 +7404,14 @@ function wallExportPng() {
   } catch (e) { return false; }
 }
 if (paintSaveBtn) paintSaveBtn.addEventListener('click', () => { wallExportPng(); paintSaveBtn.blur(); });
+if (paintFreshBtn) paintFreshBtn.addEventListener('click', () => {
+  // Build 84: archive this mural and start the wall fresh. Confirm — this
+  // clears the wall for everyone in the room.
+  if (confirm('Archive this mural and start "' + paint.wallId + '" fresh? The old one is kept in the archive.')) {
+    wallArchiveAndFresh(paint.wallId, 'manual');
+  }
+  paintFreshBtn.blur();
+});
 /* Undo: pops MY most recent stroke (eraser strokes included) and tells
    the room, so peers drop it from their logs and replay too. */
 if (paintUndoBtn) paintUndoBtn.addEventListener('click', () => {
@@ -7941,35 +8143,32 @@ function buildSoundRoom(textures) {
   }
 
   // Gallery: the realm artworks, framed, one per wall — except the north
-  // wall, where the community wall lives now (build 19 removed the
-  // REALM_DEFS[0] piece that used to hang behind it).
-  const galleryFiles = [];
-  const frameDefs = [
-    { def: REALM_DEFS[1], p: [33.7, 8, 0], r: -Math.PI / 2 },
-    { def: REALM_DEFS[2], p: [0, 8, 33.7], r: Math.PI },
-    { def: REALM_DEFS[3], p: [-33.7, 8, 0], r: Math.PI / 2 },
+  // Build 84: four paint walls, one per wall, all the same size (32x16).
+  // The north wall keeps its existing monumental canvas (built below);
+  // east/south/west get matching ones here, replacing the gallery frames.
+  const paintWallDefs = [
+    { id: 'east',  p: [33.7, 9, 0],   r: -Math.PI / 2 },
+    { id: 'south', p: [0, 9, 33.7],   r: Math.PI },
+    { id: 'west',  p: [-33.7, 9, 0],  r: Math.PI / 2 },
   ];
-  for (const f of frameDefs) {
-    const tex = textures[f.def.key];
-    const img = tex && tex.image ? tex.image : null;
-    const aspect = img ? img.width / img.height : 1;
-    const AW = 15, AH = Math.min(AW / aspect, 11);
+  for (const f of paintWallDefs) {
+    const st = wallStates[f.id];
     const frame = new THREE.Group();
-    frame.name = 'gallery-' + f.def.key; // test hook: build 19 removed gallery-realm1
+    frame.name = 'paint-wall-' + f.id;
     const back = new THREE.Mesh(
-      new THREE.PlaneGeometry(AW + 1.2, AH + 1.2),
-      new THREE.MeshStandardMaterial({ color: f.def.accent, emissive: f.def.accent, emissiveIntensity: 0.25, roughness: 0.4, metalness: 0.6 })
+      new THREE.PlaneGeometry(34.4, 17.4),
+      new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 0.35, roughness: 0.4, metalness: 0.6 })
     );
-    const art = new THREE.Mesh(
-      new THREE.PlaneGeometry(AW, AH),
-      new THREE.MeshBasicMaterial({ map: tex })
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(32, 16),
+      new THREE.MeshBasicMaterial({ map: st.tex })
     );
-    art.position.z = 0.08;
-    frame.add(back, art);
+    mesh.position.z = 0.08;
+    frame.add(back, mesh);
     frame.position.set(...f.p);
     frame.rotation.y = f.r;
     scene.add(frame);
-    galleryFiles.push(f.def.file);
+    st.mesh = mesh;
   }
 
   // DJ booth: platform, two decks, mixer, amber glow.
@@ -8019,23 +8218,25 @@ function buildSoundRoom(textures) {
   stageGroup.position.set(0, 0, -10);
   scene.add(stageGroup);
 
-  // Community wall (build 18; doubled to 32x16 in build 19 after the
-  // north-wall gallery piece was removed): a monumental shared paint
-  // canvas on the north wall behind the booth. MeshBasicMaterial so the
-  // art reads in the dark; the CanvasTexture updates live as strokes land.
+  // Community wall (build 18; doubled to 32x16 in build 19; build 84: the
+  // north of four): a monumental shared paint canvas on the north wall
+  // behind the booth. MeshBasicMaterial so the art reads in the dark;
+  // the CanvasTexture updates live as strokes land.
   const wallFrame = new THREE.Group();
+  wallFrame.name = 'paint-wall-north';
   const wallBack = new THREE.Mesh(
     new THREE.PlaneGeometry(34.4, 17.4),
     new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 0.35, roughness: 0.4, metalness: 0.6 })
   );
   const wallMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(32, 16),
-    new THREE.MeshBasicMaterial({ map: wall.tex })
+    new THREE.MeshBasicMaterial({ map: wallStates.north.tex })
   );
   wallMesh.position.z = 0.08;
   wallFrame.add(wallBack, wallMesh);
   wallFrame.position.set(0, 9, -33.4);
   scene.add(wallFrame);
+  wallStates.north.mesh = wallMesh;
 
   // Return portal to the Nexus.
   const { group, ring } = makePortal(makeSoundTexture(), accent, 'RETURN', 1.7, 0.14);
@@ -11960,18 +12161,21 @@ function goTo(key) {
       }, 2000);
     }
     if (key !== WORKSHOP_ROOM_KEY && sculpt.active) sculptExit(); // build 68: don't sculpt the void
-    // Community wall (build 18): late joiner asks the room for the current
-    // canvas. Delayed so the data channel has a moment to connect; peers
-    // with ink answer once per reqId (see handleWallSyncReq).
+    // Community wall (build 18; build 84: four walls): late joiner asks the
+    // room for the current canvases. Delayed so the data channel has a
+    // moment to connect; peers with ink answer once per reqId.
     if (musicRoom && net.enabled && (net.sendWallSyncReq || net.sendJukeStateReq)) {
       const reqId = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
       setTimeout(() => {
         if (active && active.key === SOUND_ROOM_KEY) {
-          // Build 26: announce my wall's version time; only peers with a
-          // NEWER wall answer (wallHello + the ts-gated wallSyncReq below).
-          if (net.sendWallHello) { try { net.sendWallHello({ ts: wall.ts }); } catch (e) {} }
-          if (net.sendWallSyncReq) {
-            try { net.sendWallSyncReq({ reqId, ts: wall.ts }); } catch (e) { /* best effort */ }
+          // Build 26: announce my walls' version times; only peers with a
+          // NEWER wall answer. Build 84: one hello/req per wall.
+          for (const wid of WALL_IDS) {
+            const st = wallStates[wid];
+            if (net.sendWallHello) { try { net.sendWallHello({ w: wid, ts: st.ts }); } catch (e) {} }
+            if (net.sendWallSyncReq) {
+              try { net.sendWallSyncReq({ reqId: reqId + '-' + wid, w: wid, ts: st.ts }); } catch (e) {}
+            }
           }
           // Build 66: same late-joiner pattern for the stage + FOH lights —
           // peers already in the room answer with the current layout.
@@ -12231,6 +12435,7 @@ net.onWallSyncReqCb = handleWallSyncReq;
 net.onWallSyncCb = handleWallSync;
 net.onWallHelloCb = handleWallHello; // build 26: last-writer-wins convergence
 net.onWallUndoCb = handleWallUndo; // build 26: peer undid a stroke
+net.onWallFreshCb = handleWallFresh; // build 84: peer archived + cleared a wall
 // Jukebox (build 21): synced queue playback.
 net.onJukeAddCb = handleJukeAdd;
 net.onJukeRemoveCb = handleJukeRemove;
@@ -12583,10 +12788,14 @@ function loop() {
     try { if (localTrail && localTrail.setPulse) localTrail.setPulse(roomBassSmooth); } catch (e) {}
   }
 
-  // Community wall (build 18): push new strokes to the GPU texture.
-  if (wall.texDirty && wall.tex) {
-    wall.tex.needsUpdate = true;
-    wall.texDirty = false;
+  // Community walls (build 18; build 84: four of them): push new strokes
+  // to the GPU textures.
+  for (const wid of WALL_IDS) {
+    const st = wallStates[wid];
+    if (st.texDirty && st.tex) {
+      st.tex.needsUpdate = true;
+      st.texDirty = false;
+    }
   }
 
   // Free flight everywhere — including the journey (its update adds
@@ -13131,14 +13340,14 @@ window.__limbo = {
   wallExportPng: () => wallExportPng(),
   wallLoopback: (d) => {
     const ok = wallValidStroke(d);
-    if (net.sendWallStroke) { try { net.sendWallStroke(d); } catch (e) {} }
-    handleWallStroke('loopback', d);
+    if (net.sendWallStroke) { try { net.sendWallStroke(Object.assign({ w: wall.id }, d)); } catch (e) {} }
+    handleWallStroke('loopback', Object.assign({ w: wall.id }, d));
     return ok;
   },
   wallSnapshot: () => wallSnapshot(),
   wallApplySnapshot: (u) => wallApplySnapshot(u),
   wallHandleSync: (d, pid) => handleWallSync(pid || 'test-peer', d),
-  wallSendSyncReq: (id) => { try { return !!(net.sendWallSyncReq && net.sendWallSyncReq({ reqId: id, ts: wall.ts })); } catch (e) { return false; } },
+  wallSendSyncReq: (id) => { try { return !!(net.sendWallSyncReq && net.sendWallSyncReq({ reqId: id, w: wall.id, ts: wall.ts })); } catch (e) { return false; } },
   wallHandleSyncReq: (d, pid) => handleWallSyncReq(pid || 'test-peer', d),
   wallAnswered: () => [...wall.answeredReq],
   // community wall persistence (build 26)
@@ -13147,7 +13356,7 @@ window.__limbo = {
   wallSaveSnapshotNow: () => wallSaveSnapshot(),
   wallRestoreSnapshot: () => wallRestoreSnapshot(),
   wallHandleHello: (d, pid) => handleWallHello(pid || 'test-peer', d),
-  wallHelloSend: (ts) => { try { return !!(net.sendWallHello && net.sendWallHello({ ts })); } catch (e) { return false; } },
+  wallHelloSend: (ts) => { try { return !!(net.sendWallHello && net.sendWallHello({ w: wall.id, ts })); } catch (e) { return false; } },
   // community wall undo (build 26)
   wallUndo: () => wallUndoMyLast(),
   wallHandleUndo: (d, pid) => handleWallUndo(pid || 'test-peer', d),
