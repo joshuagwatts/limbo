@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=84';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=84';
-import { CouchNet } from './couch.js?v=84';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=84';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=84';
+import { AudioEngine } from './audio.js?v=85';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=85';
+import { CouchNet } from './couch.js?v=85';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=85';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=85';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -6250,6 +6250,8 @@ const theatre = {
   seq: 0, // build 80: monotonic state version, bumped on every local play/pause
           // broadcast so a late stateReq answer can't resurrect a paused movie
   peerSeq: {}, // build 80: last applied theatre seq per sender cid
+  // Build 85: per-client screen size (S/M/L) — local only, no sync needed.
+  screenSize: (() => { try { return localStorage.getItem('limbo-theatre-screen') || 'M'; } catch (e) { return 'M'; } })(),
 };
 // build 80: stamp the next local state version on an outgoing broadcast
 function theatreNextSeq() { theatre.seq += 1; return theatre.seq; }
@@ -6391,6 +6393,30 @@ function theatreApplyState() {
     }
   } catch (e) {}
   theatreRender();
+}
+
+/* Build 85: per-client screen size. S=0.7, M=1.0, L=1.4 — scales the mesh
+   and its frame. The DOM projection follows matrixWorld automatically.
+   Local only: your size, your eyes. */
+const THEATRE_SCREEN_SCALES = { S: 0.7, M: 1.0, L: 1.4 };
+const THEATRE_SCREEN_ORDER = ['S', 'M', 'L'];
+function theatreApplyScreenSize() {
+  const s = THEATRE_SCREEN_SCALES[theatre.screenSize] || 1;
+  try {
+    const mesh = active && active.key === THEATRE_ROOM_KEY && active.anim ? active.anim.screenMesh : null;
+    if (mesh) {
+      mesh.scale.setScalar(s);
+      if (mesh.userData.frame) mesh.userData.frame.scale.setScalar(s);
+    }
+  } catch (e) {}
+  const btn = document.getElementById('theatre-sizebtn');
+  if (btn) btn.textContent = '\u26F6 ' + theatre.screenSize;
+}
+function theatreCycleScreenSize() {
+  const i = THEATRE_SCREEN_ORDER.indexOf(theatre.screenSize);
+  theatre.screenSize = THEATRE_SCREEN_ORDER[(i + 1) % THEATRE_SCREEN_ORDER.length];
+  try { localStorage.setItem('limbo-theatre-screen', theatre.screenSize); } catch (e) {}
+  theatreApplyScreenSize();
 }
 
 function theatreRender() {
@@ -6941,6 +6967,9 @@ function theatreScreenOcclusion(dst) {
   if (theatrePlayPauseEl) theatrePlayPauseEl.addEventListener('click', theatreTogglePlay);
   const close = document.getElementById('theatre-close');
   if (close) close.addEventListener('click', () => { if (theatrePanel) theatrePanel.style.display = 'none'; });
+  // Build 85: screen-size cycle button — your size, your eyes.
+  const sizeBtn = document.getElementById('theatre-sizebtn');
+  if (sizeBtn) sizeBtn.addEventListener('click', theatreCycleScreenSize);
   const jvol = document.getElementById('jam-theatre-vol');
   if (jvol) jvol.addEventListener('input', () => {
     if (theatre.muted && +jvol.value > 0) theatreSetMuted(false); // dragging volume unmutes
@@ -8494,6 +8523,8 @@ function buildTheatre() {
   screenMesh.position.set(0, screenY, screenZ);
   screenMesh.name = 'theatre-screen';
   scene.add(screenMesh);
+  // Build 85: keep the frame so the screen-size control can scale both.
+  screenMesh.userData.frame = frame;
 
   // Seat rows — simple dark boxes with a hint of red.
   const seatMat = new THREE.MeshStandardMaterial({ color: 0x1a0d10, roughness: 0.9 });
@@ -12130,6 +12161,9 @@ function goTo(key) {
     if (key === SOUND_ROOM_KEY) { try { audioEnsureRunning(); } catch (e) {} }
     // Build 22: the ambient aura ducks out in the sound room (jam,
     // jukebox and metronome all ride the game master and are unaffected).
+    audio.setAuraDucked(key === SOUND_ROOM_KEY);
+    // Build 85: restore the player's saved theatre screen size on entry.
+    if (key === THEATRE_ROOM_KEY) { try { theatreApplyScreenSize(); } catch (e) {} }
     audio.setAuraDucked(key === SOUND_ROOM_KEY);
     showTitleCard(active.name);
     renderRoomChrome(); // show/hide each room's buttons for this room
