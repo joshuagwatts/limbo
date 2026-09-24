@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=82';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=82';
-import { CouchNet } from './couch.js?v=82';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=82';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=82';
+import { AudioEngine } from './audio.js?v=83';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=83';
+import { CouchNet } from './couch.js?v=83';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=83';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=83';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
@@ -10378,11 +10378,12 @@ function buildJourneyGems(scene) {
   journey.gems = gems;
 }
 
-/* ---------------- manta rays (build 49) ----------------
-   Seven rays glide the open field on lazy seeded circles — the same
-   circles on every phone, so multiplayer shares one sky. Tap a ray when
-   you're close and it leaves its circle to follow you; tap it again (or
-   tap another ray) to let it go. Never automatic — the call is yours. */
+/* ---------------- manta rays (build 49, flight reworked build 83) ----------------
+   Seven rays glide the open field at wisp height — the same sky on every
+   phone, so multiplayer shares it. Wander is layered-sine headings (seeded,
+   deterministic): endless smooth peaceful curves, never a hard turn.
+   Tap a ray when you're close and it leaves its wander to follow you;
+   tap it again (or tap another ray) to let it go. Never automatic. */
 const J_RAYS_N = 7;
 const J_RAY_TAP_RANGE = 34; // how close you must be to call a ray
 const _raycaster = new THREE.Raycaster();
@@ -10390,11 +10391,29 @@ const _raySlot = new THREE.Vector3();
 const _rayRight = new THREE.Vector3();
 const _rayUp = new THREE.Vector3(0, 1, 0);
 
+/* Build 83: shared radial glow texture for the ray auras. */
+let _rayGlowTex = null;
+function rayGlowTexture() {
+  if (_rayGlowTex) return _rayGlowTex;
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(150,205,255,0.55)');
+  g.addColorStop(0.4, 'rgba(110,170,255,0.20)');
+  g.addColorStop(1, 'rgba(80,140,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+  _rayGlowTex = new THREE.CanvasTexture(c);
+  return _rayGlowTex;
+}
+
 function buildJourneyRays(scene) {
   const rnd = mulberry32(4901);
+  /* Build 83: glowy and majestic — lit from within, not just shaded. */
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x9db8dd, roughness: 0.55, metalness: 0.15,
-    emissive: 0x14263f, emissiveIntensity: 0.5,
+    color: 0x8fb4e8, roughness: 0.35, metalness: 0.25,
+    emissive: 0x2a6ab8, emissiveIntensity: 0.85,
     flatShading: true, side: THREE.DoubleSide,
   });
 
@@ -10469,43 +10488,50 @@ function buildJourneyRays(scene) {
     const hit = new THREE.Mesh(
       new THREE.SphereGeometry(9, 8, 6),
       new THREE.MeshBasicMaterial({ visible: false }));
+    /* Build 83: aura sprite — a soft additive halo so each ray glows
+       against the sky. Pulsed gently in updateJourneyRays. */
+    const aura = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: rayGlowTexture(), transparent: true, opacity: 0.45,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    aura.scale.setScalar(30);
     g.add(new THREE.Mesh(bodyGeo, mat), wingR, wingL,
       new THREE.Mesh(tailGeo, mat), new THREE.Mesh(dorsalGeo, mat),
-      cephL, cephR, hit);
+      cephL, cephR, hit, aura);
     g.scale.setScalar(1.1 + rnd() * 0.7);
     const ray = {
-      group: g, wingR, wingL, hit,
-      // flight brain: steered velocity toward a wandering sky target
-      vel: new THREE.Vector3((rnd() - 0.5) * 30, (rnd() - 0.5) * 6, (rnd() - 0.5) * 30),
-      tgt: new THREE.Vector3(),
-      yaw: rnd() * Math.PI * 2,
-      cruise: 26 + rnd() * 16,
+      group: g, wingR, wingL, hit, aura,
+      /* Build 83 flight brain: smooth wander on layered-sine headings.
+         heading drifts on slow seeded sines — endless curving, no targets,
+         no snaps. baseY sits in the wisp's band so you can fly alongside. */
+      heading: rnd() * Math.PI * 2,
+      yaw: 0,
+      cruise: 22 + rnd() * 10,
+      baseY: 14 + rnd() * 26, // 14–40: wisp-flyable
+      tp1: rnd() * Math.PI * 2, // turn phases (seeded → same sky, every phone)
+      tp2: rnd() * Math.PI * 2,
+      yp: rnd() * Math.PI * 2,  // altitude phase
+      bank: 0,
       flap: rnd() * Math.PI * 2,
       flapSpd: 2,
-      rollT: 0, rollCd: 8 + rnd() * 24, rollDir: rnd() < 0.5 ? 1 : -1,
       rndState: rnd,
       following: false,
     };
     hit.userData.ray = ray;
     g.rotation.order = 'YXZ';
-    g.position.set((rnd() - 0.5) * 700, 60 + rnd() * 120, (rnd() - 0.5) * 700);
-    journeyNewRayTarget(ray);
+    ray.yaw = ray.heading;
+    g.position.set((rnd() - 0.5) * 600, ray.baseY, (rnd() - 0.5) * 600);
     scene.add(g);
     rays.push(ray);
   }
   journey.rays = rays;
 }
 
-/* A ray's next sky target — wide open field, real altitude. */
-function journeyNewRayTarget(ray) {
-  const r = ray.rndState || Math.random;
-  ray.tgt.set((r() - 0.5) * 620, 55 + r() * 140, (r() - 0.5) * 620);
-}
-
 function releaseRay(ray) {
   ray.following = false;
-  // resume the wander from right here — pick a fresh target ahead of it
-  journeyNewRayTarget(ray);
+  // resume the wander from right here — keep the current heading so
+  // there's no snap, the sines take over from this direction
+  ray.heading = ray.yaw;
 }
 
 function updateJourneyRays(dt, t) {
@@ -10526,56 +10552,65 @@ function updateJourneyRays(dt, t) {
       else _jTmpA.copy(myFwd);
       hx = _jTmpA.x; hy = _jTmpA.y; hz = _jTmpA.z;
       spd = 30;
+      ray.bank += (0 - ray.bank) * k(3); // level when following
     } else {
-      // steering brain: chase the sky target, bank into every turn
-      _jTmpA.copy(ray.tgt).sub(g.position);
-      const dist = _jTmpA.length();
-      if (dist < 60) journeyNewRayTarget(ray);
-      else _jTmpA.multiplyScalar(1 / dist);
-      const cruise = ray.cruise * (ray.rollT > 0 ? 1.25 : 1);
-      _jTmpB.copy(_jTmpA).multiplyScalar(cruise);
-      ray.vel.lerp(_jTmpB, k(1.5));
-      // keep them out of the dirt and under the sky's lid
-      if (g.position.y < 25) ray.vel.y += 40 * dt;
-      if (g.position.y > 220) ray.vel.y -= 40 * dt;
-      g.position.addScaledVector(ray.vel, dt);
-      const vlen = ray.vel.length() || 1;
-      hx = ray.vel.x / vlen; hy = ray.vel.y / vlen; hz = ray.vel.z / vlen;
-      spd = vlen;
+      /* Build 83: peaceful wander. The heading breathes on two slow
+         seeded sines — the ray carves endless smooth curves. A soft
+         pull toward center only when it drifts past the field edge. */
+      const turn = 0.16 * Math.sin(0.10 * t + ray.tp1)
+                 + 0.07 * Math.sin(0.043 * t + ray.tp2);
+      let centerPull = 0;
+      const rad = Math.hypot(g.position.x, g.position.z);
+      if (rad > 300) {
+        const toCenter = Math.atan2(-g.position.x, -g.position.z);
+        let d = toCenter - ray.heading;
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+        centerPull = Math.max(-0.3, Math.min(0.3, d * 0.25));
+      }
+      const turnRate = turn + centerPull;
+      ray.heading += turnRate * dt;
+      // altitude breathes gently around baseY — stays in the wisp's band
+      const wantY = ray.baseY + 7 * Math.sin(0.08 * t + ray.yp);
+      const vy = (wantY - g.position.y) * 0.5;
+      hx = Math.sin(ray.heading); hz = Math.cos(ray.heading);
+      hy = Math.max(-0.25, Math.min(0.25, vy / ray.cruise));
+      g.position.x += hx * ray.cruise * dt;
+      g.position.z += hz * ray.cruise * dt;
+      g.position.y += vy * dt;
+      if (g.position.y < 6) g.position.y = 6;
+      if (g.position.y > 70) g.position.y = 70;
+      spd = ray.cruise;
+      // bank softly into the turn — no snaps, no barrel rolls
+      const wantBank = Math.max(-0.5, Math.min(0.5, -turnRate * 1.8));
+      ray.bank += (wantBank - ray.bank) * k(3);
     }
-    // face the heading: yaw toward it, pitch with the climb, bank the turn
+    // face the heading: yaw eases toward it, pitch with the climb
     const wantYaw = Math.atan2(hx, hz);
     let dy = wantYaw - ray.yaw;
     while (dy > Math.PI) dy -= Math.PI * 2;
     while (dy < -Math.PI) dy += Math.PI * 2;
-    const turn = Math.max(-1, Math.min(1, dy * 2.4));
-    ray.yaw += dy * k(4);
+    ray.yaw += dy * k(6);
     const wantPitch = Math.max(-0.6, Math.min(0.6, -Math.asin(
       Math.max(-1, Math.min(1, hy))) * 0.9));
-    const wantBank = Math.max(-0.65, Math.min(0.65, -turn * 0.6));
-    // the flourish: every so often a ray rolls clean through a barrel roll
-    ray.rollCd -= dt;
-    if (ray.rollCd <= 0 && !ray.following && ray.rollT <= 0) {
-      ray.rollT = 1.5; ray.rollCd = 14 + (ray.rndState || Math.random)() * 26;
-    }
-    let roll = 0;
-    if (ray.rollT > 0) {
-      ray.rollT -= dt;
-      roll = (1 - Math.max(0, ray.rollT) / 1.5) * Math.PI * 2 * ray.rollDir;
-    }
     g.rotation.y = ray.yaw;
     g.rotation.x += (wantPitch - g.rotation.x) * k(3);
-    g.rotation.z += (wantBank + roll - g.rotation.z) * k(5);
-    // wings: beat hard on the climb, hold flat on the dive — gliding birds
+    g.rotation.z += (ray.bank - g.rotation.z) * k(4);
+    // wings: beat on the climb, hold near-flat on the glide.
+    // Build 83 fix: wingL is mirrored (scale.x = -1), so it needs the
+    // NEGATED angle — same sign was seesawing the wings (the teeter).
     const climbing = hy > 0.08 && !ray.following;
-    const wantFlapSpd = ray.following ? 3.4 : climbing ? 6.5 : 1.4;
+    const wantFlapSpd = ray.following ? 3.4 : climbing ? 5.5 : 1.6;
     ray.flapSpd += (wantFlapSpd - ray.flapSpd) * k(2.5);
     ray.flap += ray.flapSpd * dt;
-    const amp = ray.following ? 0.4 : climbing ? 0.5 : 0.1;
+    const amp = ray.following ? 0.4 : climbing ? 0.45 : 0.12;
     const flap = Math.sin(ray.flap) * amp;
-    // wingL is mirrored (scale.x = -1), so the same sign lifts both tips
     ray.wingR.rotation.z = flap;
-    ray.wingL.rotation.z = flap;
+    ray.wingL.rotation.z = -flap;
+    // aura breathes with the flap
+    if (ray.aura) {
+      ray.aura.material.opacity = 0.40 + 0.10 * Math.sin(t * 1.3 + ray.yp);
+    }
   }
 }
 
