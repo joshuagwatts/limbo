@@ -14,7 +14,7 @@
 <meta name="theme-color" content="#020204">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="css/style.css?v=87">
+<link rel="stylesheet" href="css/style.css?v=88">
 <script type="importmap">
 {
   "imports": {
@@ -24,15 +24,41 @@
 </script>
 <!-- build 34: vendored QR libs (classic scripts -> window.qrcode / window.jsQR).
      Local files, not a CDN — the couch co-op ceremony must work offline. -->
-<script src="js/vendor/qrcode.js?v=87"></script>
-<script src="js/vendor/jsqr.js?v=87"></script>
+<script src="js/vendor/qrcode.js?v=88"></script>
+<script src="js/vendor/jsqr.js?v=88"></script>
 <!-- build 34: offline-first PWA — after one online visit the whole game
      (including three.js) is cached and boots with zero bars. -->
 <script>
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', function () {
-    navigator.serviceWorker.register('sw.js').catch(function () {});
-  });
+  (function () {
+    // Build 88: self-healing — if the page starts loading 3+ times in
+    // 20s without booting, the service worker is poisoned. Nuke it and
+    // reload clean. This is what ends the "keeps retrying to load" loop.
+    try {
+      var now = Date.now();
+      var attempts = JSON.parse(sessionStorage.getItem('limbo-boot-attempts') || '[]');
+      attempts = attempts.filter(function (t) { return now - t < 20000; });
+      attempts.push(now);
+      sessionStorage.setItem('limbo-boot-attempts', JSON.stringify(attempts));
+      // game.js clears this on successful boot — if it survives, boot failed
+      if (attempts.length >= 3 && !sessionStorage.getItem('limbo-booted')) {
+        sessionStorage.removeItem('limbo-boot-attempts');
+        navigator.serviceWorker.getRegistrations().then(function (regs) {
+          return Promise.all(regs.map(function (r) { return r.unregister(); }));
+        }).then(function () {
+          return caches.keys();
+        }).then(function (keys) {
+          return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+        }).then(function () {
+          location.reload();
+        }).catch(function () { location.reload(); });
+        return; // don't register a new worker while we're nuking
+      }
+    } catch (e) {}
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('sw.js').catch(function () {});
+    });
+  })();
 }
 </script>
 </head>
@@ -618,6 +644,6 @@ if ('serviceWorker' in navigator) {
 <!-- minimal touch joystick UI -->
 <div id="joy-base"><div id="joy-knob"></div></div>
 
-<script type="module" src="js/game.js?v=87"></script>
+<script type="module" src="js/game.js?v=88"></script>
 </body>
 </html>
