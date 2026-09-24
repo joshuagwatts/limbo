@@ -966,7 +966,19 @@ export class LimboNet {
   async boot(name) {
     if (name) this.name = this.cleanName(name);
     if (this._bootPromise) return this._bootPromise;
-    this._bootPromise = this._boot();
+    // Build 88: boot must not hang forever — if the Trystero modules don't
+    // load in 12s (flaky CDN, blocked network), fall back to solo instead
+    // of leaving the server list spinning on "finding servers…".
+    this._bootPromise = Promise.race([
+      this._boot(),
+      new Promise((resolve) => setTimeout(() => {
+        if (!this.enabled) {
+          this._netLog('boot: module load timed out — solo drift');
+          try { this._ensurePill(); this._updatePill(); } catch (e) {}
+        }
+        resolve(this.enabled);
+      }, 12000)),
+    ]);
     return this._bootPromise;
   }
 

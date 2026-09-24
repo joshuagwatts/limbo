@@ -9,11 +9,11 @@
    ============================================================ */
 
 import * as THREE from 'three';
-import { AudioEngine } from './audio.js?v=88';
-import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=88';
-import { CouchNet } from './couch.js?v=88';
-import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=88';
-import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=88';
+import { AudioEngine } from './audio.js?v=89';
+import { LimboNet, NEXUS_SERVERS, nexusServerKey, isNexusServerKey } from './net.js?v=89';
+import { CouchNet } from './couch.js?v=89';
+import { computeFlocks, meanHeading, FLOCK_R } from './flock.js?v=89';
+import { quantizeUp, estimateBpm, OnsetDetector, playSynthNote, synthNoteOn, synthNoteOff, synthAllOff, playBassNote, playDrum, playDrumSample, renderDrumKits, DRUM_KITS, drumVariantName, drumVariantCount, playPadChord, JAM_CHORDS, JAM_DRUMS, makeImpulseResponse, jamMetroClick, synthVoiceCount, createSynthFx } from './jam.js?v=89';
 
 /* Build 47: the build number rides the script's own ?v= cache-bust, so
    the stamp below can never drift from what's actually running. */
